@@ -75,6 +75,32 @@ class Resp:
         self.send(*args)
         return self.read()
 
+    def read_pushed(self, timeout=0.6):
+        """Collect whole CRLF-terminated lines that arrive within `timeout`.
+
+        MONITOR pushes status lines with no request of their own, and every
+        byte in one is printable ASCII (arguments are escaped), so splitting on
+        CRLF is exact.
+        """
+        deadline = time.time() + timeout
+        self.sock.settimeout(0.05)
+        try:
+            while time.time() < deadline:
+                try:
+                    chunk = self.sock.recv(65536)
+                except socket.timeout:
+                    continue
+                if not chunk:
+                    break
+                self.buf += chunk
+        finally:
+            self.sock.settimeout(10)
+        lines = []
+        while b"\r\n" in self.buf:
+            line, self.buf = self.buf.split(b"\r\n", 1)
+            lines.append(line.decode("latin-1"))
+        return lines
+
 
 FAILED = []
 PASSED = 0
@@ -242,6 +268,142 @@ def check_cluster(c, emulated):
     check("READWRITE queues", c.cmd("READWRITE"), "QUEUED")
     check("EXEC replies to the queued cluster commands", c.cmd("EXEC"),
           [node_id, "OK", "OK"])
+
+
+MONITOR_LINE = re.compile(r"^\+(\d+)\.(\d{6}) \[(\d+) (\S+:\d+)\] (.*)$")
+
+
+def monitor_commands(lines):
+    """The command name of each well-formed monitor line, in order."""
+    names = []
+    for line in lines:
+        match = MONITOR_LINE.match(line)
+        if match:
+            names.append(match.group(5).split(" ", 1)[0])
+    return names
+
+
+def check_monitor(host, port, c):
+    """MONITOR: two extra connections, one watching the other."""
+    watcher = Resp(host, port)
+    worker = Resp(host, port)
+
+    check("MONITOR replies OK", watcher.cmd("MONITOR"), "OK")
+    check("INFO clients counts the monitor",
+          info_section(c, "clients").get("monitor_clients"), "1")
+    # INFO above was itself a command, so drain whatever it produced.
+    watcher.read_pushed(0.3)
+
+    worker.cmd("SET", "mon:k", "v")
+    worker.cmd("GET", "mon:k")
+    worker.cmd("MULTI")
+    worker.cmd("SET", "mon:t", "1")
+    worker.cmd("EXEC")
+    worker.cmd("SET", "mon:bin", b"bin\x00\xffz")
+    worker.cmd("SET", "mon:q", b'say "hi"\n')
+    # A plain two-part GET is what the raw fast path would otherwise answer
+    # without ever building a command; with a monitor attached it has to fall
+    # through to the general parser and be reported like everything else.
+    worker.cmd("GET", "mon:k")
+
+    lines = watcher.read_pushed()
+    check("every monitor line matches the Redis format", lines,
+          pred=lambda got: got and all(MONITOR_LINE.match(line) for line in got))
+    check("MONITOR reports MULTI, the queued command and EXEC",
+          monitor_commands(lines),
+          ['"SET"', '"GET"', '"MULTI"', '"SET"', '"EXEC"', '"SET"', '"SET"', '"GET"'])
+    bodies = [MONITOR_LINE.match(line).group(5) for line in lines
+              if MONITOR_LINE.match(line)]
+    check("MONITOR quotes a plain command", bodies[0], '"SET" "mon:k" "v"')
+    check("MONITOR escapes a binary argument as \\xHH", bodies[5],
+          '"SET" "mon:bin" "bin\\x00\\xffz"')
+    check("MONITOR escapes quotes and newlines", bodies[6],
+          '"SET" "mon:q" "say \\"hi\\"\\n"')
+    check("MONITOR reports the fast-path GET", bodies[7], '"GET" "mon:k"')
+
+    timestamps = [float("%s.%s" % (MONITOR_LINE.match(line).group(1),
+                                   MONITOR_LINE.match(line).group(2)))
+                  for line in lines if MONITOR_LINE.match(line)]
+    check("monitor timestamps are plausible unix seconds", timestamps,
+          pred=lambda got: all(1_700_000_000 < value < 4_000_000_000 for value in got))
+    check("monitor lines report db 0", lines,
+          pred=lambda got: all(MONITOR_LINE.match(line).group(3) == "0"
+                               for line in got if MONITOR_LINE.match(line)))
+    peers = {MONITOR_LINE.match(line).group(4) for line in lines
+             if MONITOR_LINE.match(line)}
+    check("monitor lines carry one peer address, the issuing client's", peers,
+          pred=lambda got: len(got) == 1 and got.pop().startswith("127.0.0.1:"))
+
+    # Redis redacts credentials before they reach a monitor.
+    worker.cmd("AUTH", "user", "hunter2")
+    worker.cmd("HELLO", "2", "AUTH", "user", "hunter2")
+    redacted = [MONITOR_LINE.match(line).group(5) for line in watcher.read_pushed()
+                if MONITOR_LINE.match(line)]
+    check("MONITOR redacts AUTH arguments", redacted,
+          pred=lambda got: len(got) == 2
+          and got[0] == '"AUTH" "(redacted)" "(redacted)"')
+    check("MONITOR redacts HELLO AUTH arguments", redacted[1] if len(redacted) > 1 else None,
+          '"HELLO" "2" "AUTH" "(redacted)" "(redacted)"')
+
+    # The monitor still gets its own replies, and does not see its own commands.
+    check("the monitor's own PING is answered", watcher.cmd("PING"), "PONG")
+    check("the monitor's own PING is not echoed to it", watcher.read_pushed(0.4), [])
+
+    # RESET leaves monitor mode; nothing more reaches the watcher.
+    check("RESET on the monitor", watcher.cmd("RESET"), "RESET")
+    check("INFO clients no longer counts a monitor",
+          info_section(c, "clients").get("monitor_clients"), "0")
+    worker.cmd("SET", "mon:after", "v")
+    worker.cmd("GET", "mon:after")
+    check("no line reaches the client after RESET", watcher.read_pushed(0.5), [])
+
+    # MONITOR is queued inside MULTI and refused at EXEC, as in Redis.
+    check("MULTI before MONITOR", watcher.cmd("MULTI"), "OK")
+    check("MONITOR queues", watcher.cmd("MONITOR"), "QUEUED")
+    check("EXEC refuses the queued MONITOR", watcher.cmd("EXEC"),
+          pred=lambda got: isinstance(got, list) and len(got) == 1
+          and is_err(got[0], "ERR MONITOR isn't allowed for DENY BLOCKING client"))
+    check("the refused MONITOR left no monitor attached",
+          info_section(c, "clients").get("monitor_clients"), "0")
+
+    # A disconnect unregisters the monitor even without RESET or QUIT.
+    dropped = Resp(host, port)
+    check("MONITOR on a connection about to drop", dropped.cmd("MONITOR"), "OK")
+    check("INFO clients counts it", info_section(c, "clients").get("monitor_clients"), "1")
+    dropped.sock.close()
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        c.cmd("PING")
+        if info_section(c, "clients").get("monitor_clients") == "0":
+            break
+        time.sleep(0.1)
+    check("a disconnect unregisters the monitor",
+          info_section(c, "clients").get("monitor_clients"), "0")
+
+    # QUIT leaves monitor mode too.
+    quitter = Resp(host, port)
+    check("MONITOR before QUIT", quitter.cmd("MONITOR"), "OK")
+    check("QUIT from a monitor", quitter.cmd("QUIT"), "OK")
+    quitter.sock.close()
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if info_section(c, "clients").get("monitor_clients") == "0":
+            break
+        time.sleep(0.1)
+    check("QUIT leaves monitor mode",
+          info_section(c, "clients").get("monitor_clients"), "0")
+
+    # With no monitor attached the raw GET/SET fast path is back: the same two
+    # commands still answer correctly and INFO stats still counts them.
+    before = int(info_section(c, "stats").get("total_commands_processed", "0"))
+    worker.cmd("SET", "mon:fast", "v")
+    check("SET still works with the fast path restored", worker.cmd("GET", "mon:fast"), b"v")
+    after = int(info_section(c, "stats").get("total_commands_processed", "0"))
+    check("the fast path still counts its commands", after - before,
+          pred=lambda got: got >= 3)
+
+    watcher.sock.close()
+    worker.sock.close()
 
 
 def main():
@@ -1672,6 +1834,9 @@ def main():
 
     # ----- CLUSTER emulation, READONLY, READWRITE -----
     check_cluster(c, cluster_emulated())
+
+    # ----- MONITOR -----
+    check_monitor(host, port, c)
 
     c.cmd("SET", "t1", "v")
     c.cmd("SADD", "s1", "a")

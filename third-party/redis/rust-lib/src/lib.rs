@@ -606,6 +606,9 @@ enum OpCode {
     Cluster = 196,
     ReadOnly = 197,
     ReadWrite = 198,
+    // MONITOR. Local like the three above: it changes only this connection's
+    // membership in the monitor registry.
+    Monitor = 199,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -1050,6 +1053,199 @@ fn pubsub_registry() -> &'static Mutex<PubSubRegistry> {
     PUBSUB_REGISTRY.get_or_init(|| Mutex::new(PubSubRegistry::new()))
 }
 
+// ===== MONITOR =====
+//
+// A monitor is a connection that has asked to see every command any client
+// runs on this server. It is delivered exactly like a Pub/Sub message: the
+// registry holds one `PubSubTarget` per monitor, carrying a weak handle on
+// that connection's reply queue and on its worker's wake pipe, so a monitor
+// parked on another worker thread is woken the moment a line is queued for it.
+//
+// `MONITOR_COUNT` is the fast gate. It is the number of registered monitors
+// and is read with one relaxed load at the entry of the raw GET/SET fast
+// frame path; while it is zero, nothing about that path changes, and while it
+// is non-zero the path declines every frame so the general parser sees, and
+// reports, the command.
+
+static MONITOR_REGISTRY: OnceLock<Mutex<Vec<PubSubTarget>>> = OnceLock::new();
+static MONITOR_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn monitor_registry() -> &'static Mutex<Vec<PubSubTarget>> {
+    MONITOR_REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[inline]
+fn monitor_count() -> usize {
+    MONITOR_COUNT.load(Ordering::Relaxed)
+}
+
+/// Returns false when this connection was already a monitor, which Redis
+/// answers with a plain OK all the same.
+fn register_monitor(client_state: &mut ClientState) -> bool {
+    if client_state.monitoring {
+        return false;
+    }
+    let target = make_pubsub_target(client_state);
+    let registered = if let Ok(mut monitors) = monitor_registry().lock() {
+        monitors.retain(|monitor| monitor.queue.strong_count() > 0);
+        monitors.push(target);
+        MONITOR_COUNT.store(monitors.len(), Ordering::Relaxed);
+        true
+    } else {
+        false
+    };
+    if registered {
+        client_state.monitoring = true;
+        // A worker parked in poll() has to notice that the fast path is now
+        // closed before its clients' next frame.
+        notify_all_workers();
+    }
+    registered
+}
+
+fn unregister_monitor(client_state: &mut ClientState) {
+    if !client_state.monitoring {
+        return;
+    }
+    client_state.monitoring = false;
+    if let Ok(mut monitors) = monitor_registry().lock() {
+        monitors.retain(|monitor| {
+            monitor.queue.strong_count() > 0 && monitor.client_id != client_state.id
+        });
+        MONITOR_COUNT.store(monitors.len(), Ordering::Relaxed);
+    }
+}
+
+/// Everything a connection has to give up when it goes away, resets, or quits.
+fn unregister_all_client_feeds(client_state: &mut ClientState) {
+    unregister_all_pubsub(client_state);
+    unregister_monitor(client_state);
+}
+
+/// Redis `sdscatrepr`: the argument in double quotes, with `"` and `\`
+/// backslash-escaped, the five control characters Redis names spelled out, and
+/// every other non-printable byte as `\xHH`. Bytes above 0x7e are not printable
+/// in Redis's C locale, so they are escaped too.
+fn monitor_quote_arg(out: &mut String, arg: &[u8]) {
+    out.push('"');
+    for byte in arg {
+        match *byte {
+            b'\\' => out.push_str("\\\\"),
+            b'"' => out.push_str("\\\""),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x07 => out.push_str("\\a"),
+            0x08 => out.push_str("\\b"),
+            0x20..=0x7e => out.push(*byte as char),
+            other => out.push_str(&format!("\\x{other:02x}")),
+        }
+    }
+    out.push('"');
+}
+
+/// One monitor line: `+<sec>.<usec> [<db> <ip>:<port>] "CMD" "arg"...`, the
+/// shape Redis builds in `replicationFeedMonitors`. The db is 0 because this
+/// server has one keyspace; package 6 adds SELECT and would pass the
+/// connection's selected db in here instead.
+fn format_monitor_line(db: u32, peer: &str, argv: &[Bytes]) -> Vec<u8> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let mut line = String::with_capacity(64 + argv.len() * 16);
+    line.push('+');
+    line.push_str(&now.as_secs().to_string());
+    line.push('.');
+    line.push_str(&format!("{:06}", now.subsec_micros()));
+    line.push_str(" [");
+    line.push_str(&db.to_string());
+    line.push(' ');
+    line.push_str(peer);
+    line.push_str("] ");
+    for (index, arg) in argv.iter().enumerate() {
+        if index > 0 {
+            line.push(' ');
+        }
+        monitor_quote_arg(&mut line, arg);
+    }
+    line.push_str("\r\n");
+    line.into_bytes()
+}
+
+/// Redis `redactClientCommandArgument`: a password must not reach a monitor.
+/// Returns a rewritten argv, or None when there is nothing to hide. Redis also
+/// redacts MIGRATE's AUTH/AUTH2 arguments; MIGRATE is not offered here.
+fn monitor_redact_argv(argv: &[Bytes]) -> Option<Vec<Bytes>> {
+    const REDACTED: Bytes = Bytes::from_static(b"(redacted)");
+    let name = argv.first()?.as_ref();
+    if ascii_eq_ci(name, b"AUTH") {
+        let mut out = Vec::with_capacity(argv.len());
+        out.push(argv[0].clone());
+        out.resize(argv.len(), REDACTED);
+        return Some(out);
+    }
+    if ascii_eq_ci(name, b"HELLO") {
+        // HELLO [protover [AUTH username password] [SETNAME name]].
+        let position = argv
+            .iter()
+            .skip(2)
+            .position(|arg| ascii_eq_ci(arg.as_ref(), b"AUTH"))
+            .map(|offset| offset + 2)?;
+        let mut out = argv.to_vec();
+        for slot in out.iter_mut().skip(position + 1).take(2) {
+            *slot = REDACTED;
+        }
+        return Some(out);
+    }
+    None
+}
+
+/// Report one command to every attached monitor except the client that issued
+/// it. Called before the command runs, so the line is out even if the command
+/// goes on to fail, exactly as in Redis.
+fn feed_monitors(client_state: &ClientState, argv: &[Bytes]) {
+    if argv.is_empty() || monitor_count() == 0 {
+        return;
+    }
+    let redacted = monitor_redact_argv(argv);
+    let argv = redacted.as_deref().unwrap_or(argv);
+    let targets: Vec<PubSubTarget> = {
+        let Ok(monitors) = monitor_registry().lock() else {
+            return;
+        };
+        monitors
+            .iter()
+            .filter(|monitor| monitor.client_id != client_state.id)
+            .cloned()
+            .collect()
+    };
+    if targets.is_empty() {
+        return;
+    }
+    let line = format_monitor_line(0, &client_state.peer_addr, argv);
+    for target in &targets {
+        enqueue_pubsub_reply(target, &line);
+    }
+}
+
+/// The argv a monitor should see, taken from the frame before it is parsed so
+/// the line carries what the client actually sent. Only built while a monitor
+/// is attached.
+fn monitor_argv_from_frame(frame: &DecodedFrame<BytesFrame>) -> Option<Vec<Bytes>> {
+    let DecodedFrame::Complete(BytesFrame::Array { data, .. }) = frame else {
+        return None;
+    };
+    let mut argv = Vec::with_capacity(data.len());
+    for part in data.iter() {
+        argv.push(frame_to_bytes(part)?);
+    }
+    if argv.is_empty() {
+        None
+    } else {
+        Some(argv)
+    }
+}
+
 fn unblock_requests() -> &'static Mutex<HashMap<usize, bool>> {
     UNBLOCK_REQUESTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -1085,6 +1281,11 @@ struct ClientState {
     subscribed_shard_channels: HashSet<Bytes>,
     pubsub_queue: PubSubQueue,
     worker_wake: Option<Weak<WorkerWake>>,
+    /// True while this connection is in MONITOR mode.
+    monitoring: bool,
+    /// The peer address recorded when the connection was accepted, printed in
+    /// every monitor line this client causes.
+    peer_addr: String,
 }
 
 impl ClientState {
@@ -1109,6 +1310,8 @@ impl ClientState {
             subscribed_shard_channels: HashSet::new(),
             pubsub_queue: Arc::new(Mutex::new(VecDeque::new())),
             worker_wake,
+            monitoring: false,
+            peer_addr: String::from("127.0.0.1:0"),
         }
     }
 
@@ -1522,6 +1725,8 @@ fn parse_opcode(name: &[u8]) -> Option<OpCode> {
         Some(OpCode::PfCount)
     } else if ascii_eq_ci(name, b"PFMERGE") {
         Some(OpCode::PfMerge)
+    } else if ascii_eq_ci(name, b"MONITOR") {
+        Some(OpCode::Monitor)
     } else if ascii_eq_ci(name, b"CLUSTER") {
         Some(OpCode::Cluster)
     } else if ascii_eq_ci(name, b"READONLY") {
@@ -5116,6 +5321,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
         | OpCode::Cluster
         | OpCode::ReadOnly
         | OpCode::ReadWrite
+        | OpCode::Monitor
         | OpCode::Acl
         | OpCode::Config
         | OpCode::Script
@@ -5154,6 +5360,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 OpCode::Cluster if parts.len() < 2 => Some("cluster"),
                 OpCode::ReadOnly if parts.len() != 1 => Some("readonly"),
                 OpCode::ReadWrite if parts.len() != 1 => Some("readwrite"),
+                OpCode::Monitor if parts.len() != 1 => Some("monitor"),
                 OpCode::Acl if parts.len() < 2 => Some("acl"),
                 OpCode::Wait if parts.len() != 3 => Some("wait"),
                 OpCode::Time if parts.len() != 1 => Some("time"),
@@ -9107,6 +9314,12 @@ fn write_command_result<W: Write>(
         handle_publish(cmd, writer)?;
         return Ok(());
     }
+    if cmd.op == OpCode::Monitor {
+        // Redis's monitorCommand refuses a client that owes a reply per
+        // command, which is every client inside MULTI.
+        write_err(writer, "MONITOR isn't allowed for DENY BLOCKING client")?;
+        return Ok(());
+    }
     if cmd.op == OpCode::Cluster {
         handle_cluster_command(cmd, cluster_mode(), writer)?;
         return Ok(());
@@ -10668,7 +10881,7 @@ pub extern "C" fn rust_init(n_threads: usize) -> bool {
                             }
                             Ok(ClientEvent::Close) => {
                                 clients[idx].clear_blocked();
-                                unregister_all_pubsub(&mut clients[idx].client_state);
+                                unregister_all_client_feeds(&mut clients[idx].client_state);
                                 clients.swap_remove(idx);
                                 CONNECTED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
                                 made_progress = true;
@@ -10681,7 +10894,7 @@ pub extern "C" fn rust_init(n_threads: usize) -> bool {
                                 ) =>
                             {
                                 clients[idx].clear_blocked();
-                                unregister_all_pubsub(&mut clients[idx].client_state);
+                                unregister_all_client_feeds(&mut clients[idx].client_state);
                                 clients.swap_remove(idx);
                                 CONNECTED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
                                 made_progress = true;
@@ -10689,7 +10902,7 @@ pub extern "C" fn rust_init(n_threads: usize) -> bool {
                             Err(e) => {
                                 eprintln!("Client handling error: {e}");
                                 clients[idx].clear_blocked();
-                                unregister_all_pubsub(&mut clients[idx].client_state);
+                                unregister_all_client_feeds(&mut clients[idx].client_state);
                                 clients.swap_remove(idx);
                                 CONNECTED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
                                 made_progress = true;
@@ -10853,13 +11066,21 @@ struct BlockedCommand {
 
 impl ClientConn {
     fn new(stream: TcpStream, worker_wake: &Arc<WorkerWake>) -> Self {
+        // Recorded once, at accept time: MONITOR prints it on every line this
+        // connection causes, and a closed socket can no longer report it.
+        let peer_addr = stream
+            .peer_addr()
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|_| String::from("?:0"));
+        let mut client_state = ClientState::for_worker(worker_wake);
+        client_state.peer_addr = peer_addr;
         ClientConn {
             stream,
             resp3: Resp3Handler::new(10 * 1024 * 1024),
             read_buf: [0u8; 16384],
             write_buf: Vec::with_capacity(16384),
             txn_state: TransactionState::new(),
-            client_state: ClientState::for_worker(worker_wake),
+            client_state,
             close_after_write: false,
             blocked_command: None,
             pending_command: None,
@@ -11549,7 +11770,14 @@ fn bump_key_version_raw(key: &[u8]) {
 }
 
 fn can_use_raw_mako_fast_path(client: &ClientConn) -> bool {
-    redis_backend() == RedisBackend::Mako
+    // One relaxed load, and the only change this package makes to the fast
+    // path. A monitor has to see GET and SET like every other command, and the
+    // shortcut never builds a Command to report, so while any monitor is
+    // attached every frame goes to the general parser instead. With no monitor
+    // the load is a cached read of a never-written line and nothing else here
+    // changes.
+    MONITOR_COUNT.load(Ordering::Relaxed) == 0
+        && redis_backend() == RedisBackend::Mako
         && !client.txn_state.in_multi
         && !client.client_state.in_subscriber_mode()
         && client.pending_command.is_none()
@@ -11614,8 +11842,27 @@ fn process_buffered_frames(
         match client.resp3.next_frame() {
             Ok(Some(frame)) => {
                 made_progress = true;
+                // Taken from the frame, before parsing consumes it, so a
+                // monitor sees the argument bytes the client sent. Built only
+                // while a monitor is attached.
+                let monitor_argv = if monitor_count() != 0 {
+                    monitor_argv_from_frame(&frame)
+                } else {
+                    None
+                };
                 match parse_resp3(frame) {
                     Ok(cmd) => {
+                        // Redis reports a command before running it, and only
+                        // one it recognized, so this sits after the parse and
+                        // before every path that can execute the command:
+                        // the deferred-write path re-enters
+                        // execute_or_block_command later with this same
+                        // command and must not report it twice, and a
+                        // blocking command that parks is reported once, when
+                        // it arrives.
+                        if let Some(argv) = monitor_argv {
+                            feed_monitors(&client.client_state, &argv);
+                        }
                         if should_defer_dirty_command(client, &cmd) {
                             client.pending_command = Some(cmd);
                             break;
@@ -13932,6 +14179,9 @@ fn append_clients_info(out: &mut String) {
     out.push_str("blocked_clients:");
     out.push_str(&BLOCKED_CLIENTS.load(Ordering::Relaxed).to_string());
     out.push_str("\r\n");
+    out.push_str("monitor_clients:");
+    out.push_str(&monitor_count().to_string());
+    out.push_str("\r\n");
     out.push_str("pubsub_channels:");
     out.push_str(&pubsub_channel_count().to_string());
     out.push_str("\r\n");
@@ -14156,12 +14406,13 @@ fn handle_command<W: Write>(
         }
         OpCode::Reset => {
             txn_state.discard();
-            unregister_all_pubsub(client_state);
+            // RESET and QUIT both leave monitor mode, as in Redis.
+            unregister_all_client_feeds(client_state);
             client_state.reset();
             write_simple_string(writer, "RESET")?;
         }
         OpCode::Quit => {
-            unregister_all_pubsub(client_state);
+            unregister_all_client_feeds(client_state);
             client_state.close_after_reply = true;
             write_simple_ok(writer)?;
         }
@@ -14336,6 +14587,19 @@ fn handle_command<W: Write>(
                 write_queued(writer)?;
             } else {
                 handle_sunsubscribe(cmd, client_state, writer)?;
+            }
+        }
+        OpCode::Monitor => {
+            if txn_state.in_multi {
+                // Redis queues MONITOR and then refuses it at EXEC, because a
+                // transaction owes one reply per queued command and a monitor
+                // client's stream is not one. `write_command_result` produces
+                // that error.
+                txn_state.queue_command(cmd.clone());
+                write_queued(writer)?;
+            } else {
+                register_monitor(client_state);
+                write_simple_ok(writer)?;
             }
         }
         OpCode::Cluster => {
@@ -14877,6 +15141,201 @@ mod tests {
         let mut out = Vec::new();
         handle_cluster_command(&command(OpCode::Cluster, args), mode, &mut out).unwrap();
         out
+    }
+
+    #[test]
+    fn monitor_quotes_arguments_like_sdscatrepr() {
+        let quote = |arg: &[u8]| {
+            let mut out = String::new();
+            monitor_quote_arg(&mut out, arg);
+            out
+        };
+        assert_eq!(quote(b"plain"), "\"plain\"");
+        assert_eq!(quote(b""), "\"\"");
+        assert_eq!(quote(b"say \"hi\""), "\"say \\\"hi\\\"\"");
+        assert_eq!(quote(b"back\\slash"), "\"back\\\\slash\"");
+        assert_eq!(
+            quote(b"\n\r\t\x07\x08"),
+            "\"\\n\\r\\t\\a\\b\""
+        );
+        // Everything else outside printable ASCII is \xHH, lowercase, and the
+        // bytes above 0x7e are not printable in Redis's C locale either.
+        assert_eq!(quote(b"\x00\x01\x1f\x7f\x80\xff"), "\"\\x00\\x01\\x1f\\x7f\\x80\\xff\"");
+        assert_eq!(quote(" !~".as_bytes()), "\" !~\"");
+    }
+
+    #[test]
+    fn monitor_redacts_credentials_like_redis() {
+        let argv = |args: &[&[u8]]| -> Vec<Bytes> {
+            args.iter().map(|arg| Bytes::copy_from_slice(arg)).collect()
+        };
+        assert_eq!(
+            monitor_redact_argv(&argv(&[b"AUTH", b"hunter2"])).unwrap(),
+            argv(&[b"AUTH", b"(redacted)"])
+        );
+        assert_eq!(
+            monitor_redact_argv(&argv(&[b"auth", b"user", b"hunter2"])).unwrap(),
+            argv(&[b"auth", b"(redacted)", b"(redacted)"])
+        );
+        assert_eq!(
+            monitor_redact_argv(&argv(&[b"HELLO", b"3", b"AUTH", b"user", b"pw"])).unwrap(),
+            argv(&[b"HELLO", b"3", b"AUTH", b"(redacted)", b"(redacted)"])
+        );
+        assert!(monitor_redact_argv(&argv(&[b"HELLO", b"3"])).is_none());
+        assert!(monitor_redact_argv(&argv(&[b"GET", b"AUTH"])).is_none());
+    }
+
+    #[test]
+    fn monitor_line_has_the_redis_shape() {
+        let argv = vec![
+            Bytes::from_static(b"SET"),
+            Bytes::from_static(b"k"),
+            Bytes::from_static(b"a\nb"),
+        ];
+        let line = format_monitor_line(0, "127.0.0.1:54321", &argv);
+        let line = String::from_utf8(line).unwrap();
+        assert!(line.starts_with('+'), "{line}");
+        assert!(line.ends_with("\r\n"), "{line}");
+        let body = line.trim_start_matches('+').trim_end_matches("\r\n");
+        let (stamp, rest) = body.split_once(' ').unwrap();
+        let (seconds, micros) = stamp.split_once('.').unwrap();
+        assert!(seconds.bytes().all(|byte| byte.is_ascii_digit()), "{stamp}");
+        assert_eq!(micros.len(), 6, "{stamp}");
+        assert!(micros.bytes().all(|byte| byte.is_ascii_digit()), "{stamp}");
+        assert_eq!(
+            rest,
+            "[0 127.0.0.1:54321] \"SET\" \"k\" \"a\\nb\"",
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn monitor_argv_comes_from_the_frame_before_parsing() {
+        let mut resp3 = Resp3Handler::new(1024);
+        resp3.read_bytes(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$2\r\nhi\r\n");
+        let frame = resp3.next_frame().unwrap().unwrap();
+        let argv = monitor_argv_from_frame(&frame).unwrap();
+        assert_eq!(argv, vec![Bytes::from_static(b"SET"), Bytes::from_static(b"k"), Bytes::from_static(b"hi")]);
+    }
+
+    #[test]
+    fn monitor_inside_multi_is_refused_at_exec() {
+        let mut txn_state = TransactionState::new();
+        let mut client_state = ClientState::new();
+        txn_state.start_multi();
+        assert_eq!(
+            run(command(OpCode::Monitor, &[]), &mut txn_state, &mut client_state),
+            b"+QUEUED\r\n"
+        );
+        assert!(!client_state.monitoring);
+
+        let mut out = Vec::new();
+        write_command_result(&command(OpCode::Monitor, &[]), None, (0, 0), 2, &mut out).unwrap();
+        assert_eq!(
+            out,
+            b"-ERR MONITOR isn't allowed for DENY BLOCKING client\r\n"
+        );
+
+        assert_eq!(
+            run_raw(b"*2\r\n$7\r\nMONITOR\r\n$1\r\nx\r\n"),
+            b"-ERR wrong number of arguments for 'monitor' command\r\n"
+        );
+    }
+
+    /// Everything that touches the process-global monitor registry lives in one
+    /// test: MONITOR_COUNT gates the raw fast path for every connection, so two
+    /// tests racing on it would see each other's registrations.
+    #[test]
+    fn monitor_registration_gates_the_fast_path_and_skips_the_monitor_itself() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client_side = TcpStream::connect(address).unwrap();
+        let client_address = client_side.local_addr().unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        drop(client_side);
+        let wake = Arc::new(WorkerWake::new().unwrap());
+        let mut conn = ClientConn::new(accepted, &wake);
+
+        assert_eq!(monitor_count(), 0);
+        assert!(
+            can_use_raw_mako_fast_path(&conn),
+            "the fast path must be open with no monitor attached"
+        );
+        // The peer address recorded at accept time is the client's, not the
+        // listening socket's.
+        assert_eq!(conn.client_state.peer_addr, client_address.to_string());
+
+        let mut monitor_state = ClientState::for_worker(&wake);
+        monitor_state.peer_addr = String::from("127.0.0.1:1");
+        assert!(register_monitor(&mut monitor_state));
+        assert!(monitor_state.monitoring);
+        assert_eq!(monitor_count(), 1);
+        // A second MONITOR from the same connection is a no-op.
+        assert!(!register_monitor(&mut monitor_state));
+        assert_eq!(monitor_count(), 1);
+
+        assert!(
+            !can_use_raw_mako_fast_path(&conn),
+            "an attached monitor must close the raw GET/SET shortcut"
+        );
+
+        // A command from another client is echoed to the monitor...
+        conn.client_state.peer_addr = String::from("127.0.0.1:2");
+        feed_monitors(
+            &conn.client_state,
+            &[Bytes::from_static(b"GET"), Bytes::from_static(b"k")],
+        );
+        // ...and the monitor's own is not.
+        feed_monitors(
+            &monitor_state,
+            &[Bytes::from_static(b"PING")],
+        );
+        let delivered: Vec<String> = {
+            let mut queue = monitor_state.pubsub_queue.lock().unwrap();
+            queue
+                .drain(..)
+                .map(|line| String::from_utf8(line).unwrap())
+                .collect()
+        };
+        assert_eq!(delivered.len(), 1, "{delivered:?}");
+        assert!(
+            delivered[0].ends_with("[0 127.0.0.1:2] \"GET\" \"k\"\r\n"),
+            "{}",
+            delivered[0]
+        );
+
+        let mut info = String::new();
+        append_clients_info(&mut info);
+        assert!(info.contains("monitor_clients:1\r\n"), "{info}");
+
+        // RESET leaves monitor mode and reopens the fast path.
+        let mut txn_state = TransactionState::new();
+        assert_eq!(
+            run(command(OpCode::Reset, &[]), &mut txn_state, &mut monitor_state),
+            b"+RESET\r\n"
+        );
+        assert!(!monitor_state.monitoring);
+        assert_eq!(monitor_count(), 0);
+        assert!(can_use_raw_mako_fast_path(&conn));
+
+        let mut info = String::new();
+        append_clients_info(&mut info);
+        assert!(info.contains("monitor_clients:0\r\n"), "{info}");
+
+        // QUIT leaves it too.
+        assert!(register_monitor(&mut monitor_state));
+        assert_eq!(monitor_count(), 1);
+        assert_eq!(
+            run(command(OpCode::Quit, &[]), &mut txn_state, &mut monitor_state),
+            b"+OK\r\n"
+        );
+        assert_eq!(monitor_count(), 0);
+
+        // So does dropping the connection's state without a command.
+        assert!(register_monitor(&mut monitor_state));
+        unregister_all_client_feeds(&mut monitor_state);
+        assert_eq!(monitor_count(), 0);
+        assert!(can_use_raw_mako_fast_path(&conn));
     }
 
     #[test]
