@@ -392,9 +392,9 @@ does not select a file. Use `TCL_COMPAT_FILES` for file selection.
 
 ## Phase 2 and 3 Command Additions
 
-The `redis-compat-phase2` branch and, for the HyperLogLog, `BITFIELD`, Geo
-and hash-field-expiry rows, the `redis-compat-phase3` branch add the following
-on top of PR 72, all implemented in the adapter with no changes below
+The `redis-compat-phase2` branch and, for the HyperLogLog, `BITFIELD`, Geo,
+hash-field-expiry and Cluster rows, the `redis-compat-phase3` branch add the
+following on top of PR 72, all implemented in the adapter with no changes below
 `makoCon`:
 
 | Area | Commands |
@@ -406,8 +406,12 @@ on top of PR 72, all implemented in the adapter with no changes below
 | Keyspace | `TOUCH`, `SORT_RO`, `SORT ... LIMIT offset count`, `OBJECT ENCODING/REFCOUNT/HELP`, approximate `MEMORY USAGE` |
 | DUMP/RESTORE | string, set, and sorted-set payloads (`MAKO_STRING_DUMP`, `MAKO_SET_DUMP`, `MAKO_ZSET_DUMP`), TTL and `ABSTTL` honored on RESTORE |
 | Pub/Sub | `SPUBLISH`, `SSUBSCRIBE`, `SUNSUBSCRIBE`, `PUBSUB SHARDCHANNELS/SHARDNUMSUB` (process-local, like classic Pub/Sub) |
+| Cluster | `CLUSTER INFO/MYID/SLOTS/SHARDS/NODES/KEYSLOT/COUNTKEYSINSLOT/GETKEYSINSLOT/HELP`, `READONLY`, `READWRITE`, `INFO cluster` — opt-in through `MAKO_REDIS_CLUSTER_MODE`. The default `off` answers all three commands with `ERR This instance has cluster support disabled` and reports `cluster_enabled:0`. `emulated` presents the single server as a one-node cluster owning slots 0-16383, the way Dragonfly's emulated mode does, so client libraries that will only speak to a cluster can build a slot map: `KEYSLOT` is Redis's CRC16 (XMODEM) of the hash tag mod 16384 with `keyHashSlot`'s `{...}` rules, and the advertised address comes from `MAKO_REDIS_ANNOUNCE_HOST`/`MAKO_REDIS_ANNOUNCE_PORT` falling back to `MAKO_HOST`/`MAKO_PORT`. Nothing is sharded: no `MOVED`/`ASK`, no slot migration, and `COUNTKEYSINSLOT`/`GETKEYSINSLOT` answer 0 and empty |
 | Observability shims | `SLOWLOG`, `LATENCY`, `ACL` (single implicit `default` user), `INFO keyspace` (`db0:keys=N`, cached 2 s), `CONFIG GET` for `maxmemory-policy`, `timeout`, `maxclients`, `tcp-keepalive`, `hz`, `notify-keyspace-events`, `protected-mode`, `port` |
 
-`test_phase2_commands.py HOST PORT` exercises every addition against a live
-server with a dependency-free RESP client. Deliberate deviations are recorded
-in `known_divergences.txt`.
+`test_phase2_commands.py HOST PORT [cluster]` exercises every addition against a
+live server with a dependency-free RESP client. The optional third argument, or
+`MAKO_REDIS_CLUSTER_MODE=emulated` in the environment, tells it to assert the
+emulated cluster shapes rather than the disabled-mode errors, so the same script
+covers a server started either way. Deliberate deviations are recorded in
+`known_divergences.txt`.

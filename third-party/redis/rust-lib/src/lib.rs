@@ -600,6 +600,12 @@ enum OpCode {
     HExpireTime = 193,
     HPExpireTime = 194,
     HPersist = 195,
+    // Single-node CLUSTER emulation. None of the three is a storage op: they
+    // answer from process configuration alone, so they are local arms in
+    // `handle_command` the way SLOWLOG is.
+    Cluster = 196,
+    ReadOnly = 197,
+    ReadWrite = 198,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -1516,6 +1522,12 @@ fn parse_opcode(name: &[u8]) -> Option<OpCode> {
         Some(OpCode::PfCount)
     } else if ascii_eq_ci(name, b"PFMERGE") {
         Some(OpCode::PfMerge)
+    } else if ascii_eq_ci(name, b"CLUSTER") {
+        Some(OpCode::Cluster)
+    } else if ascii_eq_ci(name, b"READONLY") {
+        Some(OpCode::ReadOnly)
+    } else if ascii_eq_ci(name, b"READWRITE") {
+        Some(OpCode::ReadWrite)
     } else if ascii_eq_ci(name, b"SLOWLOG") {
         Some(OpCode::SlowLog)
     } else if ascii_eq_ci(name, b"LATENCY") {
@@ -5101,6 +5113,9 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
         | OpCode::Memory
         | OpCode::SlowLog
         | OpCode::Latency
+        | OpCode::Cluster
+        | OpCode::ReadOnly
+        | OpCode::ReadWrite
         | OpCode::Acl
         | OpCode::Config
         | OpCode::Script
@@ -5136,6 +5151,9 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 OpCode::Memory if parts.len() < 2 => Some("memory"),
                 OpCode::SlowLog if parts.len() < 2 => Some("slowlog"),
                 OpCode::Latency if parts.len() < 2 => Some("latency"),
+                OpCode::Cluster if parts.len() < 2 => Some("cluster"),
+                OpCode::ReadOnly if parts.len() != 1 => Some("readonly"),
+                OpCode::ReadWrite if parts.len() != 1 => Some("readwrite"),
                 OpCode::Acl if parts.len() < 2 => Some("acl"),
                 OpCode::Wait if parts.len() != 3 => Some("wait"),
                 OpCode::Time if parts.len() != 1 => Some("time"),
@@ -9087,6 +9105,14 @@ fn write_command_result<W: Write>(
     }
     if cmd.op == OpCode::Publish {
         handle_publish(cmd, writer)?;
+        return Ok(());
+    }
+    if cmd.op == OpCode::Cluster {
+        handle_cluster_command(cmd, cluster_mode(), writer)?;
+        return Ok(());
+    }
+    if matches!(cmd.op, OpCode::ReadOnly | OpCode::ReadWrite) {
+        write_cluster_readonly_reply(cluster_mode(), writer)?;
         return Ok(());
     }
     if cmd.op == OpCode::Config {
@@ -13141,6 +13167,294 @@ fn write_string_array<W: Write>(writer: &mut W, items: &[&str]) -> std::io::Resu
     Ok(())
 }
 
+// ===== Single-node CLUSTER emulation =====
+//
+// `MAKO_REDIS_CLUSTER_MODE=emulated` makes this one server describe itself as a
+// one-node cluster owning every slot, the way Dragonfly's emulated cluster mode
+// does: client libraries that insist on speaking to a cluster can build their
+// slot map, discover the single node and keep using it. Nothing is sharded.
+// There is one keyspace, one node, no MOVED/ASK redirection, no epoch bumps and
+// no slot migration, so the emulation is descriptive only. The default `off`
+// leaves the pre-package-5 behavior in place: CLUSTER, READONLY and READWRITE
+// all report that cluster support is disabled.
+
+const CLUSTER_SLOT_COUNT: u16 = 16384;
+const CLUSTER_LAST_SLOT: u16 = CLUSTER_SLOT_COUNT - 1;
+const CLUSTER_DISABLED_ERROR: &str = "This instance has cluster support disabled";
+/// Redis's cluster bus listens on the client port plus this offset.
+const CLUSTER_BUS_PORT_OFFSET: u32 = 10000;
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum ClusterMode {
+    Off,
+    Emulated,
+}
+
+static CLUSTER_MODE: OnceLock<ClusterMode> = OnceLock::new();
+static CLUSTER_ANNOUNCE: OnceLock<(String, u32)> = OnceLock::new();
+static CLUSTER_NODE_ID: OnceLock<String> = OnceLock::new();
+
+fn cluster_mode() -> ClusterMode {
+    *CLUSTER_MODE.get_or_init(|| match env::var("MAKO_REDIS_CLUSTER_MODE") {
+        Ok(value) if value.eq_ignore_ascii_case("emulated") => ClusterMode::Emulated,
+        Ok(value) if value.eq_ignore_ascii_case("off") => ClusterMode::Off,
+        Ok(value) => {
+            eprintln!("Unknown MAKO_REDIS_CLUSTER_MODE={value}; defaulting to off");
+            ClusterMode::Off
+        }
+        Err(_) => ClusterMode::Off,
+    })
+}
+
+/// The host and port this node advertises in SLOTS/SHARDS/NODES. A client that
+/// reached the server through a forwarder needs the address it should dial, not
+/// the bind address, so the announce pair wins over the listen pair.
+fn cluster_announce() -> &'static (String, u32) {
+    CLUSTER_ANNOUNCE.get_or_init(|| {
+        let host = env::var("MAKO_REDIS_ANNOUNCE_HOST")
+            .or_else(|_| env::var("MAKO_HOST"))
+            .unwrap_or_else(|_| "127.0.0.1".to_string());
+        let port = env::var("MAKO_REDIS_ANNOUNCE_PORT")
+            .or_else(|_| env::var("MAKO_PORT"))
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(6380);
+        (host, port)
+    })
+}
+
+/// A stable 40-hex-character node id, the shape Redis writes into nodes.conf.
+/// Redis fills its own with random bytes and remembers it on disk; this one has
+/// to be the same after a restart without a file to remember it in, so it is
+/// derived from the advertised address by five FNV-1a passes, each seeded
+/// differently and contributing eight hex digits. It is not a SHA-1 and makes
+/// no cryptographic claim: it only has to be constant and well-formed.
+fn cluster_node_id() -> &'static str {
+    CLUSTER_NODE_ID.get_or_init(|| {
+        let (host, port) = cluster_announce();
+        let address = format!("{host}:{port}");
+        let mut id = String::with_capacity(40);
+        for round in 0..5u64 {
+            let mut hash: u64 =
+                0xcbf2_9ce4_8422_2325 ^ round.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            for byte in address.as_bytes() {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            // One finalizing round so the high bits, which is what gets
+            // printed, depend on every input byte.
+            hash ^= hash >> 33;
+            hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
+            hash ^= hash >> 29;
+            id.push_str(&format!("{:08x}", (hash >> 32) as u32));
+        }
+        id
+    })
+}
+
+/// Redis `crc16`: CRC-16/XMODEM, polynomial 0x1021, zero init, no reflection,
+/// no final xor. Computed a bit at a time rather than from Redis's 256-entry
+/// table; CLUSTER KEYSLOT is not on a hot path.
+fn cluster_crc16(data: &[u8]) -> u16 {
+    let mut crc: u16 = 0;
+    for byte in data {
+        crc ^= u16::from(*byte) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x1021
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+/// Redis `keyHashSlot`: hash only what lies between the first `{` and the first
+/// `}` after it, and only when that span is non-empty; otherwise hash the whole
+/// key. `{}` and `foo{}{bar}` therefore hash whole, which is what makes hash
+/// tags composable.
+fn cluster_key_slot(key: &[u8]) -> u16 {
+    let whole = |key: &[u8]| cluster_crc16(key) % CLUSTER_SLOT_COUNT;
+    let Some(open) = key.iter().position(|byte| *byte == b'{') else {
+        return whole(key);
+    };
+    let Some(close) = key[open + 1..].iter().position(|byte| *byte == b'}') else {
+        return whole(key);
+    };
+    if close == 0 {
+        return whole(key);
+    }
+    cluster_crc16(&key[open + 1..open + 1 + close]) % CLUSTER_SLOT_COUNT
+}
+
+fn cluster_info_body() -> String {
+    let mut out = String::new();
+    out.push_str("cluster_state:ok\r\n");
+    out.push_str("cluster_slots_assigned:16384\r\n");
+    out.push_str("cluster_slots_ok:16384\r\n");
+    out.push_str("cluster_slots_pfail:0\r\n");
+    out.push_str("cluster_slots_fail:0\r\n");
+    out.push_str("cluster_known_nodes:1\r\n");
+    out.push_str("cluster_size:1\r\n");
+    out.push_str("cluster_current_epoch:1\r\n");
+    out.push_str("cluster_my_epoch:1\r\n");
+    out.push_str("cluster_stats_messages_sent:0\r\n");
+    out.push_str("cluster_stats_messages_received:0\r\n");
+    out
+}
+
+/// The one line Redis's CLUSTER NODES would print for a single master holding
+/// every slot: `<id> <ip>:<port>@<bus> myself,master - <ping> <pong> <epoch>
+/// connected <slots>`.
+fn cluster_nodes_body() -> String {
+    let (host, port) = cluster_announce();
+    let id = cluster_node_id();
+    let bus = u64::from(*port) + u64::from(CLUSTER_BUS_PORT_OFFSET);
+    format!("{id} {host}:{port}@{bus} myself,master - 0 0 1 connected 0-{CLUSTER_LAST_SLOT}\n")
+}
+
+/// READONLY and READWRITE: in a real cluster they steer reads at replicas, and
+/// with one master and no replicas there is nothing to steer, so emulated mode
+/// accepts both and does nothing.
+fn write_cluster_readonly_reply<W: Write>(
+    mode: ClusterMode,
+    writer: &mut W,
+) -> std::io::Result<()> {
+    if mode == ClusterMode::Emulated {
+        write_simple_ok(writer)
+    } else {
+        write_err(writer, CLUSTER_DISABLED_ERROR)
+    }
+}
+
+fn handle_cluster_command<W: Write>(
+    cmd: &Command,
+    mode: ClusterMode,
+    writer: &mut W,
+) -> std::io::Result<()> {
+    if mode == ClusterMode::Off {
+        return write_err(writer, CLUSTER_DISABLED_ERROR);
+    }
+    let subcommand = cmd.args.first().map(|arg| arg.as_ref()).unwrap_or(b"");
+    let (host, port) = cluster_announce();
+    let id = cluster_node_id();
+
+    if ascii_eq_ci(subcommand, b"INFO") {
+        write_bulk(writer, cluster_info_body().as_bytes())
+    } else if ascii_eq_ci(subcommand, b"MYID") {
+        write_bulk(writer, id.as_bytes())
+    } else if ascii_eq_ci(subcommand, b"SLOTS") {
+        write_array_header(writer, 1)?;
+        write_array_header(writer, 3)?;
+        write_integer(writer, 0)?;
+        write_integer(writer, i64::from(CLUSTER_LAST_SLOT))?;
+        write_array_header(writer, 3)?;
+        write_bulk(writer, host.as_bytes())?;
+        write_integer(writer, i64::from(*port))?;
+        write_bulk(writer, id.as_bytes())
+    } else if ascii_eq_ci(subcommand, b"SHARDS") {
+        write_array_header(writer, 1)?;
+        write_array_header(writer, 4)?;
+        write_bulk(writer, b"slots")?;
+        write_array_header(writer, 2)?;
+        write_integer(writer, 0)?;
+        write_integer(writer, i64::from(CLUSTER_LAST_SLOT))?;
+        write_bulk(writer, b"nodes")?;
+        write_array_header(writer, 1)?;
+        write_array_header(writer, 14)?;
+        write_bulk(writer, b"id")?;
+        write_bulk(writer, id.as_bytes())?;
+        write_bulk(writer, b"port")?;
+        write_integer(writer, i64::from(*port))?;
+        write_bulk(writer, b"ip")?;
+        write_bulk(writer, host.as_bytes())?;
+        write_bulk(writer, b"endpoint")?;
+        write_bulk(writer, host.as_bytes())?;
+        write_bulk(writer, b"role")?;
+        write_bulk(writer, b"master")?;
+        write_bulk(writer, b"replication-offset")?;
+        write_integer(writer, 0)?;
+        write_bulk(writer, b"health")?;
+        write_bulk(writer, b"online")
+    } else if ascii_eq_ci(subcommand, b"NODES") {
+        write_bulk(writer, cluster_nodes_body().as_bytes())
+    } else if ascii_eq_ci(subcommand, b"KEYSLOT") {
+        if cmd.args.len() != 2 {
+            return write_err(
+                writer,
+                "wrong number of arguments for 'cluster|keyslot' command",
+            );
+        }
+        write_integer(writer, i64::from(cluster_key_slot(cmd.args[1].as_ref())))
+    } else if ascii_eq_ci(subcommand, b"COUNTKEYSINSLOT") {
+        // Counting is a keyspace scan per call, which this executor answers
+        // with a full pass over storage; with every key in the one shard the
+        // answer is only ever "all of them" or nothing, so it stays 0. See
+        // known_divergences.txt.
+        match cluster_slot_argument(cmd.args.get(1)) {
+            Some(_) => write_integer(writer, 0),
+            None => write_err(writer, "Invalid slot"),
+        }
+    } else if ascii_eq_ci(subcommand, b"GETKEYSINSLOT") {
+        if cmd.args.len() != 3 {
+            return write_err(
+                writer,
+                "wrong number of arguments for 'cluster|getkeysinslot' command",
+            );
+        }
+        match cluster_slot_argument(cmd.args.get(1)) {
+            Some(_) => write_array_header(writer, 0),
+            None => write_err(writer, "Invalid slot"),
+        }
+    } else if ascii_eq_ci(subcommand, b"HELP") {
+        write_string_array(
+            writer,
+            &[
+                "CLUSTER <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                "INFO",
+                "    Return information about the cluster.",
+                "MYID",
+                "    Return the node id.",
+                "SLOTS",
+                "    Return information about slots range mappings. Each range is made of:",
+                "    start, end, master and replicas IP addresses, ports and ids.",
+                "SHARDS",
+                "    Return information about slot range mappings and the nodes serving them.",
+                "NODES",
+                "    Return cluster configuration seen by node. Output format:",
+                "    <id> <ip:port@bus-port> <flags> <master> <pings> <pongs> <epoch> <link> <slots>",
+                "COUNTKEYSINSLOT <slot>",
+                "    Return the number of keys in <slot>. This server emulates one node holding",
+                "    every slot and does not index keys by slot, so the answer is always 0.",
+                "GETKEYSINSLOT <slot> <count>",
+                "    Return key names stored by current node in a slot. Always empty here.",
+                "KEYSLOT <key>",
+                "    Return the hash slot for <key>.",
+                "HELP",
+                "    Print this help.",
+            ],
+        )
+    } else {
+        write_err(
+            writer,
+            &format!(
+                "unknown subcommand '{}'. Try CLUSTER HELP.",
+                String::from_utf8_lossy(subcommand)
+            ),
+        )
+    }
+}
+
+fn cluster_slot_argument(arg: Option<&Bytes>) -> Option<u16> {
+    let slot = std::str::from_utf8(arg?.as_ref()).ok()?.parse::<i64>().ok()?;
+    if (0..i64::from(CLUSTER_SLOT_COUNT)).contains(&slot) {
+        Some(slot as u16)
+    } else {
+        None
+    }
+}
+
 fn handle_slowlog_command<W: Write>(cmd: &Command, writer: &mut W) -> std::io::Result<()> {
     let subcommand = cmd.args.first().map(|arg| arg.as_ref()).unwrap_or(b"");
     if ascii_eq_ci(subcommand, b"GET") {
@@ -13644,6 +13958,17 @@ fn append_stats_info(out: &mut String) {
     out.push_str("\r\n\r\n");
 }
 
+fn append_cluster_info(out: &mut String) {
+    out.push_str("# Cluster\r\n");
+    out.push_str("cluster_enabled:");
+    out.push_str(if cluster_mode() == ClusterMode::Emulated {
+        "1"
+    } else {
+        "0"
+    });
+    out.push_str("\r\n\r\n");
+}
+
 fn append_commandstats_info(out: &mut String) {
     out.push_str("# Commandstats\r\n");
     out.push_str("cmdstat_blpop:calls=");
@@ -13706,7 +14031,10 @@ fn handle_info<W: Write>(cmd: &Command, writer: &mut W) -> std::io::Result<()> {
         append_stats_info(&mut out);
         append_commandstats_info(&mut out);
         append_mako_info(&mut out, &metrics);
+        append_cluster_info(&mut out);
         append_keyspace_info(&mut out);
+    } else if ascii_eq_ci(section, b"cluster") {
+        append_cluster_info(&mut out);
     } else if ascii_eq_ci(section, b"keyspace") {
         append_keyspace_info(&mut out);
     } else if ascii_eq_ci(section, b"server") {
@@ -14008,6 +14336,24 @@ fn handle_command<W: Write>(
                 write_queued(writer)?;
             } else {
                 handle_sunsubscribe(cmd, client_state, writer)?;
+            }
+        }
+        OpCode::Cluster => {
+            // Queued inside MULTI like the other admin commands; the reply is
+            // produced from the same handler in `write_command_result`.
+            if txn_state.in_multi {
+                txn_state.queue_command(cmd.clone());
+                write_queued(writer)?;
+            } else {
+                handle_cluster_command(cmd, cluster_mode(), writer)?;
+            }
+        }
+        OpCode::ReadOnly | OpCode::ReadWrite => {
+            if txn_state.in_multi {
+                txn_state.queue_command(cmd.clone());
+                write_queued(writer)?;
+            } else {
+                write_cluster_readonly_reply(cluster_mode(), writer)?;
             }
         }
         OpCode::SlowLog => {
@@ -14525,6 +14871,196 @@ mod tests {
         assert!(!txn_state.in_multi);
         assert!(client_state.name.is_none());
         assert_eq!(client_state.protocol_version, 2);
+    }
+
+    fn cluster(mode: ClusterMode, args: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        handle_cluster_command(&command(OpCode::Cluster, args), mode, &mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn cluster_keyslot_follows_redis_hash_tag_rules() {
+        // The three values Redis's own CLUSTER KEYSLOT documentation prints.
+        assert_eq!(cluster_key_slot(b"foo"), 12182);
+        assert_eq!(cluster_key_slot(b"somekey"), 11058);
+        assert_eq!(cluster_key_slot(b"foo{hash_tag}"), 2515);
+        // A hash tag makes two different keys share a slot.
+        assert_eq!(cluster_key_slot(b"{user1000}.following"), 3443);
+        assert_eq!(cluster_key_slot(b"{user1000}.followers"), 3443);
+        assert_eq!(cluster_key_slot(b"{user1000}"), 3443);
+        // An empty or unterminated tag hashes the whole key instead.
+        assert_eq!(cluster_key_slot(b"{}"), cluster_crc16(b"{}") % 16384);
+        assert_eq!(
+            cluster_key_slot(b"foo{}{bar}"),
+            cluster_crc16(b"foo{}{bar}") % 16384
+        );
+        assert_eq!(cluster_key_slot(b"{unclosed"), cluster_crc16(b"{unclosed") % 16384);
+        assert_eq!(cluster_key_slot(b""), 0);
+        // Only the first tag counts, and the bytes need not be UTF-8.
+        assert_eq!(cluster_key_slot(b"a{t}b{u}c"), cluster_key_slot(b"{t}"));
+        assert_eq!(cluster_key_slot(b"{\xff\x00}x"), cluster_crc16(b"\xff\x00") % 16384);
+    }
+
+    #[test]
+    fn cluster_node_id_is_stable_and_well_formed() {
+        let first = cluster_node_id();
+        assert_eq!(first.len(), 40);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(first, cluster_node_id());
+    }
+
+    #[test]
+    fn cluster_off_mode_reports_support_disabled() {
+        let disabled = format!("-ERR {CLUSTER_DISABLED_ERROR}\r\n");
+        for args in [&b"INFO"[..], b"SLOTS", b"MYID", b"BOGUS"] {
+            assert_eq!(cluster(ClusterMode::Off, &[args]), disabled.as_bytes());
+        }
+        let mut readonly = Vec::new();
+        write_cluster_readonly_reply(ClusterMode::Off, &mut readonly).unwrap();
+        assert_eq!(readonly, disabled.as_bytes());
+    }
+
+    #[test]
+    fn cluster_emulated_mode_describes_one_node_owning_every_slot() {
+        let info = cluster(ClusterMode::Emulated, &[b"info"]);
+        let info = String::from_utf8(info).unwrap();
+        assert!(info.contains("cluster_state:ok\r\n"), "{info}");
+        assert!(info.contains("cluster_slots_assigned:16384\r\n"), "{info}");
+        assert!(info.contains("cluster_known_nodes:1\r\n"), "{info}");
+        assert!(info.contains("cluster_size:1\r\n"), "{info}");
+
+        let id = cluster_node_id();
+        let (host, port) = cluster_announce();
+        assert_eq!(
+            cluster(ClusterMode::Emulated, &[b"MYID"]),
+            format!("${}\r\n{id}\r\n", id.len()).into_bytes()
+        );
+
+        let slots = cluster(ClusterMode::Emulated, &[b"SLOTS"]);
+        let expected = format!(
+            "*1\r\n*3\r\n:0\r\n:16383\r\n*3\r\n${}\r\n{host}\r\n:{port}\r\n${}\r\n{id}\r\n",
+            host.len(),
+            id.len()
+        );
+        assert_eq!(slots, expected.into_bytes());
+
+        let nodes = String::from_utf8(cluster(ClusterMode::Emulated, &[b"NODES"])).unwrap();
+        assert!(
+            nodes.contains(&format!(
+                "{id} {host}:{port}@{} myself,master - 0 0 1 connected 0-16383\n",
+                port + 10000
+            )),
+            "{nodes}"
+        );
+
+        assert_eq!(
+            cluster(ClusterMode::Emulated, &[b"KEYSLOT", b"foo"]),
+            b":12182\r\n"
+        );
+        assert_eq!(
+            cluster(ClusterMode::Emulated, &[b"COUNTKEYSINSLOT", b"0"]),
+            b":0\r\n"
+        );
+        assert_eq!(
+            cluster(ClusterMode::Emulated, &[b"GETKEYSINSLOT", b"0", b"10"]),
+            b"*0\r\n"
+        );
+        assert_eq!(
+            cluster(ClusterMode::Emulated, &[b"COUNTKEYSINSLOT", b"16384"]),
+            b"-ERR Invalid slot\r\n"
+        );
+        assert_eq!(
+            cluster(ClusterMode::Emulated, &[b"nosuchthing"]),
+            b"-ERR unknown subcommand 'nosuchthing'. Try CLUSTER HELP.\r\n"
+        );
+
+        let mut readonly = Vec::new();
+        write_cluster_readonly_reply(ClusterMode::Emulated, &mut readonly).unwrap();
+        assert_eq!(readonly, b"+OK\r\n");
+    }
+
+    #[test]
+    fn cluster_shards_uses_the_redis_7_shape() {
+        let shards = cluster(ClusterMode::Emulated, &[b"SHARDS"]);
+        let id = cluster_node_id();
+        let (host, port) = cluster_announce();
+        let expected = format!(
+            "*1\r\n*4\r\n$5\r\nslots\r\n*2\r\n:0\r\n:16383\r\n$5\r\nnodes\r\n*1\r\n*14\r\n\
+             $2\r\nid\r\n${}\r\n{id}\r\n$4\r\nport\r\n:{port}\r\n$2\r\nip\r\n${}\r\n{host}\r\n\
+             $8\r\nendpoint\r\n${}\r\n{host}\r\n$4\r\nrole\r\n$6\r\nmaster\r\n\
+             $18\r\nreplication-offset\r\n:0\r\n$6\r\nhealth\r\n$6\r\nonline\r\n",
+            id.len(),
+            host.len(),
+            host.len()
+        );
+        assert_eq!(String::from_utf8(shards).unwrap(), expected);
+    }
+
+    #[test]
+    fn cluster_and_readonly_queue_inside_multi() {
+        let mut txn_state = TransactionState::new();
+        let mut client_state = ClientState::new();
+        txn_state.start_multi();
+
+        assert_eq!(
+            run(
+                command(OpCode::Cluster, &[b"INFO"]),
+                &mut txn_state,
+                &mut client_state
+            ),
+            b"+QUEUED\r\n"
+        );
+        assert_eq!(
+            run(
+                command(OpCode::ReadOnly, &[]),
+                &mut txn_state,
+                &mut client_state
+            ),
+            b"+QUEUED\r\n"
+        );
+        assert_eq!(txn_state.queued_commands.len(), 2);
+
+        // The queued replies come back through write_command_result at EXEC.
+        let mut out = Vec::new();
+        write_command_result(
+            &command(OpCode::ReadOnly, &[]),
+            None,
+            (0, 0),
+            2,
+            &mut out,
+        )
+        .unwrap();
+        let expected = if cluster_mode() == ClusterMode::Emulated {
+            "+OK\r\n".to_string()
+        } else {
+            format!("-ERR {CLUSTER_DISABLED_ERROR}\r\n")
+        };
+        assert_eq!(out, expected.into_bytes());
+    }
+
+    #[test]
+    fn cluster_arity_errors_match_redis() {
+        assert_eq!(
+            run_raw(b"*1\r\n$7\r\nCLUSTER\r\n"),
+            b"-ERR wrong number of arguments for 'cluster' command\r\n"
+        );
+        assert_eq!(
+            run_raw(b"*2\r\n$8\r\nREADONLY\r\n$1\r\nx\r\n"),
+            b"-ERR wrong number of arguments for 'readonly' command\r\n"
+        );
+        assert_eq!(
+            run_raw(b"*2\r\n$9\r\nREADWRITE\r\n$1\r\nx\r\n"),
+            b"-ERR wrong number of arguments for 'readwrite' command\r\n"
+        );
+    }
+
+    #[test]
+    fn info_reports_a_cluster_section() {
+        let mut out = String::new();
+        append_cluster_info(&mut out);
+        assert!(out.starts_with("# Cluster\r\ncluster_enabled:"), "{out}");
+        assert!(out.ends_with("\r\n\r\n"), "{out}");
     }
 
     #[test]

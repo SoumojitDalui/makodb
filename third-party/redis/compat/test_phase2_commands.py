@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
 """Functional checks for the phase-2 Redis commands (no third-party deps).
 
-Run against a live makoCon:  python3 test_phase2_commands.py HOST PORT
+Run against a live makoCon:  python3 test_phase2_commands.py HOST PORT [cluster]
+
+The optional third argument (or MAKO_REDIS_CLUSTER_MODE=emulated in the
+environment) says the server under test was started with
+MAKO_REDIS_CLUSTER_MODE=emulated, so the CLUSTER block asserts the emulated
+shapes instead of the "cluster support disabled" errors. Everything else is
+identical in both modes.
+
 Exits non-zero on the first failing assertion and prints a summary otherwise.
 """
+import os
+import re
 import socket
 import sys
 import time
@@ -83,6 +92,156 @@ def check(name, got, want=None, pred=None):
 
 def is_err(got, prefix=""):
     return isinstance(got, Exception) and str(got).startswith(prefix)
+
+
+def cluster_emulated():
+    """True when the server under test runs MAKO_REDIS_CLUSTER_MODE=emulated."""
+    if len(sys.argv) > 3 and sys.argv[3].lower() in ("cluster", "emulated"):
+        return True
+    return os.environ.get("MAKO_REDIS_CLUSTER_MODE", "off").lower() == "emulated"
+
+
+CLUSTER_DISABLED = "ERR This instance has cluster support disabled"
+
+
+def info_section(c, section):
+    """INFO <section> as a dict of its field:value lines."""
+    body = c.cmd("INFO", section)
+    if isinstance(body, bytes):
+        body = body.decode()
+    fields = {}
+    for line in body.replace("\r\n", "\n").split("\n"):
+        if line and not line.startswith("#") and ":" in line:
+            name, value = line.split(":", 1)
+            fields[name] = value
+    return fields
+
+
+def check_cluster(c, emulated):
+    """CLUSTER, READONLY and READWRITE in whichever mode the server runs."""
+    if not emulated:
+        for args in (("CLUSTER", "INFO"), ("CLUSTER", "SLOTS"), ("CLUSTER", "MYID"),
+                     ("CLUSTER", "NODES"), ("CLUSTER", "KEYSLOT", "foo"),
+                     ("CLUSTER", "BOGUS")):
+            check("%s with cluster support off" % " ".join(args), c.cmd(*args),
+                  pred=lambda g: is_err(g, CLUSTER_DISABLED))
+        check("READONLY with cluster support off", c.cmd("READONLY"),
+              pred=lambda g: is_err(g, CLUSTER_DISABLED))
+        check("READWRITE with cluster support off", c.cmd("READWRITE"),
+              pred=lambda g: is_err(g, CLUSTER_DISABLED))
+        check("INFO cluster reports cluster_enabled:0",
+              info_section(c, "cluster").get("cluster_enabled"), "0")
+        check("INFO default carries the cluster section",
+              info_section(c, "default").get("cluster_enabled"), "0")
+        check("CLUSTER with no subcommand is an arity error", c.cmd("CLUSTER"),
+              pred=lambda g: is_err(g, "ERR wrong number of arguments"))
+        return
+
+    check("INFO cluster reports cluster_enabled:1",
+          info_section(c, "cluster").get("cluster_enabled"), "1")
+    check("INFO default carries the cluster section",
+          info_section(c, "default").get("cluster_enabled"), "1")
+
+    fields = {}
+    body = c.cmd("CLUSTER", "INFO")
+    for line in body.decode().replace("\r\n", "\n").split("\n"):
+        if ":" in line:
+            name, value = line.split(":", 1)
+            fields[name] = value
+    check("CLUSTER INFO cluster_state", fields.get("cluster_state"), "ok")
+    check("CLUSTER INFO cluster_slots_assigned", fields.get("cluster_slots_assigned"), "16384")
+    check("CLUSTER INFO cluster_slots_ok", fields.get("cluster_slots_ok"), "16384")
+    check("CLUSTER INFO cluster_slots_pfail", fields.get("cluster_slots_pfail"), "0")
+    check("CLUSTER INFO cluster_slots_fail", fields.get("cluster_slots_fail"), "0")
+    check("CLUSTER INFO cluster_known_nodes", fields.get("cluster_known_nodes"), "1")
+    check("CLUSTER INFO cluster_size", fields.get("cluster_size"), "1")
+    check("CLUSTER INFO cluster_current_epoch", fields.get("cluster_current_epoch"), "1")
+    check("CLUSTER INFO cluster_my_epoch", fields.get("cluster_my_epoch"), "1")
+    check("CLUSTER INFO cluster_stats_messages_sent",
+          fields.get("cluster_stats_messages_sent"), "0")
+    check("CLUSTER INFO cluster_stats_messages_received",
+          fields.get("cluster_stats_messages_received"), "0")
+
+    node_id = c.cmd("CLUSTER", "MYID")
+    check("CLUSTER MYID is 40 hex characters", node_id,
+          pred=lambda g: isinstance(g, bytes) and re.fullmatch(rb"[0-9a-f]{40}", g))
+    check("CLUSTER MYID is stable across calls", c.cmd("CLUSTER", "MYID"), node_id)
+
+    slots = c.cmd("CLUSTER", "SLOTS")
+    check("CLUSTER SLOTS has one range", slots, pred=lambda g: isinstance(g, list) and len(g) == 1)
+    entry = slots[0]
+    check("CLUSTER SLOTS range starts at 0", entry[0], 0)
+    check("CLUSTER SLOTS range ends at 16383", entry[1], 16383)
+    check("CLUSTER SLOTS names one node", len(entry[2]), 3)
+    check("CLUSTER SLOTS node carries the advertised id", entry[2][2], node_id)
+    slot_host, slot_port = entry[2][0], entry[2][1]
+    check("CLUSTER SLOTS node port is an integer", slot_port, pred=lambda g: isinstance(g, int))
+
+    shards = c.cmd("CLUSTER", "SHARDS")
+    check("CLUSTER SHARDS has one shard", shards,
+          pred=lambda g: isinstance(g, list) and len(g) == 1)
+    shard = dict(zip(shards[0][0::2], shards[0][1::2]))
+    check("CLUSTER SHARDS slots", shard.get(b"slots"), [0, 16383])
+    nodes = shard.get(b"nodes")
+    check("CLUSTER SHARDS lists one node", nodes,
+          pred=lambda g: isinstance(g, list) and len(g) == 1)
+    node = dict(zip(nodes[0][0::2], nodes[0][1::2]))
+    check("CLUSTER SHARDS node id", node.get(b"id"), node_id)
+    check("CLUSTER SHARDS node port", node.get(b"port"), slot_port)
+    check("CLUSTER SHARDS node ip", node.get(b"ip"), slot_host)
+    check("CLUSTER SHARDS node endpoint", node.get(b"endpoint"), slot_host)
+    check("CLUSTER SHARDS node role", node.get(b"role"), b"master")
+    check("CLUSTER SHARDS node replication-offset", node.get(b"replication-offset"), 0)
+    check("CLUSTER SHARDS node health", node.get(b"health"), b"online")
+
+    lines = c.cmd("CLUSTER", "NODES").decode().split("\n")
+    check("CLUSTER NODES has one line and a trailing newline", lines,
+          pred=lambda g: len(g) == 2 and g[1] == "")
+    want = "%s %s:%d@%d myself,master - 0 0 1 connected 0-16383" % (
+        node_id.decode(), slot_host.decode(), slot_port, slot_port + 10000)
+    check("CLUSTER NODES line", lines[0], want)
+
+    # Redis documents these three CLUSTER KEYSLOT results.
+    check("CLUSTER KEYSLOT foo", c.cmd("CLUSTER", "KEYSLOT", "foo"), 12182)
+    check("CLUSTER KEYSLOT somekey", c.cmd("CLUSTER", "KEYSLOT", "somekey"), 11058)
+    check("CLUSTER KEYSLOT foo{hash_tag}", c.cmd("CLUSTER", "KEYSLOT", "foo{hash_tag}"), 2515)
+    # A hash tag puts two different keys in the same slot.
+    check("CLUSTER KEYSLOT {user1000}.following",
+          c.cmd("CLUSTER", "KEYSLOT", "{user1000}.following"), 3443)
+    check("CLUSTER KEYSLOT {user1000}.followers",
+          c.cmd("CLUSTER", "KEYSLOT", "{user1000}.followers"), 3443)
+    check("CLUSTER KEYSLOT {user1000}", c.cmd("CLUSTER", "KEYSLOT", "{user1000}"), 3443)
+    # An empty or unterminated tag hashes the whole key.
+    check("CLUSTER KEYSLOT {}", c.cmd("CLUSTER", "KEYSLOT", "{}"), 15257)
+    check("CLUSTER KEYSLOT foo{}{bar}", c.cmd("CLUSTER", "KEYSLOT", "foo{}{bar}"), 8363)
+    check("CLUSTER KEYSLOT {}{foo}", c.cmd("CLUSTER", "KEYSLOT", "{}{foo}"), 2263)
+    check("CLUSTER KEYSLOT of an empty key", c.cmd("CLUSTER", "KEYSLOT", ""), 0)
+    check("CLUSTER KEYSLOT arity", c.cmd("CLUSTER", "KEYSLOT"),
+          pred=lambda g: is_err(g, "ERR wrong number of arguments"))
+
+    check("CLUSTER COUNTKEYSINSLOT", c.cmd("CLUSTER", "COUNTKEYSINSLOT", "0"), 0)
+    check("CLUSTER COUNTKEYSINSLOT out of range",
+          c.cmd("CLUSTER", "COUNTKEYSINSLOT", "16384"),
+          pred=lambda g: is_err(g, "ERR Invalid slot"))
+    check("CLUSTER GETKEYSINSLOT", c.cmd("CLUSTER", "GETKEYSINSLOT", "0", "10"), [])
+    check("CLUSTER HELP", c.cmd("CLUSTER", "HELP"),
+          pred=lambda g: isinstance(g, list) and g and g[0].startswith(b"CLUSTER <subcommand>"))
+    check("CLUSTER unknown subcommand", c.cmd("CLUSTER", "NOSUCHTHING"),
+          pred=lambda g: is_err(
+              g, "ERR unknown subcommand 'NOSUCHTHING'. Try CLUSTER HELP."))
+
+    check("READONLY", c.cmd("READONLY"), "OK")
+    check("READWRITE", c.cmd("READWRITE"), "OK")
+    check("READONLY arity", c.cmd("READONLY", "x"),
+          pred=lambda g: is_err(g, "ERR wrong number of arguments"))
+
+    # Both are queued inside MULTI like the other admin commands.
+    check("MULTI before the cluster commands", c.cmd("MULTI"), "OK")
+    check("CLUSTER MYID queues", c.cmd("CLUSTER", "MYID"), "QUEUED")
+    check("READONLY queues", c.cmd("READONLY"), "QUEUED")
+    check("READWRITE queues", c.cmd("READWRITE"), "QUEUED")
+    check("EXEC replies to the queued cluster commands", c.cmd("EXEC"),
+          [node_id, "OK", "OK"])
 
 
 def main():
@@ -1510,6 +1669,9 @@ def main():
           c.cmd("ZRANGE", "zr4d", "0", "-1", "WITHSCORES"), [b"m", b"2.5"])
     check("RENAME the result again", c.cmd("RENAME", "zr4d", "zr4e"), "OK")
     check("ZSCORE after the second RENAME", c.cmd("ZSCORE", "zr4e", "m"), b"2.5")
+
+    # ----- CLUSTER emulation, READONLY, READWRITE -----
+    check_cluster(c, cluster_emulated())
 
     c.cmd("SET", "t1", "v")
     c.cmd("SADD", "s1", "a")

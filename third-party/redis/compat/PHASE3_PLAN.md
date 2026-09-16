@@ -11,6 +11,7 @@ Baseline at branch start: 181 of 249 top-level Redis 7.4 commands recognized.
 After package 2: 185 of 249 recognized.
 After package 3: 194 of 249 recognized.
 After package 4: 203 of 249 recognized.
+After package 5: 206 of 249 recognized.
 
 | # | Package | Commands | Where the work is | Acceptance |
 |---|---|---|---|---|
