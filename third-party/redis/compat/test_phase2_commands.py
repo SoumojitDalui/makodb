@@ -833,6 +833,325 @@ def main():
     c.cmd("FLUSHALL")
     c.cmd("HSET", "hflush", "f", "v")
     check("FLUSHALL dropped the field TTLs", c.cmd("HTTL", "hflush", "FIELDS", "1", "f"), [-1])
+    # ----- Deleting and rewriting one storage key inside one transaction -----
+    # A key removed and written again inside a single Mako transaction used to
+    # be stranded: the storage layer marked the record invalid and every later
+    # access aborted, so the client saw "ERR backend" forever. Each case below
+    # reads the key back in a later transaction and then writes and reads it a
+    # second time, which is what a stranded key can no longer survive.
+
+    def multi(*commands):
+        """Run commands in one MULTI/EXEC and return the EXEC reply."""
+        c.cmd("MULTI")
+        for command in commands:
+            c.cmd(*command)
+        return c.cmd("EXEC")
+
+    # MULTI: delete and write the same key, one case per namespace
+    c.cmd("DEL", "rw1")
+    c.cmd("SET", "rw1", "v0")
+    check("MULTI DEL+SET replies", multi(["DEL", "rw1"], ["SET", "rw1", "v1"]), [1, "OK"])
+    check("GET after MULTI DEL+SET", c.cmd("GET", "rw1"), b"v1")
+    check("EXISTS after MULTI DEL+SET", c.cmd("EXISTS", "rw1"), 1)
+    check("TYPE after MULTI DEL+SET", c.cmd("TYPE", "rw1"), "string")
+    check("SET again after MULTI DEL+SET", c.cmd("SET", "rw1", "v2"), "OK")
+    check("GET the second write", c.cmd("GET", "rw1"), b"v2")
+    check("DEL after MULTI DEL+SET", c.cmd("DEL", "rw1"), 1)
+    check("GET after the final DEL", c.cmd("GET", "rw1"), None)
+    check("SET after the final DEL", c.cmd("SET", "rw1", "v3"), "OK")
+    check("GET after the final SET", c.cmd("GET", "rw1"), b"v3")
+
+    c.cmd("DEL", "rw2")
+    c.cmd("HSET", "rw2", "f", "v0")
+    check("MULTI HDEL+HSET replies", multi(["HDEL", "rw2", "f"], ["HSET", "rw2", "f", "v1"]), [1, 1])
+    check("HGET after MULTI HDEL+HSET", c.cmd("HGET", "rw2", "f"), b"v1")
+    check("HLEN after MULTI HDEL+HSET", c.cmd("HLEN", "rw2"), 1)
+    check("HGETALL after MULTI HDEL+HSET", c.cmd("HGETALL", "rw2"), [b"f", b"v1"])
+    check("HSET again after MULTI HDEL+HSET", c.cmd("HSET", "rw2", "f", "v2"), 0)
+    check("HGET the second write", c.cmd("HGET", "rw2", "f"), b"v2")
+
+    c.cmd("DEL", "rw3")
+    c.cmd("SADD", "rw3", "m")
+    check("MULTI SREM+SADD replies", multi(["SREM", "rw3", "m"], ["SADD", "rw3", "m"]), [1, 1])
+    check("SISMEMBER after MULTI SREM+SADD", c.cmd("SISMEMBER", "rw3", "m"), 1)
+    check("SCARD after MULTI SREM+SADD", c.cmd("SCARD", "rw3"), 1)
+    check("SADD again after MULTI SREM+SADD", c.cmd("SADD", "rw3", "m2"), 1)
+    check("SMEMBERS after the second write", sorted(c.cmd("SMEMBERS", "rw3")), [b"m", b"m2"])
+
+    c.cmd("DEL", "rw4")
+    c.cmd("ZADD", "rw4", "1", "m")
+    check("MULTI ZREM+ZADD replies", multi(["ZREM", "rw4", "m"], ["ZADD", "rw4", "2", "m"]), [1, 1])
+    check("ZSCORE after MULTI ZREM+ZADD", c.cmd("ZSCORE", "rw4", "m"), b"2")
+    check("ZCARD after MULTI ZREM+ZADD", c.cmd("ZCARD", "rw4"), 1)
+    check("ZADD again after MULTI ZREM+ZADD", c.cmd("ZADD", "rw4", "3", "m"), 0)
+    check("ZSCORE the second write", c.cmd("ZSCORE", "rw4", "m"), b"3")
+
+    c.cmd("DEL", "rw5")
+    c.cmd("RPUSH", "rw5", "a")
+    check("MULTI LPOP+RPUSH replies", multi(["LPOP", "rw5"], ["RPUSH", "rw5", "a"]), [b"a", 1])
+    check("LRANGE after MULTI LPOP+RPUSH", c.cmd("LRANGE", "rw5", "0", "-1"), [b"a"])
+    check("RPUSH again after MULTI LPOP+RPUSH", c.cmd("RPUSH", "rw5", "b"), 2)
+    check("LRANGE after the second write", c.cmd("LRANGE", "rw5", "0", "-1"), [b"a", b"b"])
+
+    # The key survives many more transactions, including another delete round
+    c.cmd("DEL", "rw6")
+    c.cmd("SET", "rw6", "v0")
+    multi(["DEL", "rw6"], ["SET", "rw6", "v1"])
+    check("APPEND on a key deleted and rewritten in one MULTI", c.cmd("APPEND", "rw6", "x"), 3)
+    check("GET after APPEND", c.cmd("GET", "rw6"), b"v1x")
+    check("SETEX over it", c.cmd("SETEX", "rw6", "100", "9"), "OK")
+    check("TTL after SETEX", c.cmd("TTL", "rw6"), pred=lambda g: 90 <= g <= 100)
+    check("INCR over it", c.cmd("INCR", "rw6"), 10)
+    check("PERSIST over it", c.cmd("PERSIST", "rw6"), 1)
+    check("GET after INCR", c.cmd("GET", "rw6"), b"10")
+    check("second MULTI DEL+SET round", multi(["DEL", "rw6"], ["SET", "rw6", "v2"]), [1, "OK"])
+    check("GET after the second round", c.cmd("GET", "rw6"), b"v2")
+    check("a MULTI SET+DEL still deletes", multi(["SET", "rw6", "v3"], ["DEL", "rw6"]), ["OK", 1])
+    check("GET after MULTI SET+DEL", c.cmd("GET", "rw6"), None)
+    # On a key that already exists, write-delete-write ends with the last
+    # write. (On a key the same transaction created, the storage layer keeps
+    # the value the record was created with -- see known_divergences.txt.)
+    c.cmd("SET", "rw6", "seed")
+    check("MULTI SET+DEL+SET keeps the last write",
+          multi(["SET", "rw6", "a"], ["DEL", "rw6"], ["SET", "rw6", "b"]), ["OK", 1, "OK"])
+    check("GET after MULTI SET+DEL+SET", c.cmd("GET", "rw6"), b"b")
+    check("MULTI DEL+SET+DEL+SET keeps the last write",
+          multi(["DEL", "rw6"], ["SET", "rw6", "c"], ["DEL", "rw6"], ["SET", "rw6", "d"]),
+          [1, "OK", 1, "OK"])
+    check("GET after MULTI DEL+SET+DEL+SET", c.cmd("GET", "rw6"), b"d")
+    check("MULTI DEL+SET then DEL leaves nothing",
+          multi(["DEL", "rw6"], ["SET", "rw6", "e"], ["DEL", "rw6"]), [1, "OK", 1])
+    check("GET after MULTI DEL+SET+DEL", c.cmd("GET", "rw6"), None)
+    check("EXISTS after MULTI DEL+SET+DEL", c.cmd("EXISTS", "rw6"), 0)
+    c.cmd("SET", "rw6", "back")
+    check("MULTI FLUSHALL+SET keeps the write", multi(["FLUSHALL"], ["SET", "rw6", "c"]),
+          pred=lambda g: g[1] == "OK")
+    check("GET after MULTI FLUSHALL+SET", c.cmd("GET", "rw6"), b"c")
+    check("DBSIZE after MULTI FLUSHALL+SET", c.cmd("DBSIZE"), 1)
+
+    # COPY dst REPLACE, every type, with elements that collide with the
+    # destination's own storage keys
+    c.cmd("DEL", "cpa", "cpb")
+    c.cmd("SET", "cpa", "A")
+    c.cmd("SET", "cpb", "B")
+    check("COPY string REPLACE", c.cmd("COPY", "cpa", "cpb", "REPLACE"), 1)
+    check("GET the copied string", c.cmd("GET", "cpb"), b"A")
+    check("SET over the copied string", c.cmd("SET", "cpb", "C"), "OK")
+    check("GET after writing over the copy", c.cmd("GET", "cpb"), b"C")
+
+    c.cmd("DEL", "cha", "chb")
+    c.cmd("HSET", "cha", "f", "A")
+    c.cmd("HSET", "chb", "f", "B")
+    check("COPY hash REPLACE onto the same field", c.cmd("COPY", "cha", "chb", "REPLACE"), 1)
+    check("HGET the copied field", c.cmd("HGET", "chb", "f"), b"A")
+    check("HGETALL the copied hash", c.cmd("HGETALL", "chb"), [b"f", b"A"])
+    check("HLEN the copied hash", c.cmd("HLEN", "chb"), 1)
+    check("HSET over the copied field", c.cmd("HSET", "chb", "f", "C"), 0)
+    check("HGET after writing over the copy", c.cmd("HGET", "chb", "f"), b"C")
+
+    c.cmd("DEL", "csa", "csb")
+    c.cmd("SADD", "csa", "m")
+    c.cmd("SADD", "csb", "m")
+    check("COPY set REPLACE onto the same member", c.cmd("COPY", "csa", "csb", "REPLACE"), 1)
+    check("SMEMBERS the copied set", c.cmd("SMEMBERS", "csb"), [b"m"])
+    check("SISMEMBER the copied member", c.cmd("SISMEMBER", "csb", "m"), 1)
+    check("SADD over the copied set", c.cmd("SADD", "csb", "m2"), 1)
+    check("SMEMBERS after writing over the copy", sorted(c.cmd("SMEMBERS", "csb")), [b"m", b"m2"])
+
+    c.cmd("DEL", "cza", "czb")
+    c.cmd("ZADD", "cza", "1", "m")
+    c.cmd("ZADD", "czb", "2", "m")
+    check("COPY zset REPLACE onto the same member", c.cmd("COPY", "cza", "czb", "REPLACE"), 1)
+    check("ZSCORE the copied member", c.cmd("ZSCORE", "czb", "m"), b"1")
+    check("ZRANGE the copied zset", c.cmd("ZRANGE", "czb", "0", "-1", "WITHSCORES"), [b"m", b"1"])
+    check("ZADD over the copied zset", c.cmd("ZADD", "czb", "5", "m"), 0)
+    check("ZSCORE after writing over the copy", c.cmd("ZSCORE", "czb", "m"), b"5")
+
+    c.cmd("DEL", "cla", "clb")
+    c.cmd("RPUSH", "cla", "A")
+    c.cmd("RPUSH", "clb", "B")
+    check("COPY list REPLACE onto the same index", c.cmd("COPY", "cla", "clb", "REPLACE"), 1)
+    check("LRANGE the copied list", c.cmd("LRANGE", "clb", "0", "-1"), [b"A"])
+    check("RPUSH over the copied list", c.cmd("RPUSH", "clb", "Z"), 2)
+    check("LRANGE after writing over the copy", c.cmd("LRANGE", "clb", "0", "-1"), [b"A", b"Z"])
+
+    # RENAME onto an existing key of the same type
+    c.cmd("DEL", "rna", "rnb")
+    c.cmd("SET", "rna", "A")
+    c.cmd("SET", "rnb", "B")
+    check("RENAME string onto a string", c.cmd("RENAME", "rna", "rnb"), "OK")
+    check("GET the renamed string", c.cmd("GET", "rnb"), b"A")
+    check("SET over the renamed string", c.cmd("SET", "rnb", "C"), "OK")
+    check("GET after writing over the rename", c.cmd("GET", "rnb"), b"C")
+
+    c.cmd("DEL", "rha", "rhb")
+    c.cmd("HSET", "rha", "f", "A")
+    c.cmd("HSET", "rhb", "f", "B")
+    check("RENAME hash onto a hash with the same field", c.cmd("RENAME", "rha", "rhb"), "OK")
+    check("HGET the renamed field", c.cmd("HGET", "rhb", "f"), b"A")
+    check("HLEN the renamed hash", c.cmd("HLEN", "rhb"), 1)
+    check("HSET over the renamed field", c.cmd("HSET", "rhb", "f", "C"), 0)
+    check("HGET after writing over the rename", c.cmd("HGET", "rhb", "f"), b"C")
+
+    c.cmd("DEL", "rsa", "rsb")
+    c.cmd("SADD", "rsa", "m")
+    c.cmd("SADD", "rsb", "m")
+    check("RENAME set onto a set with the same member", c.cmd("RENAME", "rsa", "rsb"), "OK")
+    check("SMEMBERS the renamed set", c.cmd("SMEMBERS", "rsb"), [b"m"])
+    check("SADD over the renamed set", c.cmd("SADD", "rsb", "m2"), 1)
+    check("SCARD after writing over the rename", c.cmd("SCARD", "rsb"), 2)
+
+    c.cmd("DEL", "rza", "rzb")
+    c.cmd("ZADD", "rza", "1", "m")
+    c.cmd("ZADD", "rzb", "2", "m")
+    check("RENAME zset onto a zset with the same member", c.cmd("RENAME", "rza", "rzb"), "OK")
+    check("ZSCORE the renamed member", c.cmd("ZSCORE", "rzb", "m"), b"1")
+    check("ZADD over the renamed zset", c.cmd("ZADD", "rzb", "9", "m"), 0)
+    check("ZSCORE after writing over the rename", c.cmd("ZSCORE", "rzb", "m"), b"9")
+
+    # A destination record that has to grow in place makes the storage layer
+    # abort the transaction once; the command has to retry it rather than
+    # report ERR backend.
+    c.cmd("DEL", "rgs", "rgd")
+    c.cmd("HSET", "rgs", "f", "a much longer field value than the destination has")
+    c.cmd("HSET", "rgd", "f", "a")
+    check("RENAME hash onto a hash whose value grows", c.cmd("RENAME", "rgs", "rgd"), "OK")
+    check("HGET the grown field", c.cmd("HGET", "rgd", "f"),
+          b"a much longer field value than the destination has")
+    check("HSET over the grown field", c.cmd("HSET", "rgd", "f", "short"), 0)
+    check("HGET after writing over the grown field", c.cmd("HGET", "rgd", "f"), b"short")
+    c.cmd("DEL", "rgs2", "rgd2")
+    c.cmd("SET", "rgs2", "a much longer string value than the destination has")
+    c.cmd("SET", "rgd2", "a")
+    check("RENAME string onto a string whose value grows", c.cmd("RENAME", "rgs2", "rgd2"), "OK")
+    check("GET the grown string", c.cmd("GET", "rgd2"),
+          b"a much longer string value than the destination has")
+
+    # Commands whose destination is their own source
+    c.cmd("DEL", "srt")
+    c.cmd("RPUSH", "srt", "2", "1", "3")
+    check("SORT l STORE l", c.cmd("SORT", "srt", "STORE", "srt"), 3)
+    check("LRANGE after SORT STORE onto itself", c.cmd("LRANGE", "srt", "0", "-1"),
+          [b"1", b"2", b"3"])
+    check("RPUSH after SORT STORE onto itself", c.cmd("RPUSH", "srt", "9"), 4)
+    check("LRANGE after the second write", c.cmd("LRANGE", "srt", "0", "-1"),
+          [b"1", b"2", b"3", b"9"])
+    check("SORT l STORE l a second time", c.cmd("SORT", "srt", "STORE", "srt"), 4)
+    check("LRANGE after the second SORT STORE", c.cmd("LRANGE", "srt", "0", "-1"),
+          [b"1", b"2", b"3", b"9"])
+
+    c.cmd("DEL", "sud", "sux")
+    c.cmd("SADD", "sud", "a", "b")
+    c.cmd("SADD", "sux", "c")
+    check("SUNIONSTORE d d x", c.cmd("SUNIONSTORE", "sud", "sud", "sux"), 3)
+    check("SMEMBERS after SUNIONSTORE onto itself", sorted(c.cmd("SMEMBERS", "sud")),
+          [b"a", b"b", b"c"])
+    check("SADD after SUNIONSTORE onto itself", c.cmd("SADD", "sud", "z"), 1)
+    check("SCARD after the second write", c.cmd("SCARD", "sud"), 4)
+    check("SINTERSTORE d d x", c.cmd("SINTERSTORE", "sud", "sud", "sux"), 1)
+    check("SMEMBERS after SINTERSTORE onto itself", c.cmd("SMEMBERS", "sud"), [b"c"])
+    check("SDIFFSTORE d d x", c.cmd("SDIFFSTORE", "sud", "sud", "sux"), 0)
+    check("EXISTS after SDIFFSTORE emptied it", c.cmd("EXISTS", "sud"), 0)
+    check("SADD after SDIFFSTORE emptied it", c.cmd("SADD", "sud", "again"), 1)
+    check("SMEMBERS after refilling it", c.cmd("SMEMBERS", "sud"), [b"again"])
+
+    c.cmd("DEL", "zud", "zux")
+    c.cmd("ZADD", "zud", "1", "a")
+    c.cmd("ZADD", "zux", "2", "b")
+    check("ZUNIONSTORE d 2 d x", c.cmd("ZUNIONSTORE", "zud", "2", "zud", "zux"), 2)
+    check("ZRANGE after ZUNIONSTORE onto itself", c.cmd("ZRANGE", "zud", "0", "-1", "WITHSCORES"),
+          [b"a", b"1", b"b", b"2"])
+    check("ZADD after ZUNIONSTORE onto itself", c.cmd("ZADD", "zud", "7", "c"), 1)
+    check("ZCARD after the second write", c.cmd("ZCARD", "zud"), 3)
+    check("ZINTERSTORE d 2 d x", c.cmd("ZINTERSTORE", "zud", "2", "zud", "zux"), 1)
+    check("ZRANGE after ZINTERSTORE onto itself", c.cmd("ZRANGE", "zud", "0", "-1", "WITHSCORES"),
+          [b"b", b"4"])
+
+    c.cmd("DEL", "lmv")
+    c.cmd("RPUSH", "lmv", "a", "b", "c")
+    check("LMOVE l l LEFT RIGHT", c.cmd("LMOVE", "lmv", "lmv", "LEFT", "RIGHT"), b"a")
+    check("LRANGE after LMOVE onto itself", c.cmd("LRANGE", "lmv", "0", "-1"),
+          [b"b", b"c", b"a"])
+    check("RPUSH after LMOVE onto itself", c.cmd("RPUSH", "lmv", "d"), 4)
+    check("LRANGE after the second write", c.cmd("LRANGE", "lmv", "0", "-1"),
+          [b"b", b"c", b"a", b"d"])
+    check("RPOPLPUSH l l", c.cmd("RPOPLPUSH", "lmv", "lmv"), b"d")
+    check("LRANGE after RPOPLPUSH onto itself", c.cmd("LRANGE", "lmv", "0", "-1"),
+          [b"d", b"b", b"c", b"a"])
+
+    # RESTORE REPLACE onto a key whose elements are the payload's elements
+    c.cmd("DEL", "rstla", "rstlb")
+    c.cmd("RPUSH", "rstla", "a", "b")
+    list_payload = c.cmd("DUMP", "rstla")
+    c.cmd("RPUSH", "rstlb", "a", "b")
+    check("RESTORE list REPLACE onto matching elements",
+          c.cmd("RESTORE", "rstlb", "0", list_payload, "REPLACE"), "OK")
+    check("LRANGE the restored list", c.cmd("LRANGE", "rstlb", "0", "-1"), [b"a", b"b"])
+    check("RPUSH over the restored list", c.cmd("RPUSH", "rstlb", "z"), 3)
+    check("LRANGE after writing over the restore", c.cmd("LRANGE", "rstlb", "0", "-1"),
+          [b"a", b"b", b"z"])
+
+    c.cmd("DEL", "rstha", "rsthb")
+    c.cmd("HSET", "rstha", "f", "v")
+    hash_payload = c.cmd("DUMP", "rstha")
+    c.cmd("HSET", "rsthb", "f", "other")
+    check("RESTORE hash REPLACE onto the same field",
+          c.cmd("RESTORE", "rsthb", "0", hash_payload, "REPLACE"), "OK")
+    check("HGETALL the restored hash", c.cmd("HGETALL", "rsthb"), [b"f", b"v"])
+    check("HSET over the restored hash", c.cmd("HSET", "rsthb", "g", "w"), 1)
+    check("HLEN after writing over the restore", c.cmd("HLEN", "rsthb"), 2)
+
+    c.cmd("DEL", "rstsa", "rstsb")
+    c.cmd("SADD", "rstsa", "m")
+    set_payload = c.cmd("DUMP", "rstsa")
+    c.cmd("SADD", "rstsb", "m")
+    check("RESTORE set REPLACE onto the same member",
+          c.cmd("RESTORE", "rstsb", "0", set_payload, "REPLACE"), "OK")
+    check("SMEMBERS the restored set", c.cmd("SMEMBERS", "rstsb"), [b"m"])
+    check("SISMEMBER the restored member", c.cmd("SISMEMBER", "rstsb", "m"), 1)
+    check("SADD over the restored set", c.cmd("SADD", "rstsb", "m2"), 1)
+    check("SCARD after writing over the restore", c.cmd("SCARD", "rstsb"), 2)
+
+    c.cmd("DEL", "rstza", "rstzb")
+    c.cmd("ZADD", "rstza", "1", "m")
+    zset_payload = c.cmd("DUMP", "rstza")
+    c.cmd("ZADD", "rstzb", "3", "m")
+    check("RESTORE zset REPLACE onto the same member",
+          c.cmd("RESTORE", "rstzb", "0", zset_payload, "REPLACE"), "OK")
+    check("ZSCORE the restored member", c.cmd("ZSCORE", "rstzb", "m"), b"1")
+    check("ZADD over the restored zset", c.cmd("ZADD", "rstzb", "2", "m2"), 1)
+    check("ZRANGE after writing over the restore", c.cmd("ZRANGE", "rstzb", "0", "-1"),
+          [b"m", b"m2"])
+
+    c.cmd("DEL", "rstca")
+    c.cmd("SET", "rstca", "sv")
+    string_payload = c.cmd("DUMP", "rstca")
+    check("RESTORE string REPLACE onto itself",
+          c.cmd("RESTORE", "rstca", "0", string_payload, "REPLACE"), "OK")
+    check("GET the restored string", c.cmd("GET", "rstca"), b"sv")
+    check("SET over the restored string", c.cmd("SET", "rstca", "sv2"), "OK")
+    check("GET after writing over the restore", c.cmd("GET", "rstca"), b"sv2")
+
+    # The two reproductions named in the package-4 commit message
+    c.cmd("DEL", "hfx")
+    c.cmd("HSET", "hfx", "f", "v0")
+    c.cmd("HEXPIRE", "hfx", "100", "FIELDS", "1", "f")
+    check("MULTI HDEL+HSET over a field with a TTL",
+          multi(["HDEL", "hfx", "f"], ["HSET", "hfx", "f", "v1"]), [1, 1])
+    check("HGET after MULTI HDEL+HSET with a TTL", c.cmd("HGET", "hfx", "f"), b"v1")
+    check("HTTL is gone after the rewrite", c.cmd("HTTL", "hfx", "FIELDS", "1", "f"), [-1])
+    c.cmd("DEL", "hfy", "hfz")
+    c.cmd("HSET", "hfy", "f", "src")
+    c.cmd("HEXPIRE", "hfy", "100", "FIELDS", "1", "f")
+    c.cmd("HSET", "hfz", "f", "dst")
+    check("COPY REPLACE onto a hash with the same field name",
+          c.cmd("COPY", "hfy", "hfz", "REPLACE"), 1)
+    check("HGET the copied field", c.cmd("HGET", "hfz", "f"), b"src")
+    check("the copied field kept its TTL", c.cmd("HTTL", "hfz", "FIELDS", "1", "f"),
+          pred=lambda g: 90 <= g[0] <= 100)
+    check("HSET over the copied field", c.cmd("HSET", "hfz", "f", "later"), 0)
+    check("HGET after writing over the copy", c.cmd("HGET", "hfz", "f"), b"later")
+
     c.cmd("SET", "t1", "v")
     c.cmd("SADD", "s1", "a")
 

@@ -1286,6 +1286,20 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
     std::unordered_map<std::string, bool> batch_exists;
     std::unordered_map<std::string, std::string> batch_values;
     std::unordered_map<std::string, int64_t> batch_ttls;
+    // Storage keys whose physical removal is deferred to the end of the
+    // transaction. STO cannot take a remove and a later write of the same key
+    // inside one transaction: MassTrans::transDelete sets delete_bit on the
+    // TransItem and stores the key in the item's write slot, and a later
+    // transPut lands in handlePutFound, whose delete-then-write branch is
+    // compiled out (the tree is built with -DREAD_MY_WRITES=OFF), so it only
+    // replaces the write slot with the value. At install() the item still says
+    // "delete": it sets invalid_bit on the record and calls remove() with the
+    // value bytes as the key, so the record stays in the tree permanently
+    // invalid and every later access aborts -- the key is stranded for the
+    // lifetime of the process. Deletes are therefore recorded here; a later
+    // write of the same key cancels the record and overwrites in place, and
+    // whatever is left is removed once, just before commit.
+    std::unordered_set<std::string> pending_deletes;
     std::unordered_map<std::string, std::unordered_set<std::string>> staged_sets;
     std::unordered_set<std::string> staged_sets_loaded;
     std::unordered_set<std::string> dirty_sets;
@@ -1592,6 +1606,13 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
 
     auto read_raw = [&](void* txn, const std::string& key, std::string& value, bool& exists) {
         value.clear();
+        // A key whose removal is pending is already gone as far as this
+        // transaction is concerned; the record is still in storage only
+        // because the physical remove waits for commit.
+        if (!pending_deletes.empty() && pending_deletes.count(key) != 0) {
+            exists = false;
+            return mako::Status::OK();
+        }
         mako::Status s = redis_table_get(txn, key, value);
         if (s.ok()) {
             exists = true;
@@ -1609,24 +1630,24 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
         return read_raw(txn, key, ignored, exists);
     };
 
+    // Records the removal of a storage key instead of issuing it. The record
+    // is cancelled by a later put_raw of the same key (which then overwrites
+    // the row in place) and is turned into a real tx_remove by
+    // flush_pending_deletes() at the end of the transaction. See the comment on
+    // pending_deletes for why the remove cannot be issued here.
     auto delete_raw_if_exists = [&](void* txn, const std::string& key) {
-        if (!key.empty() && static_cast<unsigned char>(key[0]) == 0x01) {
-            mako::Status s = redis_table_delete(txn, key);
-            return s.IsNotFound() ? mako::Status::OK() : s;
-        }
-        auto batch_it = batch_exists.find(key);
-        if (batch_it != batch_exists.end()) {
-            if (!batch_it->second) {
-                return mako::Status::OK();
-            }
-            return redis_table_delete(txn, key);
-        }
-        bool exists = false;
-        mako::Status s = read_raw_exists(txn, key, exists);
-        if (!s.ok() || !exists) {
-            return s;
-        }
-        return redis_table_delete(txn, key);
+        (void)txn;
+        // Recorded unconditionally, including for a key this transaction has
+        // already marked absent: several callers (write_set_cardinality and
+        // the other meta writers) set batch_exists[key] = false before asking
+        // for the removal, so trusting that cache here would drop the removal
+        // altogether. The flush reads the key once and skips what is not
+        // there, which costs the same as the existence check this helper used
+        // to do.
+        pending_deletes.insert(key);
+        batch_exists[key] = false;
+        batch_values.erase(key);
+        return mako::Status::OK();
     };
 
     auto now_unix_ms = []() {
@@ -1708,8 +1729,30 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
     };
 
     auto put_raw = [&](void* txn, const std::string& key, const std::string& raw_value) {
+        // Writing a key that was deleted earlier in this transaction cancels
+        // the pending removal: the row is overwritten in place, which is the
+        // only shape the storage layer supports (see pending_deletes).
+        if (!pending_deletes.empty()) {
+            pending_deletes.erase(key);
+        }
+        batch_exists[key] = true;
+        batch_values.erase(key);
         owned_encoded_vals.push_back(mako::Encode(raw_value));
         return redis_table_put(txn, key, owned_encoded_vals.back());
+    };
+
+    // Issues the removals recorded by delete_raw_if_exists. Called once, after
+    // every op and every staged collection has been written, so a key that was
+    // deleted and written again in the same transaction is never removed.
+    auto flush_pending_deletes = [&](void* txn) {
+        for (const auto& storage_key : pending_deletes) {
+            mako::Status s = redis_table_delete(txn, storage_key);
+            if (!s.ok() && !s.IsNotFound()) {
+                return s;
+            }
+        }
+        pending_deletes.clear();
+        return mako::Status::OK();
     };
 
     auto write_ttl_meta = [&](void* txn, const std::string& user_key, int64_t expire_at_ms) {
@@ -1850,13 +1893,25 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                 }
 
                 if (!ok) {
+                    pending_deletes.clear();
                     g_mako_db->Rollback(scan_txn);
                     break;
                 }
 
+                // This chunk runs in its own transaction, so its deferred
+                // removals are issued against that transaction, not the one
+                // execute_transaction opened.
                 if (expired_user_keys.empty()) {
+                    pending_deletes.clear();
                     g_mako_db->Rollback(scan_txn);
                 } else {
+                    mako::Status flush_status = flush_pending_deletes(scan_txn);
+                    if (!flush_status.ok()) {
+                        pending_deletes.clear();
+                        g_mako_db->Rollback(scan_txn);
+                        ok = false;
+                        break;
+                    }
                     g_mako_db->Commit(scan_txn);
                     wait_for_redis_replication();
                 }
@@ -1867,10 +1922,12 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                 scan_start = last_storage_key;
                 scan_start.push_back('\0');
             } catch (abstract_db::abstract_abort_exception&) {
+                pending_deletes.clear();
                 g_mako_db->Rollback(scan_txn);
                 ok = false;
                 break;
             } catch (...) {
+                pending_deletes.clear();
                 g_mako_db->Rollback(scan_txn);
                 ok = false;
                 break;
@@ -3754,7 +3811,7 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                     s = delete_hash(txn, user_key);
                 }
                 if (s.ok() && string_exists) {
-                    s = redis_table_delete(txn, tl_key_buf);
+                    s = delete_raw_if_exists(txn, tl_key_buf);
                 }
                 result.success = s.ok();
                 result.value_present = exists;
@@ -5488,9 +5545,10 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                     }
                     // A field whose time has passed counts as absent, so HSET
                     // reports it as added and HSETNX writes over it. The record
-                    // is overwritten in place rather than deleted first:
-                    // deleting and re-inserting one storage key inside a single
-                    // Mako transaction leaves that key unreadable.
+                    // is overwritten in place rather than deleted first, which
+                    // saves the delete; delete_raw_if_exists would be safe here
+                    // too, since it only records the removal and put_raw
+                    // cancels it.
                     const bool live =
                         exists && !(field_ttl_exists && field_expire_at_ms <= now_unix_ms());
                     if ((op.flags & TXN_FLAG_SET_NX) != 0 && live) {
@@ -5798,8 +5856,8 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                 // An expired field is discarded and the increment starts from
                 // zero again; a live one keeps its expiration, because HINCRBY
                 // changes the value and not the time. The stale record is
-                // overwritten in place, never deleted and re-inserted inside
-                // the same transaction.
+                // overwritten in place, which saves a delete the executor
+                // would otherwise defer to the end of the transaction.
                 const bool field_expired =
                     field_ttl_exists && field_expire_at_ms <= now_unix_ms();
                 const bool live = exists && !field_expired;
@@ -6327,11 +6385,7 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                     bool string_exists = false;
                     mako::Status s = read_string_exists_no_expire(txn, tl_key_buf, string_exists);
                     if (s.ok() && string_exists) {
-                        s = redis_table_delete(txn, tl_key_buf);
-                    }
-                    if (s.ok() && string_exists) {
-                        batch_exists[tl_key_buf] = false;
-                        batch_values.erase(tl_key_buf);
+                        s = delete_raw_if_exists(txn, tl_key_buf);
                     }
                     std::vector<std::string> existing_members;
                     bool existing_set = false;
@@ -7542,12 +7596,10 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                 tx_scan(g_table, txn, std::string(), nullptr, callback, tl_arena);
                 mako::Status s = mako::Status::OK();
                 for (const auto& storage_key : keys_to_delete) {
-                    s = redis_table_delete(txn, storage_key);
+                    s = delete_raw_if_exists(txn, storage_key);
                     if (!s.ok() && !s.IsNotFound()) {
                         break;
                     }
-                    batch_exists[storage_key] = false;
-                    batch_values.erase(storage_key);
                 }
                 if (s.ok() || s.IsNotFound()) {
                     batch_ttls.clear();
@@ -7765,6 +7817,18 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                     all_success = false;
                     break;
                 }
+            }
+        }
+
+        // Every write this transaction will make is now in place, so the keys
+        // that are still marked for removal are the ones that were not written
+        // again. Removing them here, and only here, is what keeps a delete and
+        // a later write of the same key from colliding inside one STO
+        // transaction (see pending_deletes).
+        if (all_success) {
+            mako::Status s = flush_pending_deletes(txn);
+            if (!s.ok()) {
+                all_success = false;
             }
         }
 

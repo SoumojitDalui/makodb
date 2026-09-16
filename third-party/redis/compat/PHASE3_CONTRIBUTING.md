@@ -65,6 +65,17 @@ Useful lambdas (grep `auto NAME = [`):
   `copy_result_value(result, std::string)` to return bytes.
 - zset scores: `encode_zset_score`, `format_zset_score`, `parse_zset_score_value`.
 
+Deletes are deferred. `delete_raw_if_exists` only records the storage key in
+the transaction's `pending_deletes` set (and marks it absent in
+`batch_exists`); `put_raw` cancels that record, so a key deleted and written
+again in one transaction is overwritten in place; `read_raw` answers
+"not found" for a recorded key; and `flush_pending_deletes` issues the real
+`tx_remove` calls once, after the staged collections are written and before
+`Commit`. Route every removal through `delete_raw_if_exists` — a bare
+`tx_remove`/`redis_table_delete` followed by a write of the same key inside one
+transaction strands that key for the life of the process (see
+`known_divergences.txt`, "Writing a key the same transaction created").
+
 Key layout conventions: strings live at `"table_key_" + key`; collections
 live under hidden `0x01` prefixes built by `make_set_member_key`,
 `make_hash_field_key`, `make_zset_member_key`, `make_zset_score_key`, each

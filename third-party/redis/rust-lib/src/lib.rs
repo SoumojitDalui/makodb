@@ -7941,9 +7941,14 @@ fn command_needs_retry(cmd: &Command) -> bool {
             | OpCode::LPushX
             | OpCode::RPushX
             | OpCode::LMove
+            | OpCode::BLMove
+            | OpCode::LMPop
             | OpCode::RPopLPush
             | OpCode::BRPopLPush
             | OpCode::LPos
+            | OpCode::Rename
+            | OpCode::RenameNx
+            | OpCode::Sort
             | OpCode::ZAdd
             | OpCode::ZScore
             | OpCode::ZMScore
@@ -15808,5 +15813,26 @@ $6\r\nFIELDS\r\n$1\r\n1\r\n$2\r\nf1\r\n"
         let out = run_raw(b"+PING\r\n");
 
         assert_eq!(out, b"-ERR protocol error: expected array\r\n");
+    }
+
+    #[test]
+    fn every_write_command_retries_on_an_occ_abort() {
+        // A storage-backed command that is not in the retry class turns a
+        // single OCC abort into "ERR backend" for the client. These five were
+        // missing, which is how RENAME onto an existing key of the same type
+        // failed whenever the destination record had to grow in place.
+        for op in [
+            OpCode::Rename,
+            OpCode::RenameNx,
+            OpCode::Sort,
+            OpCode::LMPop,
+            OpCode::BLMove,
+        ] {
+            assert!(
+                command_needs_retry(&command(op, &[])),
+                "a storage-backed command would not retry an OCC abort (opcode {})",
+                op as u32
+            );
+        }
     }
 }
