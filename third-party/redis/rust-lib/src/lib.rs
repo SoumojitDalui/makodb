@@ -162,6 +162,15 @@ const HASH_FIELD_EXPIRE_TIME_MAX_MS: i64 = (1i64 << 46) - 1;
 /// holding a string that is not a valid sketch through int_value.
 const HLL_ERR_NOT_HLL: i64 = -2;
 
+/// Mirror the TXN_INCR_ERR_* sentinels in transaction_ffi.h. A failed INCR,
+/// INCRBY, DECR, DECRBY or INCRBYFLOAT comes back as success=false with one of
+/// these in int_value; int_value 0 means the key holds another type and the
+/// reply is WRONGTYPE.
+const INCR_ERR_NOT_INTEGER: i64 = -1;
+const INCR_ERR_OVERFLOW: i64 = -2;
+const INCR_ERR_NOT_FLOAT: i64 = -3;
+const INCR_ERR_NAN_OR_INF: i64 = -4;
+
 const ZRANGE_MODE_RANK: i64 = 0;
 const ZRANGE_MODE_SCORE: i64 = 1;
 const ZRANGE_MODE_LEX: i64 = 2;
@@ -2804,14 +2813,18 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             validate_user_key(&key)?;
             let mut val = part_to_bytes(&parts[2])?;
             if op == OpCode::DecrBy {
-                let text = std::str::from_utf8(val.as_ref())
-                    .map_err(|_| ParseError::Protocol("invalid argument"))?;
-                let amount: i64 = text
-                    .parse()
-                    .map_err(|_| ParseError::Protocol("invalid argument"))?;
-                let negated = amount.checked_neg().ok_or(ParseError::Protocol(
-                    "increment or decrement would overflow",
-                ))?;
+                // DECRBY runs as INCRBY with the amount negated, so the amount
+                // is parsed here rather than in the executor. Redis's own texts
+                // for the two ways that can fail: a decrement that is not a
+                // 64-bit integer, and -LLONG_MIN, which has no positive
+                // counterpart.
+                let amount: i64 = std::str::from_utf8(val.as_ref())
+                    .ok()
+                    .and_then(|text| text.parse().ok())
+                    .ok_or(ParseError::Error("value is not an integer or out of range"))?;
+                let negated = amount
+                    .checked_neg()
+                    .ok_or(ParseError::Error("decrement would overflow"))?;
                 val = Bytes::from(negated.to_string());
             }
             let mut cmd = Command::new(
@@ -8281,13 +8294,27 @@ fn memory_execute_transaction(ops: &[TxnOperation]) -> OwnedTxnResponse {
                 let delta = std::str::from_utf8(delta_bytes)
                     .ok()
                     .and_then(|text| text.parse::<i64>().ok());
-                let current = memory_get_live(&mut store, key, now_ms)
+                let stored = memory_get_live(&mut store, key, now_ms)
                     .map(|value| String::from_utf8(value).ok())
-                    .flatten()
-                    .and_then(|text| text.parse::<i64>().ok())
-                    .unwrap_or(0);
-                let Some(next) = delta.and_then(|delta| current.checked_add(delta)) else {
-                    push_memory_result(&mut results, &mut data, false, None, -1);
+                    .flatten();
+                let current = match stored {
+                    None => Some(0),
+                    Some(text) => text.parse::<i64>().ok(),
+                };
+                // Same TXN_INCR_ERR_* sentinels the C++ executor reports, so
+                // the memory backend produces the same replies.
+                let (Some(current), Some(delta)) = (current, delta) else {
+                    push_memory_result(
+                        &mut results,
+                        &mut data,
+                        false,
+                        None,
+                        INCR_ERR_NOT_INTEGER,
+                    );
+                    continue;
+                };
+                let Some(next) = current.checked_add(delta) else {
+                    push_memory_result(&mut results, &mut data, false, None, INCR_ERR_OVERFLOW);
                     continue;
                 };
                 store.insert(
@@ -9618,10 +9645,6 @@ fn write_command_result<W: Write>(
         | OpCode::SetBit
         | OpCode::GetBit
         | OpCode::SetRange
-        | OpCode::Incr
-        | OpCode::IncrBy
-        | OpCode::Decr
-        | OpCode::DecrBy
         | OpCode::Expire
         | OpCode::PExpire
         | OpCode::ExpireAt
@@ -9637,6 +9660,20 @@ fn write_command_result<W: Write>(
                 } else {
                     write_err(writer, "operation failed")?;
                 }
+            }
+        }
+        OpCode::Incr | OpCode::IncrBy | OpCode::Decr | OpCode::DecrBy => {
+            // A failed increment is a command error, not a backend failure:
+            // the executor reports it with a TXN_INCR_ERR_* sentinel so these
+            // replies read exactly as Redis's do.
+            if first.success {
+                write_integer(writer, first.int_value)?;
+            } else if first.int_value == INCR_ERR_NOT_INTEGER {
+                write_err(writer, "value is not an integer or out of range")?;
+            } else if first.int_value == INCR_ERR_OVERFLOW {
+                write_err(writer, "increment or decrement would overflow")?;
+            } else {
+                write_wrongtype(writer)?;
             }
         }
         OpCode::ExpireTime | OpCode::PExpireTime => {
@@ -9731,7 +9768,13 @@ fn write_command_result<W: Write>(
         }
         OpCode::IncrByFloat => {
             if !first.success {
-                write_err(writer, "operation failed")?;
+                if first.int_value == INCR_ERR_NOT_FLOAT {
+                    write_err(writer, "value is not a valid float")?;
+                } else if first.int_value == INCR_ERR_NAN_OR_INF {
+                    write_err(writer, "increment would produce NaN or Infinity")?;
+                } else {
+                    write_wrongtype(writer)?;
+                }
             } else if first.value_present {
                 if first.data_len > 0 {
                     if first.data_ptr.is_null() {
@@ -14928,6 +14971,23 @@ mod tests {
         let out = run_raw(b"*2\r\n$6\r\nUNLINK\r\n$1\r\nk\r\n");
 
         assert_eq!(out, b"-ERR backend\r\n");
+    }
+
+    #[test]
+    fn decrby_reports_redis_texts_for_a_decrement_it_cannot_negate() {
+        // DECRBY runs as INCRBY with the amount negated, so these two are the
+        // only INCR-family errors decided before the executor sees the
+        // command. They used to read "ERR protocol error: invalid argument"
+        // and "ERR protocol error: increment or decrement would overflow".
+        let out = run_raw(b"*3\r\n$6\r\nDECRBY\r\n$1\r\nk\r\n$3\r\nfoo\r\n");
+        assert_eq!(out, b"-ERR value is not an integer or out of range\r\n");
+
+        let out = run_raw(b"*3\r\n$6\r\nDECRBY\r\n$1\r\nk\r\n$4\r\n9e99\r\n");
+        assert_eq!(out, b"-ERR value is not an integer or out of range\r\n");
+
+        let out =
+            run_raw(b"*3\r\n$6\r\nDECRBY\r\n$1\r\nk\r\n$20\r\n-9223372036854775808\r\n");
+        assert_eq!(out, b"-ERR decrement would overflow\r\n");
     }
 
     #[test]

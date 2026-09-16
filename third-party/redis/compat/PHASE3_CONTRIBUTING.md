@@ -45,8 +45,9 @@ before `} else if (op.op == TXN_OP_RESTORE_LIST) {`).
 Inside a branch you have: `op` (the `TxnOperation`), `result` (its
 `TxnOpResult`), `txn`, `user_key` (the Redis key), `tl_key_buf` (the storage
 key `"table_key_" + user_key` for the string namespace), `all_success`,
-`batch_exists` / `batch_values` (per-transaction caches of string keys; keep
-them in sync when you write or delete a string), and the helper lambdas.
+`batch_exists` / `batch_values` (per-transaction caches of storage keys, kept
+in sync for you by `put_raw` and `delete_raw_if_exists`), and the helper
+lambdas.
 
 Useful lambdas (grep `auto NAME = [`):
 - strings: `read_current(txn, user_key, storage_key, value, exists)`,
@@ -65,16 +66,43 @@ Useful lambdas (grep `auto NAME = [`):
   `copy_result_value(result, std::string)` to return bytes.
 - zset scores: `encode_zset_score`, `format_zset_score`, `parse_zset_score_value`.
 
-Deletes are deferred. `delete_raw_if_exists` only records the storage key in
-the transaction's `pending_deletes` set (and marks it absent in
-`batch_exists`); `put_raw` cancels that record, so a key deleted and written
-again in one transaction is overwritten in place; `read_raw` answers
-"not found" for a recorded key; and `flush_pending_deletes` issues the real
-`tx_remove` calls once, after the staged collections are written and before
-`Commit`. Route every removal through `delete_raw_if_exists` — a bare
-`tx_remove`/`redis_table_delete` followed by a write of the same key inside one
-transaction strands that key for the life of the process (see
-`known_divergences.txt`, "Writing a key the same transaction created").
+Writes and deletes are both deferred. `put_raw` writes nothing: it records the
+raw value in the transaction's `pending_writes` map (last write to a key wins)
+and marks the key present in `batch_exists`/`batch_values`.
+`delete_raw_if_exists` drops any buffered write for the key and records the
+storage key in `pending_deletes`, marking it absent. `read_raw` answers from
+`pending_writes` first and reports "not found" for a key in `pending_deletes`,
+so every read path in the transaction sees the transaction's own writes.
+`flush_pending_writes` then issues one `tx_put` per key and
+`flush_pending_deletes` the real `tx_remove` calls — once each, after the
+staged collections are written and just before `Commit`. The two sets are
+disjoint by construction, so a key deleted and written again in one transaction
+is overwritten in place, and a key created and then deleted never reaches
+storage at all.
+
+Both buffers exist for the same reason. STO is built with
+`-DREAD_MY_WRITES=OFF` (`CMakeLists.txt` passes `-DREAD_MY_WRITES=${STO_RMW}`,
+which defaults to OFF), so in `src/mako/sto/MassTrans.hh` a record the
+transaction itself created cannot be touched again by that transaction:
+`trans_write` allocates the `versioned_value` with the creation value already
+in it and puts only the KEY in the TransItem write slot, so `install()`
+re-publishes that value and ignores every later `transPut`; `transDelete` on
+that record takes the `if (!valid) Sto::abort()` branch; and a remove followed
+by a write of the same key leaves `delete_bit` set on an item whose payload is
+now the value, so `install()` invalidates the record and calls `remove()` with
+the value bytes as the key, stranding it for the life of the process.
+
+Route every write through `put_raw` and every removal through
+`delete_raw_if_exists`. A bare `tx_put`/`redis_table_put` escapes the buffer:
+a second write of that key in the same transaction is then silently dropped,
+and reads in that transaction see stale bytes. A bare
+`tx_remove`/`redis_table_delete` strands the key. The one code path that talks
+to storage directly, and must stay that way, is the raw GET/SET fast path
+(`execute_fast_mako_string`), which runs a single op per transaction and needs
+no buffering. What the buffers do not cover is keyspace enumeration: KEYS,
+SCAN, DBSIZE and RANDOMKEY scan storage, so inside one transaction they do not
+see its own creations or deletions (see `known_divergences.txt`, "Keyspace
+enumeration inside a transaction").
 
 Key layout conventions: strings live at `"table_key_" + key`; collections
 live under hidden `0x01` prefixes built by `make_set_member_key`,

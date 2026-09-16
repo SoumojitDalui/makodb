@@ -1152,6 +1152,365 @@ def main():
     check("HSET over the copied field", c.cmd("HSET", "hfz", "f", "later"), 0)
     check("HGET after writing over the copy", c.cmd("HGET", "hfz", "f"), b"later")
 
+    # ----- Writing or deleting a key the same transaction created -----
+    # With STO built -DREAD_MY_WRITES=OFF, a record this transaction created
+    # could not be changed again by it: install() re-published the creation
+    # value and ignored every later write, and transDelete on it aborted the
+    # transaction. The executor now buffers raw writes in pending_writes and
+    # issues one tx_put per key just before commit, so the record is created
+    # once with the value the transaction ended up with. Each case below reads
+    # the key back in a later transaction and then writes and reads it again.
+
+    # Strings: a second write to a key that did not exist
+    c.cmd("DEL", "nw1")
+    check("MULTI SET+SET on a new key replies",
+          multi(["SET", "nw1", "a"], ["SET", "nw1", "b"]), ["OK", "OK"])
+    check("GET keeps the last write", c.cmd("GET", "nw1"), b"b")
+    check("STRLEN after MULTI SET+SET", c.cmd("STRLEN", "nw1"), 1)
+    check("SET again after MULTI SET+SET", c.cmd("SET", "nw1", "c"), "OK")
+    check("GET the later write", c.cmd("GET", "nw1"), b"c")
+
+    c.cmd("DEL", "nw2")
+    check("MULTI SET+SET+SET on a new key replies",
+          multi(["SET", "nw2", "a"], ["SET", "nw2", "b"], ["SET", "nw2", "c"]),
+          ["OK", "OK", "OK"])
+    check("GET keeps the third write", c.cmd("GET", "nw2"), b"c")
+
+    # Strings: delete a key the transaction created
+    c.cmd("DEL", "nw3")
+    check("MULTI SET+DEL on a new key replies",
+          multi(["SET", "nw3", "a"], ["DEL", "nw3"]), ["OK", 1])
+    check("GET after MULTI SET+DEL", c.cmd("GET", "nw3"), None)
+    check("EXISTS after MULTI SET+DEL", c.cmd("EXISTS", "nw3"), 0)
+    check("SET after MULTI SET+DEL", c.cmd("SET", "nw3", "later"), "OK")
+    check("GET the write after the delete", c.cmd("GET", "nw3"), b"later")
+
+    c.cmd("DEL", "nw4")
+    check("MULTI SET+DEL+SET on a new key replies",
+          multi(["SET", "nw4", "a"], ["DEL", "nw4"], ["SET", "nw4", "c"]),
+          ["OK", 1, "OK"])
+    check("GET after MULTI SET+DEL+SET", c.cmd("GET", "nw4"), b"c")
+    check("SET again after MULTI SET+DEL+SET", c.cmd("SET", "nw4", "d"), "OK")
+    check("GET the second round", c.cmd("GET", "nw4"), b"d")
+
+    # Strings: read-modify-write over a key the transaction created
+    c.cmd("DEL", "nw5")
+    check("MULTI SET+APPEND on a new key replies",
+          multi(["SET", "nw5", "a"], ["APPEND", "nw5", "b"]), ["OK", 2])
+    check("GET after MULTI SET+APPEND", c.cmd("GET", "nw5"), b"ab")
+    check("APPEND again after the transaction", c.cmd("APPEND", "nw5", "c"), 3)
+    check("GET after the second APPEND", c.cmd("GET", "nw5"), b"abc")
+
+    c.cmd("DEL", "nw6")
+    check("MULTI SET+INCR on a new key replies",
+          multi(["SET", "nw6", "1"], ["INCR", "nw6"]), ["OK", 2])
+    check("GET after MULTI SET+INCR", c.cmd("GET", "nw6"), b"2")
+    check("INCR again after the transaction", c.cmd("INCR", "nw6"), 3)
+    check("GET after the second INCR", c.cmd("GET", "nw6"), b"3")
+
+    c.cmd("DEL", "nw7")
+    check("MULTI SET+GETSET on a new key replies",
+          multi(["SET", "nw7", "a"], ["GETSET", "nw7", "z"]), ["OK", b"a"])
+    check("GET after MULTI SET+GETSET", c.cmd("GET", "nw7"), b"z")
+
+    c.cmd("DEL", "nw8")
+    check("MULTI SET+SETRANGE on a new key replies",
+          multi(["SET", "nw8", "aaaa"], ["SETRANGE", "nw8", "1", "X"]), ["OK", 4])
+    check("GET after MULTI SET+SETRANGE", c.cmd("GET", "nw8"), b"aXaa")
+
+    c.cmd("DEL", "nw9")
+    check("MULTI SET+INCRBYFLOAT on a new key replies",
+          multi(["SET", "nw9", "10.5"], ["INCRBYFLOAT", "nw9", "0.1"]), ["OK", b"10.6"])
+    check("GET after MULTI SET+INCRBYFLOAT", c.cmd("GET", "nw9"), b"10.6")
+
+    # Strings: read back a key the transaction created, in that transaction
+    c.cmd("DEL", "nw10")
+    check("MULTI SET+GET on a new key replies",
+          multi(["SET", "nw10", "a"], ["GET", "nw10"]), ["OK", b"a"])
+    check("MULTI SET+STRLEN+TYPE+EXISTS on a new key",
+          multi(["SET", "nw10b", "abc"], ["STRLEN", "nw10b"], ["TYPE", "nw10b"],
+                ["EXISTS", "nw10b"]),
+          pred=lambda g: g == ["OK", 3, "string", 1])
+    check("GET the key the same transaction read", c.cmd("GET", "nw10b"), b"abc")
+
+    # TTL meta: created and then rewritten, or created and then removed
+    c.cmd("DEL", "nw11")
+    check("MULTI SET+EXPIRE on a new key replies",
+          multi(["SET", "nw11", "a"], ["EXPIRE", "nw11", "100"]), ["OK", 1])
+    check("TTL after MULTI SET+EXPIRE", c.cmd("TTL", "nw11"),
+          pred=lambda g: 90 <= g <= 100)
+    check("GET after MULTI SET+EXPIRE", c.cmd("GET", "nw11"), b"a")
+    check("PERSIST after MULTI SET+EXPIRE", c.cmd("PERSIST", "nw11"), 1)
+    check("TTL after the PERSIST", c.cmd("TTL", "nw11"), -1)
+
+    c.cmd("DEL", "nw12")
+    check("MULTI SET EX + EXPIRE rewrites the TTL meta",
+          multi(["SET", "nw12", "a", "EX", "100"], ["EXPIRE", "nw12", "200"]), ["OK", 1])
+    check("TTL takes the second expiration", c.cmd("TTL", "nw12"),
+          pred=lambda g: 190 <= g <= 200)
+    check("GET the key with the rewritten TTL", c.cmd("GET", "nw12"), b"a")
+
+    c.cmd("DEL", "nw13")
+    check("MULTI SET EX + PERSIST deletes the TTL meta it created",
+          multi(["SET", "nw13", "a", "EX", "100"], ["PERSIST", "nw13"]), ["OK", 1])
+    check("TTL after MULTI SET EX + PERSIST", c.cmd("TTL", "nw13"), -1)
+    check("GET after MULTI SET EX + PERSIST", c.cmd("GET", "nw13"), b"a")
+    check("EXPIRE still works afterwards", c.cmd("EXPIRE", "nw13", "50"), 1)
+    check("TTL after the later EXPIRE", c.cmd("TTL", "nw13"),
+          pred=lambda g: 40 <= g <= 50)
+
+    c.cmd("DEL", "nw14")
+    check("MULTI SETEX + TTL on a new key",
+          multi(["SETEX", "nw14", "100", "a"], ["TTL", "nw14"]),
+          pred=lambda g: g[0] == "OK" and 90 <= g[1] <= 100)
+    check("GET after MULTI SETEX+TTL", c.cmd("GET", "nw14"), b"a")
+
+    # RENAME of a key the transaction created
+    c.cmd("DEL", "nw15", "nw15j")
+    check("MULTI SET+RENAME on a new key replies",
+          multi(["SET", "nw15", "a"], ["RENAME", "nw15", "nw15j"]), ["OK", "OK"])
+    check("GET the renamed key", c.cmd("GET", "nw15j"), b"a")
+    check("the source is gone after the rename", c.cmd("EXISTS", "nw15"), 0)
+    check("SET over the renamed key", c.cmd("SET", "nw15j", "b"), "OK")
+    check("GET after writing over the rename", c.cmd("GET", "nw15j"), b"b")
+
+    c.cmd("DEL", "nw16", "nw16j")
+    check("MULTI SET+COPY on a new key replies",
+          multi(["SET", "nw16", "a"], ["COPY", "nw16", "nw16j"]), ["OK", 1])
+    check("GET the copy of a key made in the same transaction",
+          c.cmd("GET", "nw16j"), b"a")
+    check("GET the source of that copy", c.cmd("GET", "nw16"), b"a")
+
+    # Hash fields
+    c.cmd("DEL", "nh1")
+    check("MULTI HSET+HSET on a new field replies",
+          multi(["HSET", "nh1", "f", "a"], ["HSET", "nh1", "f", "b"]), [1, 0])
+    check("HGET keeps the last write", c.cmd("HGET", "nh1", "f"), b"b")
+    check("HLEN after MULTI HSET+HSET", c.cmd("HLEN", "nh1"), 1)
+    check("HGETALL after MULTI HSET+HSET", c.cmd("HGETALL", "nh1"), [b"f", b"b"])
+    check("HSET again after the transaction", c.cmd("HSET", "nh1", "f", "c"), 0)
+    check("HGET the later write", c.cmd("HGET", "nh1", "f"), b"c")
+
+    c.cmd("DEL", "nh2")
+    check("MULTI HSET+HDEL on a new field replies",
+          multi(["HSET", "nh2", "f", "a"], ["HDEL", "nh2", "f"]), [1, 1])
+    check("HGET after MULTI HSET+HDEL", c.cmd("HGET", "nh2", "f"), None)
+    check("EXISTS after MULTI HSET+HDEL", c.cmd("EXISTS", "nh2"), 0)
+    check("HSET after MULTI HSET+HDEL", c.cmd("HSET", "nh2", "f", "later"), 1)
+    check("HGET the write after the delete", c.cmd("HGET", "nh2", "f"), b"later")
+
+    c.cmd("DEL", "nh3")
+    check("MULTI HSET+HINCRBY on a new field replies",
+          multi(["HSET", "nh3", "f", "1"], ["HINCRBY", "nh3", "f", "1"]), [1, 2])
+    check("HGET after MULTI HSET+HINCRBY", c.cmd("HGET", "nh3", "f"), b"2")
+    check("HINCRBY again after the transaction", c.cmd("HINCRBY", "nh3", "f", "1"), 3)
+
+    c.cmd("DEL", "nh4")
+    check("MULTI HSET+HGETALL on a new field replies",
+          multi(["HSET", "nh4", "f", "a"], ["HGETALL", "nh4"]), [1, [b"f", b"a"]])
+
+    c.cmd("DEL", "nh5")
+    check("MULTI HSET+HEXPIRE on a new field replies",
+          multi(["HSET", "nh5", "f", "a"], ["HEXPIRE", "nh5", "100", "FIELDS", "1", "f"]),
+          [1, [1]])
+    check("HTTL after MULTI HSET+HEXPIRE", c.cmd("HTTL", "nh5", "FIELDS", "1", "f"),
+          pred=lambda g: 90 <= g[0] <= 100)
+    check("HGET after MULTI HSET+HEXPIRE", c.cmd("HGET", "nh5", "f"), b"a")
+    check("HPERSIST after MULTI HSET+HEXPIRE",
+          c.cmd("HPERSIST", "nh5", "FIELDS", "1", "f"), [1])
+
+    c.cmd("DEL", "nh6")
+    check("MULTI HSET+HEXPIRE+HPERSIST in one transaction",
+          multi(["HSET", "nh6", "f", "a"],
+                ["HEXPIRE", "nh6", "100", "FIELDS", "1", "f"],
+                ["HPERSIST", "nh6", "FIELDS", "1", "f"]),
+          [1, [1], [1]])
+    check("HTTL after the in-transaction HPERSIST",
+          c.cmd("HTTL", "nh6", "FIELDS", "1", "f"), [-1])
+    check("HGET after the in-transaction HPERSIST", c.cmd("HGET", "nh6", "f"), b"a")
+
+    # Sets, zsets and lists (staged in memory, so these were already correct)
+    c.cmd("DEL", "ns1")
+    check("MULTI SADD+SREM on a new set replies",
+          multi(["SADD", "ns1", "m"], ["SREM", "ns1", "m"]), [1, 1])
+    check("SMEMBERS after MULTI SADD+SREM", c.cmd("SMEMBERS", "ns1"), [])
+    check("EXISTS after MULTI SADD+SREM", c.cmd("EXISTS", "ns1"), 0)
+    check("SADD after MULTI SADD+SREM", c.cmd("SADD", "ns1", "z"), 1)
+    check("SMEMBERS after the later SADD", c.cmd("SMEMBERS", "ns1"), [b"z"])
+
+    c.cmd("DEL", "ns2")
+    check("MULTI SADD+DEL on a new set replies",
+          multi(["SADD", "ns2", "a"], ["DEL", "ns2"]), [1, 1])
+    check("EXISTS after MULTI SADD+DEL", c.cmd("EXISTS", "ns2"), 0)
+    check("SADD after MULTI SADD+DEL", c.cmd("SADD", "ns2", "z"), 1)
+    check("SMEMBERS after MULTI SADD+DEL", c.cmd("SMEMBERS", "ns2"), [b"z"])
+
+    c.cmd("DEL", "nz1")
+    check("MULTI ZADD+ZADD on a new member replies",
+          multi(["ZADD", "nz1", "1", "m"], ["ZADD", "nz1", "2", "m"]), [1, 0])
+    check("ZSCORE keeps the last score", c.cmd("ZSCORE", "nz1", "m"), b"2")
+    check("ZCARD after MULTI ZADD+ZADD", c.cmd("ZCARD", "nz1"), 1)
+    check("ZADD again after the transaction", c.cmd("ZADD", "nz1", "3", "m"), 0)
+    check("ZSCORE the later write", c.cmd("ZSCORE", "nz1", "m"), b"3")
+
+    c.cmd("DEL", "nz2")
+    check("MULTI ZADD+ZREM on a new member replies",
+          multi(["ZADD", "nz2", "1", "m"], ["ZREM", "nz2", "m"]), [1, 1])
+    check("ZSCORE after MULTI ZADD+ZREM", c.cmd("ZSCORE", "nz2", "m"), None)
+    check("EXISTS after MULTI ZADD+ZREM", c.cmd("EXISTS", "nz2"), 0)
+
+    c.cmd("DEL", "nl1")
+    check("MULTI RPUSH+LSET on a new list replies",
+          multi(["RPUSH", "nl1", "a"], ["LSET", "nl1", "0", "b"]), [1, "OK"])
+    check("LRANGE after MULTI RPUSH+LSET", c.cmd("LRANGE", "nl1", "0", "-1"), [b"b"])
+    check("LSET again after the transaction", c.cmd("LSET", "nl1", "0", "c"), "OK")
+    check("LRANGE after the later LSET", c.cmd("LRANGE", "nl1", "0", "-1"), [b"c"])
+
+    c.cmd("DEL", "nl2")
+    check("MULTI RPUSH+DEL on a new list replies",
+          multi(["RPUSH", "nl2", "a"], ["DEL", "nl2"]), [1, 1])
+    check("EXISTS after MULTI RPUSH+DEL", c.cmd("EXISTS", "nl2"), 0)
+    check("RPUSH after MULTI RPUSH+DEL", c.cmd("RPUSH", "nl2", "z"), 1)
+    check("LRANGE after MULTI RPUSH+DEL", c.cmd("LRANGE", "nl2", "0", "-1"), [b"z"])
+
+    # FLUSHALL drops what the same transaction buffered
+    c.cmd("DEL", "nf1")
+    check("MULTI SET+FLUSHALL replies", multi(["SET", "nf1", "a"], ["FLUSHALL"]),
+          ["OK", "OK"])
+    check("the buffered write did not survive FLUSHALL", c.cmd("EXISTS", "nf1"), 0)
+    check("SET after the FLUSHALL", c.cmd("SET", "nf1", "b"), "OK")
+    check("GET after the FLUSHALL", c.cmd("GET", "nf1"), b"b")
+
+    # ----- INCR family error handling -----
+    # These used to abort the transaction, which reached the client as
+    # "ERR backend" after the 32-attempt retry loop, and an increment on a
+    # collection replaced it with a string instead of answering WRONGTYPE.
+
+    c.cmd("SET", "ie1", "abc")
+    for name, args in (("INCR", ("INCR", "ie1")),
+                       ("INCRBY", ("INCRBY", "ie1", "5")),
+                       ("DECR", ("DECR", "ie1")),
+                       ("DECRBY", ("DECRBY", "ie1", "5"))):
+        check("%s on a non-integer value" % name, c.cmd(*args),
+              pred=lambda g: is_err(g, "ERR value is not an integer or out of range"))
+    check("INCRBYFLOAT on a non-float value", c.cmd("INCRBYFLOAT", "ie1", "1.0"),
+          pred=lambda g: is_err(g, "ERR value is not a valid float"))
+    check("the failed increments left the value alone", c.cmd("GET", "ie1"), b"abc")
+    check("the key is still usable after the errors", c.cmd("SET", "ie1", "7"), "OK")
+    check("INCR works once the value is an integer", c.cmd("INCR", "ie1"), 8)
+
+    c.cmd("SET", "ie2", "9223372036854775807")
+    check("INCR overflow", c.cmd("INCR", "ie2"),
+          pred=lambda g: is_err(g, "ERR increment or decrement would overflow"))
+    check("INCRBY overflow", c.cmd("INCRBY", "ie2", "1"),
+          pred=lambda g: is_err(g, "ERR increment or decrement would overflow"))
+    check("the overflowed value is unchanged", c.cmd("GET", "ie2"),
+          b"9223372036854775807")
+    c.cmd("SET", "ie3", "-9223372036854775808")
+    check("DECR overflow", c.cmd("DECR", "ie3"),
+          pred=lambda g: is_err(g, "ERR increment or decrement would overflow"))
+    check("DECRBY overflow", c.cmd("DECRBY", "ie3", "1"),
+          pred=lambda g: is_err(g, "ERR increment or decrement would overflow"))
+
+    c.cmd("SET", "ie4", "0")
+    check("INCRBY with a non-integer increment", c.cmd("INCRBY", "ie4", "foo"),
+          pred=lambda g: is_err(g, "ERR value is not an integer or out of range"))
+    check("DECRBY with a non-integer increment", c.cmd("DECRBY", "ie4", "foo"),
+          pred=lambda g: is_err(g, "ERR value is not an integer or out of range"))
+    check("INCRBY with an out-of-range increment",
+          c.cmd("INCRBY", "ie4", "99999999999999999999999"),
+          pred=lambda g: is_err(g, "ERR value is not an integer or out of range"))
+    # Redis negates DECRBY's argument, and -LLONG_MIN has no counterpart.
+    check("DECRBY by LLONG_MIN", c.cmd("DECRBY", "ie4", "-9223372036854775808"),
+          pred=lambda g: is_err(g, "ERR decrement would overflow"))
+    check("the key survived the bad increments", c.cmd("GET", "ie4"), b"0")
+
+    c.cmd("SET", "ie5", "10.5")
+    check("INCRBYFLOAT with a non-float increment", c.cmd("INCRBYFLOAT", "ie5", "foo"),
+          pred=lambda g: is_err(g, "ERR value is not a valid float"))
+    check("INCRBYFLOAT with a NaN increment", c.cmd("INCRBYFLOAT", "ie5", "nan"),
+          pred=lambda g: is_err(g, "ERR value is not a valid float"))
+    check("INCRBYFLOAT by infinity", c.cmd("INCRBYFLOAT", "ie5", "+inf"),
+          pred=lambda g: is_err(g, "ERR increment would produce NaN or Infinity"))
+    check("INCRBYFLOAT by negative infinity", c.cmd("INCRBYFLOAT", "ie5", "-inf"),
+          pred=lambda g: is_err(g, "ERR increment would produce NaN or Infinity"))
+    check("the float value is unchanged", c.cmd("GET", "ie5"), b"10.5")
+    check("INCRBYFLOAT still works", c.cmd("INCRBYFLOAT", "ie5", "0.1"), b"10.6")
+    c.cmd("SET", "ie6", "inf")
+    check("INCRBYFLOAT on a stored infinity", c.cmd("INCRBYFLOAT", "ie6", "1"),
+          pred=lambda g: is_err(g, "ERR increment would produce NaN or Infinity"))
+
+    # WRONGTYPE for every increment on every collection type
+    for kind, make in (("list", ("RPUSH", "iw", "x")),
+                       ("set", ("SADD", "iw", "x")),
+                       ("hash", ("HSET", "iw", "f", "x")),
+                       ("zset", ("ZADD", "iw", "1", "x"))):
+        c.cmd("DEL", "iw")
+        c.cmd(*make)
+        for name, args in (("INCR", ("INCR", "iw")),
+                           ("INCRBY", ("INCRBY", "iw", "2")),
+                           ("DECR", ("DECR", "iw")),
+                           ("DECRBY", ("DECRBY", "iw", "2")),
+                           ("INCRBYFLOAT", ("INCRBYFLOAT", "iw", "1.5"))):
+            check("%s on a %s is WRONGTYPE" % (name, kind), c.cmd(*args),
+                  pred=lambda g: is_err(g, "WRONGTYPE"))
+        check("the %s survived the increments" % kind, c.cmd("TYPE", "iw"), kind)
+
+    # An increment on a missing key still starts from zero
+    c.cmd("DEL", "iz")
+    check("INCR on a missing key", c.cmd("INCR", "iz"), 1)
+    c.cmd("DEL", "iz")
+    check("INCRBY on a missing key", c.cmd("INCRBY", "iz", "5"), 5)
+    c.cmd("DEL", "iz")
+    check("DECRBY on a missing key", c.cmd("DECRBY", "iz", "5"), -5)
+    c.cmd("DEL", "iz")
+    check("INCRBYFLOAT on a missing key", c.cmd("INCRBYFLOAT", "iz", "1.5"), b"1.5")
+
+    # ----- RENAME writes zset scores in the canonical format -----
+    # RENAME used to store the member's score with std::to_string, which is
+    # "%.6f": 1 became "1.000000", 3.141592653589793 became "3.141593" and
+    # 0.0000001 became "0.000000". Every other path stores format_zset_score.
+    c.cmd("DEL", "zr1", "zr1d")
+    c.cmd("ZADD", "zr1", "1", "m", "2.5", "n", "0", "o", "-3", "p",
+          "3.141592653589793", "pi", "0.0000001", "tiny", "1e300", "huge")
+    members = ("m", "n", "o", "p", "pi", "tiny", "huge")
+    scores_before = [c.cmd("ZSCORE", "zr1", member) for member in members]
+    check("ZSCORE before RENAME is the canonical format", scores_before,
+          [b"1", b"2.5", b"0", b"-3", b"3.1415926535897931",
+           b"9.9999999999999995e-08", b"1.0000000000000001e+300"])
+    check("RENAME the zset", c.cmd("RENAME", "zr1", "zr1d"), "OK")
+    check("ZSCORE after RENAME is the same string as before",
+          [c.cmd("ZSCORE", "zr1d", member) for member in members], scores_before)
+    check("ZRANGE WITHSCORES after RENAME", c.cmd("ZRANGE", "zr1d", "0", "-1", "WITHSCORES"),
+          [b"p", b"-3", b"o", b"0", b"tiny", b"9.9999999999999995e-08",
+           b"m", b"1", b"n", b"2.5", b"pi", b"3.1415926535897931",
+           b"huge", b"1.0000000000000001e+300"])
+    check("a precise score still sorts by score after RENAME",
+          c.cmd("ZRANGEBYSCORE", "zr1d", "0.00000005", "0.0000002"), [b"tiny"])
+    check("ZINCRBY on the renamed zset", c.cmd("ZINCRBY", "zr1d", "1", "m"), b"2")
+    check("ZSCORE after the ZINCRBY", c.cmd("ZSCORE", "zr1d", "m"), b"2")
+
+    c.cmd("DEL", "zr2", "zr2d")
+    c.cmd("ZADD", "zr2", "3.141592653589793", "pi")
+    check("RENAMENX the zset", c.cmd("RENAMENX", "zr2", "zr2d"), 1)
+    check("ZSCORE after RENAMENX", c.cmd("ZSCORE", "zr2d", "pi"),
+          b"3.1415926535897931")
+
+    c.cmd("DEL", "zr3", "zr3d")
+    c.cmd("ZADD", "zr3", "3.141592653589793", "pi")
+    check("COPY the zset", c.cmd("COPY", "zr3", "zr3d"), 1)
+    check("ZSCORE after COPY", c.cmd("ZSCORE", "zr3d", "pi"), b"3.1415926535897931")
+
+    # RENAME onto an existing zset, and a zset renamed twice
+    c.cmd("DEL", "zr4", "zr4d")
+    c.cmd("ZADD", "zr4", "2.5", "m")
+    c.cmd("ZADD", "zr4d", "9", "other")
+    check("RENAME over an existing zset", c.cmd("RENAME", "zr4", "zr4d"), "OK")
+    check("the destination holds only the source's members",
+          c.cmd("ZRANGE", "zr4d", "0", "-1", "WITHSCORES"), [b"m", b"2.5"])
+    check("RENAME the result again", c.cmd("RENAME", "zr4d", "zr4e"), "OK")
+    check("ZSCORE after the second RENAME", c.cmd("ZSCORE", "zr4e", "m"), b"2.5")
+
     c.cmd("SET", "t1", "v")
     c.cmd("SADD", "s1", "a")
 

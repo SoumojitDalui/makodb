@@ -195,6 +195,20 @@ typedef enum {
  */
 #define TXN_HLL_ERR_NOT_HLL (-2)
 
+/**
+ * INCR-family result convention (TXN_OP_INCRBY and TXN_OP_INCRBYFLOAT, which
+ * carry INCR, INCRBY, DECR, DECRBY and INCRBYFLOAT). A failed increment is a
+ * command error, not a transaction error: the op reports success=false and
+ * puts one of these sentinels in int_value so Rust can emit the exact Redis
+ * text instead of failing the whole transaction (which reaches the client as
+ * "ERR backend" after the retry loop). int_value 0, the default, means the key
+ * holds a list, set, hash or zset and the reply is plain WRONGTYPE.
+ */
+#define TXN_INCR_ERR_NOT_INTEGER (-1)  /* value is not an integer or out of range */
+#define TXN_INCR_ERR_OVERFLOW (-2)     /* increment or decrement would overflow */
+#define TXN_INCR_ERR_NOT_FLOAT (-3)    /* value is not a valid float */
+#define TXN_INCR_ERR_NAN_OR_INF (-4)   /* increment would produce NaN or Infinity */
+
 typedef enum {
     TXN_FLAG_NONE = 0,
     TXN_FLAG_SET_NX = 1u << 0,

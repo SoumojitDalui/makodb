@@ -1300,6 +1300,23 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
     // write of the same key cancels the record and overwrites in place, and
     // whatever is left is removed once, just before commit.
     std::unordered_set<std::string> pending_deletes;
+    // Every raw write this transaction makes, buffered by storage key, last
+    // write wins. The same -DREAD_MY_WRITES=OFF build that forces the deferred
+    // deletes above also makes a record unchangeable once this transaction has
+    // created it: MassTrans::trans_write allocates the versioned_value with the
+    // creation value already in it and only records the KEY in the TransItem
+    // write slot (insert_bit), so install() re-publishes that same value and
+    // ignores any later transPut; transDelete on it takes the
+    // "if (!valid) Sto::abort()" branch because the record still carries
+    // invalid_bit; and transGet on it fails validityCheck, because
+    // t_read_only_item() is Sto::fresh_item() in this build and a fresh item
+    // has no insert_bit. Buffering here means the record is created exactly
+    // once, by flush_pending_writes(), with the value the transaction ended up
+    // with -- so a second SET, a DEL, an APPEND or a read of a key the same
+    // transaction created all behave. A key is never in both pending_writes
+    // and pending_deletes: put_raw cancels the delete and delete_raw_if_exists
+    // drops the buffered write.
+    std::unordered_map<std::string, std::string> pending_writes;
     std::unordered_map<std::string, std::unordered_set<std::string>> staged_sets;
     std::unordered_set<std::string> staged_sets_loaded;
     std::unordered_set<std::string> dirty_sets;
@@ -1606,6 +1623,17 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
 
     auto read_raw = [&](void* txn, const std::string& key, std::string& value, bool& exists) {
         value.clear();
+        // The write buffer is this transaction's own view of storage, so it
+        // answers first: storage still holds the previous value (or nothing at
+        // all) until flush_pending_writes() runs just before commit.
+        if (!pending_writes.empty()) {
+            auto pending_it = pending_writes.find(key);
+            if (pending_it != pending_writes.end()) {
+                value = pending_it->second;
+                exists = true;
+                return mako::Status::OK();
+            }
+        }
         // A key whose removal is pending is already gone as far as this
         // transaction is concerned; the record is still in storage only
         // because the physical remove waits for commit.
@@ -1637,6 +1665,14 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
     // pending_deletes for why the remove cannot be issued here.
     auto delete_raw_if_exists = [&](void* txn, const std::string& key) {
         (void)txn;
+        // A buffered write is simply dropped. If the key only ever existed
+        // inside this transaction, dropping it is the whole removal: nothing
+        // was written to storage, so the pending delete below finds nothing
+        // and issues no tx_remove. If the key existed before the transaction,
+        // the pending delete is what removes it.
+        if (!pending_writes.empty()) {
+            pending_writes.erase(key);
+        }
         // Recorded unconditionally, including for a key this transaction has
         // already marked absent: several callers (write_set_cardinality and
         // the other meta writers) set batch_exists[key] = false before asking
@@ -1728,17 +1764,41 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
         return read_raw(txn, key, value, exists);
     };
 
+    // Buffers a raw write instead of issuing it; last write to a key wins.
+    // Nothing reaches storage until flush_pending_writes() runs at the end of
+    // the transaction, which is what lets the same transaction write a key
+    // twice, or write and then delete it (see pending_writes).
     auto put_raw = [&](void* txn, const std::string& key, const std::string& raw_value) {
+        (void)txn;
         // Writing a key that was deleted earlier in this transaction cancels
         // the pending removal: the row is overwritten in place, which is the
         // only shape the storage layer supports (see pending_deletes).
         if (!pending_deletes.empty()) {
             pending_deletes.erase(key);
         }
+        pending_writes[key] = raw_value;
         batch_exists[key] = true;
-        batch_values.erase(key);
-        owned_encoded_vals.push_back(mako::Encode(raw_value));
-        return redis_table_put(txn, key, owned_encoded_vals.back());
+        // The buffered value is the transaction's own view of the key, so the
+        // read caches carry it too: read_current and read_internal_current
+        // answer from batch_values without consulting storage, and the scan
+        // collectors merge batch_exists/batch_values over what they scanned.
+        batch_values[key] = raw_value;
+        return mako::Status::OK();
+    };
+
+    // Issues the buffered writes. Called once, after every op and every staged
+    // collection has been written, so each storage key is created or updated
+    // exactly once with the value the transaction ended up with.
+    auto flush_pending_writes = [&](void* txn) {
+        for (const auto& [storage_key, raw_value] : pending_writes) {
+            owned_encoded_vals.push_back(mako::Encode(raw_value));
+            mako::Status s = redis_table_put(txn, storage_key, owned_encoded_vals.back());
+            if (!s.ok()) {
+                return s;
+            }
+        }
+        pending_writes.clear();
+        return mako::Status::OK();
     };
 
     // Issues the removals recorded by delete_raw_if_exists. Called once, after
@@ -1893,20 +1953,26 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                 }
 
                 if (!ok) {
+                    pending_writes.clear();
                     pending_deletes.clear();
                     g_mako_db->Rollback(scan_txn);
                     break;
                 }
 
-                // This chunk runs in its own transaction, so its deferred
-                // removals are issued against that transaction, not the one
-                // execute_transaction opened.
+                // This chunk runs in its own transaction, so its buffered
+                // writes and deferred removals are issued against that
+                // transaction, not the one execute_transaction opened.
                 if (expired_user_keys.empty()) {
+                    pending_writes.clear();
                     pending_deletes.clear();
                     g_mako_db->Rollback(scan_txn);
                 } else {
-                    mako::Status flush_status = flush_pending_deletes(scan_txn);
+                    mako::Status flush_status = flush_pending_writes(scan_txn);
+                    if (flush_status.ok()) {
+                        flush_status = flush_pending_deletes(scan_txn);
+                    }
                     if (!flush_status.ok()) {
+                        pending_writes.clear();
                         pending_deletes.clear();
                         g_mako_db->Rollback(scan_txn);
                         ok = false;
@@ -1922,11 +1988,13 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                 scan_start = last_storage_key;
                 scan_start.push_back('\0');
             } catch (abstract_db::abstract_abort_exception&) {
+                pending_writes.clear();
                 pending_deletes.clear();
                 g_mako_db->Rollback(scan_txn);
                 ok = false;
                 break;
             } catch (...) {
+                pending_writes.clear();
                 pending_deletes.clear();
                 g_mako_db->Rollback(scan_txn);
                 ok = false;
@@ -3535,6 +3603,41 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
         return true;
     };
 
+    // INCRBYFLOAT's parser, matching Redis's string2ld: the infinity spellings
+    // are accepted as values, NaN is not, and a strtold overflow is a parse
+    // failure. Accepting the infinities is what makes "INCRBYFLOAT k +inf"
+    // answer "increment would produce NaN or Infinity" like Redis, rather than
+    // "value is not a valid float". parse_float, which every other command
+    // uses, keeps rejecting anything non-finite.
+    auto parse_incr_float = [](const std::string& input, long double& out) {
+        if (input.empty() || std::isspace(static_cast<unsigned char>(input.front()))) {
+            return false;
+        }
+        std::string lowered;
+        lowered.reserve(input.size());
+        for (char ch : input) {
+            lowered.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+        }
+        if (lowered == "inf" || lowered == "+inf"
+            || lowered == "infinity" || lowered == "+infinity") {
+            out = std::numeric_limits<long double>::infinity();
+            return true;
+        }
+        if (lowered == "-inf" || lowered == "-infinity") {
+            out = -std::numeric_limits<long double>::infinity();
+            return true;
+        }
+        errno = 0;
+        char* end = nullptr;
+        long double parsed = std::strtold(input.c_str(), &end);
+        if (end == input.c_str() || end != input.c_str() + input.size()
+            || std::isnan(parsed) || !std::isfinite(parsed)) {
+            return false;
+        }
+        out = parsed;
+        return true;
+    };
+
     auto format_float = [](long double value) {
         std::ostringstream oss;
         oss << std::fixed << std::setprecision(17) << value;
@@ -3993,9 +4096,20 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                     }
                 }
             } else if (op.op == TXN_OP_INCRBY) {
+                // A key holding another type is WRONGTYPE, not a silent
+                // overwrite of the collection with a string.
+                bool allowed = false;
+                mako::Status s = string_key_allowed(txn, user_key, tl_key_buf, result, allowed);
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                if (!allowed) {
+                    continue;
+                }
                 std::string current;
                 bool exists = false;
-                mako::Status s = read_current(txn, user_key, tl_key_buf, current, exists);
+                s = read_current(txn, user_key, tl_key_buf, current, exists);
                 if (!s.ok()) {
                     all_success = false;
                     continue;
@@ -4003,13 +4117,18 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                 int64_t base = 0;
                 int64_t delta = 0;
                 std::string delta_str(reinterpret_cast<const char*>(op.val_ptr), op.val_len);
+                // A bad stored value or a bad increment is a command error:
+                // report it to Rust and leave the rest of the transaction
+                // alone, instead of aborting it into "ERR backend".
                 if ((exists && !parse_int64(current, base)) || !parse_int64(delta_str, delta)) {
-                    all_success = false;
+                    result.success = false;
+                    result.int_value = TXN_INCR_ERR_NOT_INTEGER;
                     continue;
                 }
                 int64_t next = 0;
                 if (!add_int64(base, delta, next)) {
-                    all_success = false;
+                    result.success = false;
+                    result.int_value = TXN_INCR_ERR_OVERFLOW;
                     continue;
                 }
                 std::string next_str = std::to_string(next);
@@ -4024,9 +4143,18 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                     batch_values[tl_key_buf] = next_str;
                 }
             } else if (op.op == TXN_OP_INCRBYFLOAT) {
+                bool allowed = false;
+                mako::Status s = string_key_allowed(txn, user_key, tl_key_buf, result, allowed);
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                if (!allowed) {
+                    continue;
+                }
                 std::string current;
                 bool exists = false;
-                mako::Status s = read_current(txn, user_key, tl_key_buf, current, exists);
+                s = read_current(txn, user_key, tl_key_buf, current, exists);
                 if (!s.ok()) {
                     all_success = false;
                     continue;
@@ -4034,13 +4162,16 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                 long double base = 0;
                 long double delta = 0;
                 std::string delta_str(reinterpret_cast<const char*>(op.val_ptr), op.val_len);
-                if ((exists && !parse_float(current, base)) || !parse_float(delta_str, delta)) {
-                    all_success = false;
+                if ((exists && !parse_incr_float(current, base))
+                    || !parse_incr_float(delta_str, delta)) {
+                    result.success = false;
+                    result.int_value = TXN_INCR_ERR_NOT_FLOAT;
                     continue;
                 }
                 long double next = base + delta;
                 if (!std::isfinite(next)) {
-                    all_success = false;
+                    result.success = false;
+                    result.int_value = TXN_INCR_ERR_NAN_OR_INF;
                     continue;
                 }
                 std::string next_str = format_float(next);
@@ -4498,26 +4629,13 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                 } else if (s.ok() && !list_values.empty()) {
                     s = rewrite_list_values(txn, destination, list_values);
                 } else if (s.ok() && !zset_values.empty()) {
-                    for (const auto& [member, score] : zset_values) {
-                        std::string member_key = zset_member_storage_key(destination, member);
-                        std::string score_payload = std::to_string(score);
-                        s = put_raw(txn, member_key, score_payload);
-                        if (!s.ok()) {
-                            break;
-                        }
-                        batch_exists[member_key] = true;
-                        batch_values[member_key] = score_payload;
-                        std::string score_key = zset_score_storage_key(destination, score, member);
-                        s = put_raw(txn, score_key, "1");
-                        if (!s.ok()) {
-                            break;
-                        }
-                        batch_exists[score_key] = true;
-                        batch_values[score_key] = "1";
-                    }
-                    if (s.ok()) {
-                        s = write_zset_cardinality(txn, destination, static_cast<int64_t>(zset_values.size()));
-                    }
+                    // Through rewrite_zset_values, exactly like COPY: it is the
+                    // one place that formats a stored score, with
+                    // format_zset_score. Writing the member record here with
+                    // std::to_string(score) instead stored "1.000000" where
+                    // every other path stores "1", so ZSCORE answered a
+                    // different string after a RENAME than before it.
+                    s = rewrite_zset_values(txn, destination, zset_values);
                 } else if (s.ok()) {
                     for (const auto& [field, value] : hash_entries) {
                         std::string field_key = hash_field_storage_key(destination, field);
@@ -7602,6 +7720,11 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                     }
                 }
                 if (s.ok() || s.IsNotFound()) {
+                    // The scan only sees what is in storage, and a key this
+                    // transaction created is still only in the write buffer,
+                    // so drop the buffer as well: FLUSHDB empties the keyspace,
+                    // including whatever this transaction was about to add.
+                    pending_writes.clear();
                     batch_ttls.clear();
                     staged_sets.clear();
                     staged_sets_loaded.clear();
@@ -7820,11 +7943,24 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
             }
         }
 
-        // Every write this transaction will make is now in place, so the keys
-        // that are still marked for removal are the ones that were not written
-        // again. Removing them here, and only here, is what keeps a delete and
-        // a later write of the same key from colliding inside one STO
-        // transaction (see pending_deletes).
+        // Every op and every staged collection has had its say, so the buffer
+        // now holds the final value of each key this transaction writes. One
+        // tx_put per key, here and nowhere else, is what keeps a second write
+        // of a key the transaction created from being dropped by install()
+        // (see pending_writes).
+        if (all_success) {
+            mako::Status s = flush_pending_writes(txn);
+            if (!s.ok()) {
+                all_success = false;
+            }
+        }
+
+        // What is still marked for removal is what was not written again.
+        // Removing it here, and only here, is what keeps a delete and a later
+        // write of the same key from colliding inside one STO transaction (see
+        // pending_deletes). The two sets are disjoint, so the order of the two
+        // flushes does not matter; writes go first so that a removal never
+        // races a record this transaction has just created.
         if (all_success) {
             mako::Status s = flush_pending_deletes(txn);
             if (!s.ok()) {
