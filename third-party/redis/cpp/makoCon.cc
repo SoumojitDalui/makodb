@@ -492,14 +492,15 @@ static std::string hll_make_empty() {
     return out;
 }
 
-// Register index and run length for one element. Same hash and same run-length
-// rule as Redis hllPatLen; the index comes from the top kHllIndexBits of the
-// hash and the run is counted over the remaining kHllQ bits, so the value is
-// in [1, kHllQ + 1].
+// Register index and run length for one element, exactly as Redis hllPatLen:
+// the low kHllIndexBits of the hash select the register, the remaining bits
+// carry the run, and a sentinel bit at position kHllQ bounds the scan, so the
+// value is in [1, kHllQ + 1]. Keeping Redis's register placement leaves an
+// RDB-compatible export possible later.
 static void hll_element_slot(const void* data, size_t len, size_t& index, uint8_t& run) {
     const uint64_t hash = hll_murmur64a(data, len, kHllHashSeed);
-    index = static_cast<size_t>(hash >> kHllQ);
-    uint64_t bits = hash & ((static_cast<uint64_t>(1) << kHllQ) - 1);
+    index = static_cast<size_t>(hash & (kHllRegisters - 1));
+    uint64_t bits = hash >> kHllIndexBits;
     bits |= static_cast<uint64_t>(1) << kHllQ;  // guarantees the loop terminates
     uint8_t count = 1;
     uint64_t bit = 1;
