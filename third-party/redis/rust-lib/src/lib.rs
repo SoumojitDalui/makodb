@@ -145,6 +145,13 @@ const TXN_OP_ZMPOP: u32 = 75;
 const TXN_OP_ZRANDMEMBER: u32 = 76;
 const TXN_OP_COPY: u32 = 77;
 const TXN_OP_BITOP: u32 = 78;
+const TXN_OP_HLL_ADD: u32 = 79;
+const TXN_OP_HLL_COUNT: u32 = 80;
+const TXN_OP_HLL_MERGE: u32 = 81;
+
+/// Mirrors TXN_HLL_ERR_NOT_HLL in transaction_ffi.h: an HLL op reports a key
+/// holding a string that is not a valid sketch through int_value.
+const HLL_ERR_NOT_HLL: i64 = -2;
 
 const ZRANGE_MODE_RANK: i64 = 0;
 const ZRANGE_MODE_SCORE: i64 = 1;
@@ -547,6 +554,9 @@ enum OpCode {
     SSubscribe = 175,
     SUnsubscribe = 176,
     BitOp = 177,
+    PfAdd = 178,
+    PfCount = 179,
+    PfMerge = 180,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -1383,6 +1393,12 @@ fn parse_opcode(name: &[u8]) -> Option<OpCode> {
         Some(OpCode::BitFieldRo)
     } else if ascii_eq_ci(name, b"BITOP") {
         Some(OpCode::BitOp)
+    } else if ascii_eq_ci(name, b"PFADD") {
+        Some(OpCode::PfAdd)
+    } else if ascii_eq_ci(name, b"PFCOUNT") {
+        Some(OpCode::PfCount)
+    } else if ascii_eq_ci(name, b"PFMERGE") {
+        Some(OpCode::PfMerge)
     } else if ascii_eq_ci(name, b"SLOWLOG") {
         Some(OpCode::SlowLog)
     } else if ascii_eq_ci(name, b"LATENCY") {
@@ -2018,6 +2034,68 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             let mut values = Vec::with_capacity(parts.len() - 2);
             values.push(operation);
             for part in parts.iter().skip(3) {
+                let key = part_to_bytes(part)?;
+                validate_user_key(&key)?;
+                values.push(key);
+            }
+            let mut cmd = Command::new(
+                op,
+                vec![destination],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values = values;
+            Ok(cmd)
+        }
+        OpCode::PfAdd => {
+            if parts.len() < 2 {
+                return Err(wrong_arity("pfadd"));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            let mut values = Vec::with_capacity(parts.len() - 2);
+            for part in parts.iter().skip(2) {
+                values.push(part_to_bytes(part)?);
+            }
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values = values;
+            Ok(cmd)
+        }
+        OpCode::PfCount => {
+            if parts.len() < 2 {
+                return Err(wrong_arity("pfcount"));
+            }
+            let mut keys = Vec::with_capacity(parts.len() - 1);
+            for part in parts.iter().skip(1) {
+                let key = part_to_bytes(part)?;
+                validate_user_key(&key)?;
+                keys.push(key);
+            }
+            // The op payload repeats every key, including keys[0], so the C++
+            // branch and the lock-stripe pass see the same list.
+            let values = keys.clone();
+            let mut cmd = Command::new(
+                op,
+                keys,
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values = values;
+            Ok(cmd)
+        }
+        OpCode::PfMerge => {
+            if parts.len() < 2 {
+                return Err(wrong_arity("pfmerge"));
+            }
+            let destination = part_to_bytes(&parts[1])?;
+            validate_user_key(&destination)?;
+            let mut values = Vec::with_capacity(parts.len() - 2);
+            for part in parts.iter().skip(2) {
                 let key = part_to_bytes(part)?;
                 validate_user_key(&key)?;
                 values.push(key);
@@ -4685,6 +4763,14 @@ fn write_wrongtype<W: Write>(w: &mut W) -> std::io::Result<()> {
     w.write_all(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
 }
 
+/// Redis reports a string that is not a HyperLogLog sketch with its own
+/// WRONGTYPE-prefixed text, so this cannot go through write_err (which prefixes
+/// "ERR ").
+#[inline]
+fn write_invalid_hll<W: Write>(w: &mut W) -> std::io::Result<()> {
+    w.write_all(b"-WRONGTYPE Key is not a valid HyperLogLog string value.\r\n")
+}
+
 fn write_parse_error<W: Write>(w: &mut W, err: ParseError) -> std::io::Result<()> {
     match err {
         ParseError::Protocol(msg) => {
@@ -6293,6 +6379,30 @@ fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)
                     group_id: 0,
                 });
             }
+            OpCode::PfAdd | OpCode::PfCount | OpCode::PfMerge => {
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                // PFADD: elements. PFCOUNT: every key. PFMERGE: the source keys.
+                let payload = pack_bytes_list(&cmd.values);
+                payloads.push(payload);
+                let payload = payloads.last().unwrap();
+                ops.push(TxnOperation {
+                    op: match cmd.op {
+                        OpCode::PfAdd => TXN_OP_HLL_ADD,
+                        OpCode::PfCount => TXN_OP_HLL_COUNT,
+                        _ => TXN_OP_HLL_MERGE,
+                    },
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr: payload.as_ptr(),
+                    val_len: payload.len(),
+                    flags: 0,
+                    expire_at_ms: -1,
+                    group_id: 0,
+                });
+            }
             OpCode::Object => {
                 let Some(key) = cmd.keys.first() else {
                     spans.push((start, 0));
@@ -7117,6 +7227,9 @@ fn command_needs_retry(cmd: &Command) -> bool {
             | OpCode::BitPos
             | OpCode::BitFieldRo
             | OpCode::BitOp
+            | OpCode::PfAdd
+            | OpCode::PfCount
+            | OpCode::PfMerge
             | OpCode::Object
             | OpCode::Memory
             | OpCode::BLPop
@@ -8392,6 +8505,24 @@ fn write_command_result<W: Write>(
         OpCode::BitOp => {
             if first.success {
                 write_integer(writer, first.int_value)?;
+            } else {
+                write_wrongtype(writer)?;
+            }
+        }
+        OpCode::PfAdd | OpCode::PfCount => {
+            if first.success {
+                write_integer(writer, first.int_value)?;
+            } else if first.int_value == HLL_ERR_NOT_HLL {
+                write_invalid_hll(writer)?;
+            } else {
+                write_wrongtype(writer)?;
+            }
+        }
+        OpCode::PfMerge => {
+            if first.success {
+                write_simple_ok(writer)?;
+            } else if first.int_value == HLL_ERR_NOT_HLL {
+                write_invalid_hll(writer)?;
             } else {
                 write_wrongtype(writer)?;
             }
@@ -9841,6 +9972,8 @@ fn is_dirty_command(op: OpCode) -> bool {
             | OpCode::Copy
             | OpCode::Sort
             | OpCode::BitOp
+            | OpCode::PfAdd
+            | OpCode::PfMerge
             | OpCode::Del
             | OpCode::FlushDb
             | OpCode::FlushAll
@@ -11968,6 +12101,9 @@ fn handle_command<W: Write>(
         | OpCode::BitPos
         | OpCode::BitFieldRo
         | OpCode::BitOp
+        | OpCode::PfAdd
+        | OpCode::PfCount
+        | OpCode::PfMerge
         | OpCode::GetSet
         | OpCode::SetNx
         | OpCode::Append
@@ -13108,6 +13244,86 @@ mod tests {
             out,
             b"-ERR unknown command 'FOO', with args beginning with: 'bar'\r\n"
         );
+    }
+
+    fn parse_one(input: &[u8]) -> Command {
+        let mut resp3 = Resp3Handler::new(1024);
+        resp3.read_bytes(input);
+        let frame = resp3.next_frame().unwrap().unwrap();
+        parse_resp3(frame).ok().unwrap()
+    }
+
+    #[test]
+    fn hyperloglog_commands_report_wrong_arity() {
+        assert_eq!(
+            run_raw(b"*1\r\n$5\r\nPFADD\r\n"),
+            b"-ERR wrong number of arguments for 'pfadd' command\r\n"
+        );
+        assert_eq!(
+            run_raw(b"*1\r\n$7\r\nPFCOUNT\r\n"),
+            b"-ERR wrong number of arguments for 'pfcount' command\r\n"
+        );
+        assert_eq!(
+            run_raw(b"*1\r\n$7\r\nPFMERGE\r\n"),
+            b"-ERR wrong number of arguments for 'pfmerge' command\r\n"
+        );
+    }
+
+    #[test]
+    fn hyperloglog_commands_build_a_single_op() {
+        // PFADD: key is the sketch, the payload carries the elements.
+        let pfadd = parse_one(b"*4\r\n$5\r\nPFADD\r\n$3\r\nhll\r\n$1\r\na\r\n$1\r\nb\r\n");
+        assert!(pfadd.op == OpCode::PfAdd);
+        assert_eq!(pfadd.keys, vec![Bytes::from_static(b"hll")]);
+        let (ops, spans, payloads) = build_txn_ops(std::slice::from_ref(&pfadd));
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, TXN_OP_HLL_ADD);
+        assert_eq!(spans, vec![(0, 1)]);
+        assert_eq!(
+            parse_list_payload(&payloads[0]).unwrap(),
+            vec![b"a".to_vec(), b"b".to_vec()]
+        );
+
+        // PFADD with no elements still builds one op with an empty payload.
+        let bare = parse_one(b"*2\r\n$5\r\nPFADD\r\n$3\r\nhll\r\n");
+        let (ops, _, payloads) = build_txn_ops(std::slice::from_ref(&bare));
+        assert_eq!(ops.len(), 1);
+        assert!(parse_list_payload(&payloads[0]).unwrap().is_empty());
+
+        // PFCOUNT keeps every key in cmd.keys and repeats them in the payload.
+        let pfcount = parse_one(b"*3\r\n$7\r\nPFCOUNT\r\n$2\r\nk1\r\n$2\r\nk2\r\n");
+        assert!(pfcount.op == OpCode::PfCount);
+        assert_eq!(
+            pfcount.keys,
+            vec![Bytes::from_static(b"k1"), Bytes::from_static(b"k2")]
+        );
+        let (ops, _, payloads) = build_txn_ops(std::slice::from_ref(&pfcount));
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, TXN_OP_HLL_COUNT);
+        assert_eq!(
+            parse_list_payload(&payloads[0]).unwrap(),
+            vec![b"k1".to_vec(), b"k2".to_vec()]
+        );
+
+        // PFMERGE: destination in keys[0], sources in the payload.
+        let pfmerge = parse_one(b"*3\r\n$7\r\nPFMERGE\r\n$4\r\ndest\r\n$3\r\nsrc\r\n");
+        assert!(pfmerge.op == OpCode::PfMerge);
+        assert_eq!(pfmerge.keys, vec![Bytes::from_static(b"dest")]);
+        let (ops, _, payloads) = build_txn_ops(std::slice::from_ref(&pfmerge));
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, TXN_OP_HLL_MERGE);
+        assert_eq!(
+            parse_list_payload(&payloads[0]).unwrap(),
+            vec![b"src".to_vec()]
+        );
+
+        // Writers are dirty; the read-only union query is not.
+        assert!(is_dirty_command(OpCode::PfAdd));
+        assert!(is_dirty_command(OpCode::PfMerge));
+        assert!(!is_dirty_command(OpCode::PfCount));
+        assert!(command_needs_retry(&pfadd));
+        assert!(command_needs_retry(&pfcount));
+        assert!(command_needs_retry(&pfmerge));
     }
 
     #[test]

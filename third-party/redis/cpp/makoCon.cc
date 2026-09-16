@@ -422,6 +422,147 @@ static bool redis_lock_unpack_bytes_list(const uint8_t* data, size_t len, std::v
     return pos == len;
 }
 
+// ---------------------------------------------------------------------------
+// HyperLogLog support (PFADD / PFCOUNT / PFMERGE)
+//
+// A sketch is a plain string value stored at the usual string storage key, so
+// TYPE reports "string" and DEL/EXPIRE/DUMP/RESTORE/GET keep working on it.
+// The payload uses a private dense layout: a 16-byte header ("MHLL", format
+// version 1, then zero padding) followed by one byte per register.
+// ---------------------------------------------------------------------------
+static constexpr size_t kHllHeaderSize = 16;
+static constexpr size_t kHllIndexBits = 14;
+static constexpr size_t kHllRegisters = static_cast<size_t>(1) << kHllIndexBits;  // 16384
+static constexpr size_t kHllDenseSize = kHllHeaderSize + kHllRegisters;           // 16400
+static constexpr int kHllQ = 64 - static_cast<int>(kHllIndexBits);                // 50
+static constexpr uint64_t kHllHashSeed = 0xadc83b19ULL;
+// HLL_ALPHA_INF from Redis hyperloglog.c: 0.5 / ln(2).
+static constexpr double kHllAlphaInf = 0.721347520444481703680;
+static constexpr char kHllMagic[4] = {'M', 'H', 'L', 'L'};
+static constexpr uint8_t kHllFormatVersion = 1;
+
+// MurmurHash64A by Austin Appleby, ported verbatim from Redis hyperloglog.c.
+// Mako only runs on little-endian hosts, so the word load needs no swap.
+static uint64_t hll_murmur64a(const void* key, size_t len, uint64_t seed) {
+    const uint64_t m = 0xc6a4a7935bd1e995ULL;
+    const int r = 47;
+    uint64_t h = seed ^ (static_cast<uint64_t>(len) * m);
+    const uint8_t* data = static_cast<const uint8_t*>(key);
+    const uint8_t* end = data + (len - (len & 7));
+
+    while (data != end) {
+        uint64_t k = 0;
+        std::memcpy(&k, data, sizeof(k));
+        k *= m;
+        k ^= k >> r;
+        k *= m;
+        h ^= k;
+        h *= m;
+        data += 8;
+    }
+
+    switch (len & 7) {
+        case 7: h ^= static_cast<uint64_t>(data[6]) << 48; [[fallthrough]];
+        case 6: h ^= static_cast<uint64_t>(data[5]) << 40; [[fallthrough]];
+        case 5: h ^= static_cast<uint64_t>(data[4]) << 32; [[fallthrough]];
+        case 4: h ^= static_cast<uint64_t>(data[3]) << 24; [[fallthrough]];
+        case 3: h ^= static_cast<uint64_t>(data[2]) << 16; [[fallthrough]];
+        case 2: h ^= static_cast<uint64_t>(data[1]) << 8;  [[fallthrough]];
+        case 1: h ^= static_cast<uint64_t>(data[0]);
+                h *= m;
+                break;
+        default: break;
+    }
+
+    h ^= h >> r;
+    h *= m;
+    h ^= h >> r;
+    return h;
+}
+
+static bool hll_value_is_valid(const std::string& value) {
+    return value.size() == kHllDenseSize
+        && std::memcmp(value.data(), kHllMagic, sizeof(kHllMagic)) == 0;
+}
+
+static std::string hll_make_empty() {
+    std::string out(kHllDenseSize, '\0');
+    std::memcpy(out.data(), kHllMagic, sizeof(kHllMagic));
+    out[sizeof(kHllMagic)] = static_cast<char>(kHllFormatVersion);
+    return out;
+}
+
+// Register index and run length for one element. Same hash and same run-length
+// rule as Redis hllPatLen; the index comes from the top kHllIndexBits of the
+// hash and the run is counted over the remaining kHllQ bits, so the value is
+// in [1, kHllQ + 1].
+static void hll_element_slot(const void* data, size_t len, size_t& index, uint8_t& run) {
+    const uint64_t hash = hll_murmur64a(data, len, kHllHashSeed);
+    index = static_cast<size_t>(hash >> kHllQ);
+    uint64_t bits = hash & ((static_cast<uint64_t>(1) << kHllQ) - 1);
+    bits |= static_cast<uint64_t>(1) << kHllQ;  // guarantees the loop terminates
+    uint8_t count = 1;
+    uint64_t bit = 1;
+    while ((bits & bit) == 0) {
+        ++count;
+        bit <<= 1;
+    }
+    run = count;
+}
+
+// tau and sigma from Redis hyperloglog.c (Ertl, arXiv:1702.01284).
+static double hll_tau(double x) {
+    if (x == 0.0 || x == 1.0) {
+        return 0.0;
+    }
+    double z_prime = 0.0;
+    double y = 1.0;
+    double z = 1 - x;
+    do {
+        x = std::sqrt(x);
+        z_prime = z;
+        y *= 0.5;
+        z -= std::pow(1 - x, 2) * y;
+    } while (z_prime != z);
+    return z / 3;
+}
+
+static double hll_sigma(double x) {
+    if (x == 1.0) {
+        return std::numeric_limits<double>::infinity();
+    }
+    double z_prime = 0.0;
+    double y = 1;
+    double z = x;
+    do {
+        x *= x;
+        z_prime = z;
+        z += x * y;
+        y += y;
+    } while (z_prime != z);
+    return z;
+}
+
+// Redis hllCount for the dense encoding: the improved Ertl estimator, which
+// needs no separate linear-counting branch for small cardinalities.
+static int64_t hll_estimate(const uint8_t* registers) {
+    int reghisto[64] = {0};
+    for (size_t i = 0; i < kHllRegisters; ++i) {
+        ++reghisto[registers[i] & 63];
+    }
+    const double m = static_cast<double>(kHllRegisters);
+    double z = m * hll_tau((m - static_cast<double>(reghisto[kHllQ + 1])) / m);
+    for (int j = kHllQ; j >= 1; --j) {
+        z += static_cast<double>(reghisto[j]);
+        z *= 0.5;
+    }
+    z += m * hll_sigma(static_cast<double>(reghisto[0]) / m);
+    const long double estimate =
+        static_cast<long double>(kHllAlphaInf) * static_cast<long double>(m)
+        * static_cast<long double>(m) / static_cast<long double>(z);
+    return static_cast<int64_t>(std::llround(estimate));
+}
+
 static bool redis_op_is_read_only(const TxnOperation& op) {
     switch (op.op) {
         case TXN_OP_GET:
@@ -459,6 +600,7 @@ static bool redis_op_is_read_only(const TxnOperation& op) {
         case TXN_OP_ZRANGEBYLEX:
         case TXN_OP_ZLEXCOUNT:
         case TXN_OP_ZRANDMEMBER:
+        case TXN_OP_HLL_COUNT:
             return true;
         case TXN_OP_SET_ALGEBRA:
             return (op.flags & TXN_FLAG_SET_ALGEBRA_STORE) == 0;
@@ -504,6 +646,8 @@ static bool redis_op_uses_only_primary_lock_key(const TxnOperation& op) {
         case TXN_OP_BPOP:
         case TXN_OP_ZMPOP:
         case TXN_OP_BITOP:
+        case TXN_OP_HLL_COUNT:
+        case TXN_OP_HLL_MERGE:
             return false;
         default:
             return true;
@@ -553,6 +697,8 @@ static std::vector<size_t> redis_request_lock_stripes(const TxnRequest* request)
             case TXN_OP_BPOP:
             case TXN_OP_ZMPOP:
             case TXN_OP_BITOP:
+            case TXN_OP_HLL_COUNT:
+            case TXN_OP_HLL_MERGE:
                 add_packed_lock_keys(op, SIZE_MAX);
                 break;
             default:
@@ -4320,6 +4466,216 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                 result.success = true;
                 result.value_present = true;
                 result.int_value = static_cast<int64_t>(combined.size());
+            } else if (op.op == TXN_OP_HLL_ADD) {
+                // PFADD key [element ...]. Read-modify-write has to happen in a
+                // single op because the executor has no interactive transaction.
+                std::vector<std::string> elements;
+                if (!unpack_bytes_list(op.val_ptr, op.val_len, elements)) {
+                    all_success = false;
+                    continue;
+                }
+                bool allowed = false;
+                mako::Status s = string_key_allowed(txn, user_key, tl_key_buf, result, allowed);
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                if (!allowed) {
+                    continue;  // string_key_allowed already flagged WRONGTYPE
+                }
+                std::string current;
+                bool exists = false;
+                s = read_current(txn, user_key, tl_key_buf, current, exists);
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                bool changed = false;
+                if (!exists) {
+                    current = hll_make_empty();
+                    changed = true;
+                } else if (!hll_value_is_valid(current)) {
+                    result.success = false;
+                    result.int_value = TXN_HLL_ERR_NOT_HLL;
+                    continue;
+                }
+                uint8_t* registers =
+                    reinterpret_cast<uint8_t*>(current.data()) + kHllHeaderSize;
+                for (const std::string& element : elements) {
+                    size_t index = 0;
+                    uint8_t run = 0;
+                    hll_element_slot(element.data(), element.size(), index, run);
+                    if (registers[index] < run) {
+                        registers[index] = run;
+                        changed = true;
+                    }
+                }
+                if (changed) {
+                    // The sketch stays a plain string value, and PFADD keeps any
+                    // TTL the key already had, exactly like SETBIT or APPEND.
+                    s = put_raw(txn, tl_key_buf, current);
+                    if (!s.ok()) {
+                        result.success = false;
+                        all_success = false;
+                        continue;
+                    }
+                    batch_exists[tl_key_buf] = true;
+                    batch_values[tl_key_buf] = current;
+                }
+                result.success = true;
+                result.value_present = true;
+                result.int_value = changed ? 1 : 0;
+            } else if (op.op == TXN_OP_HLL_COUNT) {
+                // PFCOUNT key [key ...]. The payload carries every key, including
+                // op.key; no key is modified, the registers are merged in memory.
+                std::vector<std::string> keys;
+                if (!unpack_bytes_list(op.val_ptr, op.val_len, keys) || keys.empty()) {
+                    all_success = false;
+                    continue;
+                }
+                std::vector<uint8_t> merged(kHllRegisters, 0);
+                bool keys_ok = true;
+                bool invalid_hll = false;
+                for (const std::string& hll_key : keys) {
+                    const std::string storage_key = "table_key_" + hll_key;
+                    bool allowed = false;
+                    mako::Status s =
+                        string_key_allowed(txn, hll_key, storage_key, result, allowed);
+                    if (!s.ok()) {
+                        all_success = false;
+                        keys_ok = false;
+                        break;
+                    }
+                    if (!allowed) {
+                        keys_ok = false;
+                        break;
+                    }
+                    std::string value;
+                    bool exists = false;
+                    s = read_current(txn, hll_key, storage_key, value, exists);
+                    if (!s.ok()) {
+                        all_success = false;
+                        keys_ok = false;
+                        break;
+                    }
+                    if (!exists) {
+                        continue;  // a missing key contributes an empty sketch
+                    }
+                    if (!hll_value_is_valid(value)) {
+                        keys_ok = false;
+                        invalid_hll = true;
+                        break;
+                    }
+                    const uint8_t* registers =
+                        reinterpret_cast<const uint8_t*>(value.data()) + kHllHeaderSize;
+                    for (size_t r = 0; r < kHllRegisters; ++r) {
+                        if (registers[r] > merged[r]) {
+                            merged[r] = registers[r];
+                        }
+                    }
+                }
+                if (!keys_ok) {
+                    if (invalid_hll) {
+                        result.success = false;
+                        result.int_value = TXN_HLL_ERR_NOT_HLL;
+                    }
+                    continue;
+                }
+                result.success = true;
+                result.value_present = true;
+                result.int_value = hll_estimate(merged.data());
+            } else if (op.op == TXN_OP_HLL_MERGE) {
+                // PFMERGE destkey [sourcekey ...]: destination becomes the union
+                // of itself and every source.
+                std::vector<std::string> sources;
+                if (!unpack_bytes_list(op.val_ptr, op.val_len, sources)) {
+                    all_success = false;
+                    continue;
+                }
+                bool allowed = false;
+                mako::Status s = string_key_allowed(txn, user_key, tl_key_buf, result, allowed);
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                if (!allowed) {
+                    continue;
+                }
+                std::string destination;
+                bool exists = false;
+                s = read_current(txn, user_key, tl_key_buf, destination, exists);
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                if (!exists) {
+                    destination = hll_make_empty();
+                } else if (!hll_value_is_valid(destination)) {
+                    result.success = false;
+                    result.int_value = TXN_HLL_ERR_NOT_HLL;
+                    continue;
+                }
+                uint8_t* registers =
+                    reinterpret_cast<uint8_t*>(destination.data()) + kHllHeaderSize;
+                bool sources_ok = true;
+                bool invalid_hll = false;
+                for (const std::string& src_key : sources) {
+                    const std::string src_storage = "table_key_" + src_key;
+                    bool src_allowed = false;
+                    s = string_key_allowed(txn, src_key, src_storage, result, src_allowed);
+                    if (!s.ok()) {
+                        all_success = false;
+                        sources_ok = false;
+                        break;
+                    }
+                    if (!src_allowed) {
+                        sources_ok = false;
+                        break;
+                    }
+                    std::string value;
+                    bool src_exists = false;
+                    s = read_current(txn, src_key, src_storage, value, src_exists);
+                    if (!s.ok()) {
+                        all_success = false;
+                        sources_ok = false;
+                        break;
+                    }
+                    if (!src_exists) {
+                        continue;
+                    }
+                    if (!hll_value_is_valid(value)) {
+                        sources_ok = false;
+                        invalid_hll = true;
+                        break;
+                    }
+                    const uint8_t* src_registers =
+                        reinterpret_cast<const uint8_t*>(value.data()) + kHllHeaderSize;
+                    for (size_t r = 0; r < kHllRegisters; ++r) {
+                        if (src_registers[r] > registers[r]) {
+                            registers[r] = src_registers[r];
+                        }
+                    }
+                }
+                if (!sources_ok) {
+                    if (invalid_hll) {
+                        result.success = false;
+                        result.int_value = TXN_HLL_ERR_NOT_HLL;
+                    }
+                    continue;
+                }
+                // Like Redis, PFMERGE rewrites the destination in place and keeps
+                // whatever TTL it already carried.
+                s = put_raw(txn, tl_key_buf, destination);
+                if (!s.ok()) {
+                    result.success = false;
+                    all_success = false;
+                    continue;
+                }
+                batch_exists[tl_key_buf] = true;
+                batch_values[tl_key_buf] = destination;
+                result.success = true;
+                result.value_present = true;
+                result.int_value = 0;
             } else if (op.op == TXN_OP_RESTORE_LIST) {
                 std::vector<std::string> values;
                 if (!unpack_bytes_list(op.val_ptr, op.val_len, values)) {

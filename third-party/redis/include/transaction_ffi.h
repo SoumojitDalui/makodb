@@ -127,7 +127,26 @@ typedef enum {
     TXN_OP_COPY = 77,
     // BITOP: key = destination, value = packed [AND|OR|XOR|NOT, src...].
     TXN_OP_BITOP = 78,
+    // HyperLogLog. The sketch is a plain string value at the normal string
+    // storage key, so TYPE/DEL/EXPIRE/DUMP/RESTORE/GET keep working on it.
+    // HLL_ADD: key = target, value = packed [element ...] (may be empty);
+    //   int_value = 1 when a register changed or the key was created.
+    // HLL_COUNT: key = first key, value = packed [key ...] (all of them);
+    //   read-only, int_value = the cardinality of the union.
+    // HLL_MERGE: key = destination, value = packed [source key ...].
+    TXN_OP_HLL_ADD = 79,
+    TXN_OP_HLL_COUNT = 80,
+    TXN_OP_HLL_MERGE = 81,
 } TxnOpCode;
+
+/**
+ * HyperLogLog result convention: when an HLL op fails because one of its keys
+ * holds a string that is not a valid sketch (bad magic or wrong length), the
+ * op reports success=false with int_value set to this sentinel so Rust can
+ * emit the Redis "not a valid HyperLogLog string value" error instead of the
+ * generic WRONGTYPE text. Any other success=false means plain WRONGTYPE.
+ */
+#define TXN_HLL_ERR_NOT_HLL (-2)
 
 typedef enum {
     TXN_FLAG_NONE = 0,

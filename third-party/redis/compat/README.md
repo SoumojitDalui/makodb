@@ -390,14 +390,16 @@ TCL_COMPAT_FILES=unit/type/list TCL_COMPAT_FILE_TIMEOUT=120 \
 `TCL_COMPAT_ONLY` passes Redis's exact test-name filter to the Tcl helper; it
 does not select a file. Use `TCL_COMPAT_FILES` for file selection.
 
-## Phase 2 Command Additions
+## Phase 2 and 3 Command Additions
 
-The `redis-compat-phase2` branch adds the following on top of PR 72, all
+The `redis-compat-phase2` branch and, for the HyperLogLog row, the
+`redis-compat-phase3` branch add the following on top of PR 72, all
 implemented in the adapter with no changes below `makoCon`:
 
 | Area | Commands |
 |---|---|
 | Bitmaps | `BITCOUNT` (BYTE/BIT ranges), `BITPOS`, `BITFIELD_RO` (GET), `BITOP` (AND/OR/XOR/NOT, atomic in one Mako transaction) |
+| HyperLogLog | `PFADD`, `PFCOUNT` (single key and multi-key union), `PFMERGE` — dense sketch kept in a plain string value (`MHLL` header, 16384 one-byte registers), MurmurHash64A and the Ertl estimator from Redis `hyperloglog.c`, each command one atomic Mako op |
 | Keyspace | `TOUCH`, `SORT_RO`, `SORT ... LIMIT offset count`, `OBJECT ENCODING/REFCOUNT/HELP`, approximate `MEMORY USAGE` |
 | DUMP/RESTORE | string, set, and sorted-set payloads (`MAKO_STRING_DUMP`, `MAKO_SET_DUMP`, `MAKO_ZSET_DUMP`), TTL and `ABSTTL` honored on RESTORE |
 | Pub/Sub | `SPUBLISH`, `SSUBSCRIBE`, `SUNSUBSCRIBE`, `PUBSUB SHARDCHANNELS/SHARDNUMSUB` (process-local, like classic Pub/Sub) |

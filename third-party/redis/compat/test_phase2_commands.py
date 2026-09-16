@@ -143,6 +143,92 @@ def main():
     check("BITOP dest gone", c.cmd("EXISTS", "dest"), 0)
     check("BITOP wrongtype source", c.cmd("BITOP", "OR", "d", "bc-list"), pred=lambda g: is_err(g, "WRONGTYPE"))
 
+    # HyperLogLog: PFADD / PFCOUNT / PFMERGE (phase 3 package 1)
+    # The sketch is a private dense format kept in a plain string value.
+    check("PFADD doc example", c.cmd("PFADD", "hll", "a", "b", "c", "d", "e", "f", "g"), 1)
+    check("PFCOUNT doc example", c.cmd("PFCOUNT", "hll"), 7)
+    check("PFADD known element", c.cmd("PFADD", "hll", "a"), 0)
+
+    check("PFADD no elements creates", c.cmd("PFADD", "hll-empty"), 1)
+    check("PFCOUNT empty sketch", c.cmd("PFCOUNT", "hll-empty"), 0)
+    check("PFADD no elements again", c.cmd("PFADD", "hll-empty"), 0)
+    check("PFCOUNT missing key", c.cmd("PFCOUNT", "hll-gone"), 0)
+
+    # Multi-key PFCOUNT is the cardinality of the union and touches nothing.
+    left = ["u%d" % i for i in range(120)]
+    right = ["u%d" % i for i in range(80, 200)]
+    c.cmd("PFADD", "hll1", *left)
+    c.cmd("PFADD", "hll2", *right)
+    true_union = len(set(left) | set(right))
+    before = c.cmd("PFCOUNT", "hll1")
+    tolerance = max(1, int(round(true_union * 0.02)))
+    check(
+        "PFCOUNT union of two keys",
+        c.cmd("PFCOUNT", "hll1", "hll2"),
+        pred=lambda g: isinstance(g, int) and abs(g - true_union) <= tolerance,
+    )
+    check("PFCOUNT leaves sources alone", c.cmd("PFCOUNT", "hll1"), before)
+    check("PFCOUNT union is order independent",
+          c.cmd("PFCOUNT", "hll2", "hll1"), c.cmd("PFCOUNT", "hll1", "hll2"))
+
+    # 10,000 distinct elements, within the documented 1.5% band.
+    for base in range(0, 10000, 500):
+        c.cmd("PFADD", "hll-big", *["e%d" % i for i in range(base, base + 500)])
+    check(
+        "PFCOUNT 10k within 1.5%",
+        c.cmd("PFCOUNT", "hll-big"),
+        pred=lambda g: isinstance(g, int) and abs(g - 10000) <= 150,
+    )
+
+    # PFMERGE
+    c.cmd("PFADD", "hll-src1", *["m%d" % i for i in range(100)])
+    c.cmd("PFADD", "hll-src2", *["m%d" % i for i in range(50, 150)])
+    check("PFMERGE", c.cmd("PFMERGE", "hll-dest", "hll-src1", "hll-src2"), "OK")
+    check(
+        "PFMERGE count matches union",
+        c.cmd("PFCOUNT", "hll-dest"),
+        pred=lambda g: isinstance(g, int) and abs(g - 150) <= 3,
+    )
+    check("PFMERGE equals multi-key PFCOUNT",
+          c.cmd("PFCOUNT", "hll-dest"), c.cmd("PFCOUNT", "hll-src1", "hll-src2"))
+    check("PFMERGE is idempotent", c.cmd("PFMERGE", "hll-dest", "hll-src1"), "OK")
+    check("PFMERGE idempotent count", c.cmd("PFCOUNT", "hll-dest"),
+          c.cmd("PFCOUNT", "hll-src1", "hll-src2"))
+    check("PFMERGE onto missing dest", c.cmd("PFMERGE", "hll-dest2", "hll-src1"), "OK")
+    check("PFMERGE new dest count", c.cmd("PFCOUNT", "hll-dest2"), c.cmd("PFCOUNT", "hll-src1"))
+
+    # The sketch is an ordinary string value for every other command.
+    check("TYPE of a sketch", c.cmd("TYPE", "hll"), "string")
+    check("GET of a sketch", c.cmd("GET", "hll"),
+          pred=lambda g: isinstance(g, bytes) and g.startswith(b"MHLL"))
+    check("STRLEN of a sketch", c.cmd("STRLEN", "hll"), 16400)
+    check("DEL of a sketch", c.cmd("DEL", "hll"), 1)
+
+    # A plain string is not a valid sketch; another type is a plain WRONGTYPE.
+    c.cmd("SET", "hll-plain", "x")
+    check("PFADD on a plain string", c.cmd("PFADD", "hll-plain", "a"),
+          pred=lambda g: is_err(g, "WRONGTYPE Key is not a valid HyperLogLog"))
+    check("PFCOUNT on a plain string", c.cmd("PFCOUNT", "hll-plain"),
+          pred=lambda g: is_err(g, "WRONGTYPE Key is not a valid HyperLogLog"))
+    check("PFMERGE from a plain string", c.cmd("PFMERGE", "hll-d3", "hll-plain"),
+          pred=lambda g: is_err(g, "WRONGTYPE Key is not a valid HyperLogLog"))
+    c.cmd("RPUSH", "hll-list", "x")
+    check("PFADD on a list", c.cmd("PFADD", "hll-list", "a"),
+          pred=lambda g: is_err(g, "WRONGTYPE Operation against"))
+    check("PFCOUNT on a list", c.cmd("PFCOUNT", "hll-list"),
+          pred=lambda g: is_err(g, "WRONGTYPE Operation against"))
+    check("PFADD arity", c.cmd("PFADD"), pred=lambda g: is_err(g, "ERR wrong number"))
+    check("PFCOUNT arity", c.cmd("PFCOUNT"), pred=lambda g: is_err(g, "ERR wrong number"))
+    check("PFMERGE arity", c.cmd("PFMERGE"), pred=lambda g: is_err(g, "ERR wrong number"))
+
+    # Hash-tag style key names and TTLs behave like any other string key.
+    check("PFADD tagged key", c.cmd("PFADD", "{visits}:2026", "a", "b"), 1)
+    check("EXPIRE on a sketch", c.cmd("EXPIRE", "{visits}:2026", "100"), 1)
+    check("PFADD after EXPIRE", c.cmd("PFADD", "{visits}:2026", "c"), 1)
+    check("PFCOUNT after EXPIRE", c.cmd("PFCOUNT", "{visits}:2026"), 3)
+    check("PFADD keeps the TTL", c.cmd("TTL", "{visits}:2026"),
+          pred=lambda g: isinstance(g, int) and 0 < g <= 100)
+
     # BITFIELD_RO
     c.cmd("SET", "bf", b"\x01\x02\xff")
     check("BITFIELD_RO u8 0", c.cmd("BITFIELD_RO", "bf", "GET", "u8", "0"), [1])
