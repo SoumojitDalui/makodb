@@ -404,6 +404,164 @@ def main():
     check("PUBSUB SHARDCHANNELS empty", c.cmd("PUBSUB", "SHARDCHANNELS"), [])
     check("subscriber left subscriber mode", sub.cmd("PING"), "PONG")
 
+    # Geo commands (Redis documentation examples: Palermo / Catania / Agrigento)
+    def near(got, want, tol):
+        return isinstance(got, (int, float)) and abs(got - want) <= tol
+
+    def coord_near(got, lon, lat):
+        return (
+            isinstance(got, list)
+            and len(got) == 2
+            and near(float(got[0]), lon, 1e-4)
+            and near(float(got[1]), lat, 1e-4)
+        )
+
+    check("GEOADD two members", c.cmd("GEOADD", "Sicily", "13.361389", "38.115556", "Palermo",
+                                      "15.087269", "37.502669", "Catania"), 2)
+    check("GEOADD repeated adds nothing", c.cmd("GEOADD", "Sicily", "13.361389", "38.115556", "Palermo"), 0)
+    check("GEOADD CH counts a move", c.cmd("GEOADD", "Sicily", "CH", "13.5", "38.2", "Palermo"), 1)
+    check("GEOADD CH restores Palermo", c.cmd("GEOADD", "Sicily", "CH", "13.361389", "38.115556", "Palermo"), 1)
+    check("GEOADD NX keeps the old position", c.cmd("GEOADD", "Sicily", "NX", "1", "1", "Palermo"), 0)
+    check("GEOADD NX position unchanged", c.cmd("GEOPOS", "Sicily", "Palermo"),
+          pred=lambda g: coord_near(g[0], 13.361389, 38.115556))
+    check("GEOADD NX adds a new member", c.cmd("GEOADD", "Sicily", "NX", "12.0", "38.0", "Marsala"), 1)
+    check("GEOADD XX ignores a new member", c.cmd("GEOADD", "Sicily", "XX", "12.5", "38.5", "Trapani"), 0)
+    check("GEOADD XX moves an existing one", c.cmd("GEOADD", "Sicily", "XX", "CH", "12.1", "38.1", "Marsala"), 1)
+    check("GEOADD XX did not create Trapani", c.cmd("ZSCORE", "Sicily", "Trapani"), None)
+    check("GEOADD cleanup", c.cmd("ZREM", "Sicily", "Marsala"), 1)
+
+    # A geo set is an ordinary sorted set.
+    check("TYPE of a geo key", c.cmd("TYPE", "Sicily"), "zset")
+    check("ZSCORE Palermo is the 52-bit geohash", c.cmd("ZSCORE", "Sicily", "Palermo"), b"3479099956230698")
+    check("ZSCORE Catania is the 52-bit geohash", c.cmd("ZSCORE", "Sicily", "Catania"), b"3479447370796909")
+
+    # GEODIST
+    check("GEODIST meters", c.cmd("GEODIST", "Sicily", "Palermo", "Catania"), b"166274.1516")
+    check("GEODIST km", c.cmd("GEODIST", "Sicily", "Palermo", "Catania", "km"), b"166.2742")
+    check("GEODIST mi", c.cmd("GEODIST", "Sicily", "Palermo", "Catania", "mi"), b"103.3182")
+    check("GEODIST ft", c.cmd("GEODIST", "Sicily", "Palermo", "Catania", "ft"),
+          pred=lambda g: near(float(g), 166274.1516 / 0.3048, 0.1))
+    check("GEODIST missing member", c.cmd("GEODIST", "Sicily", "Palermo", "Foo"), None)
+    check("GEODIST missing key", c.cmd("GEODIST", "geo-missing", "a", "b"), None)
+
+    # GEOHASH
+    check("GEOHASH strings", c.cmd("GEOHASH", "Sicily", "Palermo", "Catania"),
+          [b"sqc8b49rny0", b"sqdtr74hyu0"])
+    check("GEOHASH missing member", c.cmd("GEOHASH", "Sicily", "NonExisting"), [None])
+    check("GEOHASH missing key", c.cmd("GEOHASH", "geo-missing", "a"), [None])
+
+    # GEOPOS
+    pos = c.cmd("GEOPOS", "Sicily", "Palermo", "Catania", "NonExisting")
+    check("GEOPOS shape", pos, pred=lambda g: isinstance(g, list) and len(g) == 3 and g[2] is None)
+    check("GEOPOS Palermo", pos[0], pred=lambda g: coord_near(g, 13.361389, 38.115556))
+    check("GEOPOS Catania", pos[1], pred=lambda g: coord_near(g, 15.087269, 37.502669))
+    check("GEOPOS missing key", c.cmd("GEOPOS", "geo-missing", "a"), [None])
+
+    # GEORADIUS (documentation example: centre 15 37, radius 200 km)
+    check("GEORADIUS names", sorted(c.cmd("GEORADIUS", "Sicily", "15", "37", "200", "km")),
+          [b"Catania", b"Palermo"])
+    withdist = c.cmd("GEORADIUS", "Sicily", "15", "37", "200", "km", "WITHDIST")
+    dists = {row[0]: float(row[1]) for row in withdist}
+    check("GEORADIUS WITHDIST members", sorted(dists), [b"Catania", b"Palermo"])
+    check("GEORADIUS WITHDIST Palermo", dists.get(b"Palermo"), pred=lambda g: near(g, 190.4424, 0.01))
+    check("GEORADIUS WITHDIST Catania", dists.get(b"Catania"), pred=lambda g: near(g, 56.4413, 0.01))
+    withcoord = {row[0]: row[1] for row in c.cmd("GEORADIUS", "Sicily", "15", "37", "200", "km", "WITHCOORD")}
+    check("GEORADIUS WITHCOORD Palermo", withcoord.get(b"Palermo"),
+          pred=lambda g: coord_near(g, 13.361389, 38.115556))
+    check("GEORADIUS WITHCOORD Catania", withcoord.get(b"Catania"),
+          pred=lambda g: coord_near(g, 15.087269, 37.502669))
+    both = c.cmd("GEORADIUS", "Sicily", "15", "37", "200", "km", "WITHDIST", "WITHCOORD")
+    check("GEORADIUS WITHDIST WITHCOORD shape", both,
+          pred=lambda g: isinstance(g, list) and len(g) == 2 and all(len(row) == 3 for row in g)
+          and all(isinstance(row[2], list) and len(row[2]) == 2 for row in g))
+    withhash = {row[0]: row[1] for row in c.cmd("GEORADIUS", "Sicily", "15", "37", "200", "km", "WITHHASH")}
+    check("GEORADIUS WITHHASH Palermo", withhash.get(b"Palermo"), 3479099956230698)
+    check("GEORADIUS COUNT 1 ASC", c.cmd("GEORADIUS", "Sicily", "15", "37", "200", "km", "COUNT", "1", "ASC"),
+          [b"Catania"])
+    check("GEORADIUS COUNT 1 picks the closest", c.cmd("GEORADIUS", "Sicily", "15", "37", "200", "km", "COUNT", "1"),
+          [b"Catania"])
+    check("GEORADIUS DESC", c.cmd("GEORADIUS", "Sicily", "15", "37", "200", "km", "DESC"),
+          [b"Palermo", b"Catania"])
+    check("GEORADIUS small radius", c.cmd("GEORADIUS", "Sicily", "15", "37", "1", "km"), [])
+    check("GEORADIUS missing key", c.cmd("GEORADIUS", "geo-missing", "15", "37", "200", "km"), [])
+    check("GEORADIUS_RO", sorted(c.cmd("GEORADIUS_RO", "Sicily", "15", "37", "200", "km")),
+          [b"Catania", b"Palermo"])
+
+    # GEOSEARCH
+    check("GEOSEARCH BYRADIUS ASC", c.cmd("GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37",
+                                          "BYRADIUS", "200", "km", "ASC"),
+          [b"Catania", b"Palermo"])
+    box = c.cmd("GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37", "BYBOX", "400", "400", "km",
+                "ASC", "WITHCOORD", "WITHDIST")
+    check("GEOSEARCH BYBOX order", [row[0] for row in box], [b"Catania", b"Palermo"])
+    check("GEOSEARCH BYBOX shape", box,
+          pred=lambda g: all(len(row) == 3 and isinstance(row[2], list) and len(row[2]) == 2 for row in g))
+    check("GEOSEARCH BYBOX Catania distance", float(box[0][1]), pred=lambda g: near(g, 56.4413, 0.01))
+    check("GEOSEARCH BYBOX Palermo coord", box[1][2], pred=lambda g: coord_near(g, 13.361389, 38.115556))
+    check("GEOSEARCH FROMMEMBER", sorted(c.cmd("GEOSEARCH", "Sicily", "FROMMEMBER", "Palermo",
+                                               "BYRADIUS", "200", "km")),
+          pred=lambda g: b"Catania" in g and b"Palermo" in g)
+    check("GEOSEARCH COUNT 1 ANY", c.cmd("GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37",
+                                         "BYRADIUS", "200", "km", "COUNT", "1", "ANY"),
+          pred=lambda g: isinstance(g, list) and len(g) == 1)
+    check("GEOSEARCH DESC", c.cmd("GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37",
+                                  "BYRADIUS", "200", "km", "DESC"),
+          [b"Palermo", b"Catania"])
+    check("GEOSEARCH missing key", c.cmd("GEOSEARCH", "geo-missing", "FROMLONLAT", "15", "37",
+                                         "BYRADIUS", "200", "km"), [])
+    check("GEOSEARCH FROMMEMBER missing",
+          c.cmd("GEOSEARCH", "Sicily", "FROMMEMBER", "NonExisting", "BYRADIUS", "200", "km"),
+          pred=lambda g: is_err(g, "ERR") and "could not decode requested zset member" in str(g))
+
+    # GEORADIUSBYMEMBER (documentation example)
+    check("GEOADD Agrigento", c.cmd("GEOADD", "Sicily", "13.583333", "37.316667", "Agrigento"), 1)
+    check("GEORADIUSBYMEMBER", sorted(c.cmd("GEORADIUSBYMEMBER", "Sicily", "Agrigento", "100", "km")),
+          [b"Agrigento", b"Palermo"])
+    check("GEORADIUSBYMEMBER_RO", sorted(c.cmd("GEORADIUSBYMEMBER_RO", "Sicily", "Agrigento", "100", "km")),
+          [b"Agrigento", b"Palermo"])
+    check("GEORADIUSBYMEMBER missing member", c.cmd("GEORADIUSBYMEMBER", "Sicily", "NonExisting", "100", "km"),
+          pred=lambda g: is_err(g, "ERR") and "could not decode requested zset member" in str(g))
+    # A key that does not exist searches an empty set; only a missing member of
+    # an existing key is an error (Redis tests/unit/geo.tcl).
+    check("GEORADIUSBYMEMBER missing key", c.cmd("GEORADIUSBYMEMBER", "geo-missing", "member", "100", "km"), [])
+    check("GEORADIUSBYMEMBER_RO missing key", c.cmd("GEORADIUSBYMEMBER_RO", "geo-missing", "member", "1", "km"), [])
+    check("GEOSEARCH FROMMEMBER missing key",
+          c.cmd("GEOSEARCH", "geo-missing", "FROMMEMBER", "member", "BYBOX", "1", "1", "km"), [])
+
+    # Geo error cases
+    check("GEOADD invalid coordinates",
+          c.cmd("GEOADD", "Sicily", "200", "100", "bad"),
+          pred=lambda g: is_err(g, "ERR invalid longitude,latitude pair 200.000000,100.000000"))
+    check("GEODIST bad unit", c.cmd("GEODIST", "Sicily", "Palermo", "Catania", "yards"),
+          pred=lambda g: is_err(g, "ERR unsupported unit provided. please use M, KM, FT, MI"))
+    check("GEORADIUS bad unit", c.cmd("GEORADIUS", "Sicily", "15", "37", "200", "yards"),
+          pred=lambda g: is_err(g, "ERR unsupported unit provided. please use M, KM, FT, MI"))
+    check("GEORADIUS negative radius", c.cmd("GEORADIUS", "Sicily", "15", "37", "-5", "km"),
+          pred=lambda g: is_err(g, "ERR radius cannot be negative"))
+    check("GEORADIUS rejects STORE", c.cmd("GEORADIUS", "Sicily", "15", "37", "200", "km", "STORE", "dst"),
+          pred=lambda g: is_err(g, "ERR STORE option in GEORADIUS is not supported by this server"))
+    check("GEORADIUS rejects STOREDIST", c.cmd("GEORADIUS", "Sicily", "15", "37", "200", "km", "STOREDIST", "dst"),
+          pred=lambda g: is_err(g, "ERR STORE option in GEORADIUS is not supported by this server"))
+    check("GEOSEARCHSTORE is unknown", c.cmd("GEOSEARCHSTORE", "dst", "Sicily", "FROMLONLAT", "15", "37",
+                                             "BYRADIUS", "200", "km"),
+          pred=lambda g: is_err(g, "ERR unknown command"))
+    c.cmd("SET", "geo-string", "not-a-geo-set")
+    check("GEOADD wrongtype", c.cmd("GEOADD", "geo-string", "13.0", "38.0", "x"),
+          pred=lambda g: is_err(g, "WRONGTYPE"))
+    check("GEOPOS wrongtype", c.cmd("GEOPOS", "geo-string", "x"), pred=lambda g: is_err(g, "WRONGTYPE"))
+    check("GEODIST wrongtype", c.cmd("GEODIST", "geo-string", "a", "b"), pred=lambda g: is_err(g, "WRONGTYPE"))
+    check("GEOHASH wrongtype", c.cmd("GEOHASH", "geo-string", "x"), pred=lambda g: is_err(g, "WRONGTYPE"))
+    check("GEORADIUS wrongtype", c.cmd("GEORADIUS", "geo-string", "15", "37", "200", "km"),
+          pred=lambda g: is_err(g, "WRONGTYPE"))
+    check("GEORADIUSBYMEMBER wrongtype", c.cmd("GEORADIUSBYMEMBER", "geo-string", "x", "200", "km"),
+          pred=lambda g: is_err(g, "WRONGTYPE"))
+
+    # The geo set stayed a plain sorted set throughout.
+    check("TYPE Sicily", c.cmd("TYPE", "Sicily"), "zset")
+    check("ZCARD Sicily", c.cmd("ZCARD", "Sicily"), 3)
+    check("ZRANGE Sicily by geohash score", c.cmd("ZRANGE", "Sicily", "0", "-1"),
+          [b"Agrigento", b"Palermo", b"Catania"])
+
     # Untouched basics still work
     check("SET/GET regression", c.cmd("GET", "t1"), b"v")
     check("EXISTS regression", c.cmd("EXISTS", "t1", "s1"), 2)

@@ -392,14 +392,15 @@ does not select a file. Use `TCL_COMPAT_FILES` for file selection.
 
 ## Phase 2 and 3 Command Additions
 
-The `redis-compat-phase2` branch and, for the HyperLogLog row and
-`BITFIELD`, the `redis-compat-phase3` branch add the following on top of
+The `redis-compat-phase2` branch and, for the HyperLogLog, `BITFIELD` and
+Geo rows, the `redis-compat-phase3` branch add the following on top of
 PR 72, all implemented in the adapter with no changes below `makoCon`:
 
 | Area | Commands |
 |---|---|
 | Bitmaps | `BITCOUNT` (BYTE/BIT ranges), `BITPOS`, `BITFIELD_RO` (GET), `BITFIELD` (GET/SET/INCRBY, `OVERFLOW WRAP/SAT/FAIL`, `#` offsets; the whole subcommand list runs as one atomic Mako op, and a call whose subcommands are all GET is dispatched to the read-only path), `BITOP` (AND/OR/XOR/NOT, atomic in one Mako transaction) |
 | HyperLogLog | `PFADD`, `PFCOUNT` (single key and multi-key union), `PFMERGE` — dense sketch kept in a plain string value (`MHLL` header, 16384 one-byte registers), MurmurHash64A and the Ertl estimator from Redis `hyperloglog.c`, each command one atomic Mako op |
+| Geo | `GEOADD` (`NX`/`XX`/`CH`), `GEOPOS`, `GEODIST`, `GEOHASH`, `GEOSEARCH` (`FROMMEMBER`/`FROMLONLAT`, `BYRADIUS`/`BYBOX`), `GEORADIUS`, `GEORADIUSBYMEMBER`, `GEORADIUS_RO`, `GEORADIUSBYMEMBER_RO` — a geo key is a plain sorted set scored by Redis's 52-bit interleaved geohash, so `TYPE` is `zset` and every zset command still works on it. Built entirely from existing zset ops: GEOADD is one ZADD, GEOPOS/GEODIST/GEOHASH are one ZSCORE per member, and a search issues one by-score range read per geohash neighbor box in a single request, then filters by exact haversine distance (or Redis's rectangle test) in Rust. `STORE`/`STOREDIST` and `GEOSEARCHSTORE` are not offered, which is the only reason any test in Redis's own `tests/unit/geo.tcl` fails against the adapter (48 pass, 5 fail, all on those options) |
 | Keyspace | `TOUCH`, `SORT_RO`, `SORT ... LIMIT offset count`, `OBJECT ENCODING/REFCOUNT/HELP`, approximate `MEMORY USAGE` |
 | DUMP/RESTORE | string, set, and sorted-set payloads (`MAKO_STRING_DUMP`, `MAKO_SET_DUMP`, `MAKO_ZSET_DUMP`), TTL and `ABSTTL` honored on RESTORE |
 | Pub/Sub | `SPUBLISH`, `SSUBSCRIBE`, `SUNSUBSCRIBE`, `PUBSUB SHARDCHANNELS/SHARDNUMSUB` (process-local, like classic Pub/Sub) |

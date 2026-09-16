@@ -559,6 +559,14 @@ enum OpCode {
     PfCount = 179,
     PfMerge = 180,
     BitField = 181,
+    GeoAdd = 182,
+    GeoPos = 183,
+    GeoDist = 184,
+    GeoHash = 185,
+    // One opcode for GEOSEARCH, GEORADIUS, GEORADIUSBYMEMBER and the two _RO
+    // spellings: they differ only in argument syntax, and the shape they search
+    // with plus the requested output columns live in `Command::geo`.
+    GeoSearch = 186,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -587,6 +595,56 @@ struct Command {
     set_count: Option<i64>,
     // RESTORE payload kind: 0 list, 1 hash, 2 string, 3 set, 4 zset.
     restore_kind: u8,
+    // GEOSEARCH/GEORADIUS/GEORADIUSBYMEMBER search shape and output columns.
+    // Boxed so the common commands keep `Command` small.
+    geo: Option<Box<GeoSearchSpec>>,
+}
+
+/// Result ordering requested by a geo search.
+#[derive(Clone, Copy, PartialEq)]
+enum GeoSort {
+    None,
+    Asc,
+    Desc,
+}
+
+/// Everything a geo search needs after parsing. The center is in degrees;
+/// radius, width and height are in meters, already converted from the unit the
+/// client asked for. `unit_meters` is kept so WITHDIST can convert back.
+#[derive(Clone)]
+struct GeoSearchSpec {
+    center_lon: f64,
+    center_lat: f64,
+    /// FROMMEMBER / GEORADIUSBYMEMBER: the member whose position is the center.
+    /// It is resolved by its own request before the range reads are built,
+    /// because a later op cannot read an earlier op's result in one request.
+    from_member: Option<Bytes>,
+    /// Why the FROMMEMBER lookup could not produce a center, if it could not.
+    resolve_error: GeoResolve,
+    /// BYRADIUS (true) or BYBOX (false).
+    circular: bool,
+    radius_m: f64,
+    width_m: f64,
+    height_m: f64,
+    unit_meters: f64,
+    sort: GeoSort,
+    count: Option<usize>,
+    any: bool,
+    withcoord: bool,
+    withdist: bool,
+    withhash: bool,
+}
+
+/// Outcome of the FROMMEMBER center lookup.
+#[derive(Clone, Copy, PartialEq)]
+enum GeoResolve {
+    Ok,
+    /// The key does not exist at all: Redis answers an empty result.
+    KeyMissing,
+    /// The key exists but holds no such member: Redis answers an error.
+    MemberMissing,
+    WrongType,
+    Failed,
 }
 
 impl Command {
@@ -608,6 +666,7 @@ impl Command {
             scan_type_matches: true,
             set_count: None,
             restore_kind: 0,
+            geo: None,
         }
     }
 }
@@ -615,6 +674,9 @@ impl Command {
 enum ParseError {
     Protocol(&'static str),
     Error(&'static str),
+    /// Redis-style `ERR ...` text that has to be built at parse time, such as
+    /// GEOADD's "invalid longitude,latitude pair %f,%f".
+    Owned(String),
     UnknownCommand { name: Bytes, args: Vec<Bytes> },
     WrongArity { command: &'static str },
 }
@@ -1418,6 +1480,22 @@ fn parse_opcode(name: &[u8]) -> Option<OpCode> {
         Some(OpCode::SSubscribe)
     } else if ascii_eq_ci(name, b"SUNSUBSCRIBE") {
         Some(OpCode::SUnsubscribe)
+    } else if ascii_eq_ci(name, b"GEOADD") {
+        Some(OpCode::GeoAdd)
+    } else if ascii_eq_ci(name, b"GEOPOS") {
+        Some(OpCode::GeoPos)
+    } else if ascii_eq_ci(name, b"GEODIST") {
+        Some(OpCode::GeoDist)
+    } else if ascii_eq_ci(name, b"GEOHASH") {
+        Some(OpCode::GeoHash)
+    } else if ascii_eq_ci(name, b"GEOSEARCH")
+        || ascii_eq_ci(name, b"GEORADIUS")
+        || ascii_eq_ci(name, b"GEORADIUS_RO")
+        || ascii_eq_ci(name, b"GEORADIUSBYMEMBER")
+        || ascii_eq_ci(name, b"GEORADIUSBYMEMBER_RO")
+    {
+        // The parse arm re-reads the name to pick the argument syntax.
+        Some(OpCode::GeoSearch)
     } else {
         None
     }
@@ -2201,6 +2279,122 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             cmd.values = values;
             Ok(cmd)
         }
+        OpCode::GeoAdd => {
+            // GEOADD key [NX|XX] [CH] lon lat member ... becomes a ZADD whose
+            // score is the 52-bit geohash of each position.
+            if parts.len() < 5 {
+                return Err(wrong_arity("geoadd"));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            let mut flags = 0u32;
+            let mut index = 2usize;
+            while index < parts.len() {
+                let arg = part_to_bytes(&parts[index])?;
+                if ascii_eq_ci(arg.as_ref(), b"NX") {
+                    flags |= TXN_FLAG_ZADD_NX;
+                } else if ascii_eq_ci(arg.as_ref(), b"XX") {
+                    flags |= TXN_FLAG_ZADD_XX;
+                } else if ascii_eq_ci(arg.as_ref(), b"CH") {
+                    flags |= TXN_FLAG_ZADD_CH;
+                } else {
+                    break;
+                }
+                index += 1;
+            }
+            if (flags & TXN_FLAG_ZADD_NX) != 0 && (flags & TXN_FLAG_ZADD_XX) != 0 {
+                return Err(ParseError::Error("syntax error"));
+            }
+            if index >= parts.len() || (parts.len() - index) % 3 != 0 {
+                return Err(ParseError::Error("syntax error"));
+            }
+            let mut values = Vec::with_capacity((parts.len() - index) / 3 * 2);
+            for triple in parts[index..].chunks_exact(3) {
+                let longitude = parse_f64_error_arg(
+                    part_to_bytes(&triple[0])?.as_ref(),
+                    "value is not a valid float",
+                )?;
+                let latitude = parse_f64_error_arg(
+                    part_to_bytes(&triple[1])?.as_ref(),
+                    "value is not a valid float",
+                )?;
+                // Redis formats both coordinates with %f in this message.
+                if !(GEO_LONG_MIN..=GEO_LONG_MAX).contains(&longitude)
+                    || !(GEO_LAT_MIN..=GEO_LAT_MAX).contains(&latitude)
+                {
+                    return Err(ParseError::Owned(format!(
+                        "invalid longitude,latitude pair {longitude:.6},{latitude:.6}"
+                    )));
+                }
+                let Some(score) = geo_score_for_position(longitude, latitude) else {
+                    return Err(ParseError::Owned(format!(
+                        "invalid longitude,latitude pair {longitude:.6},{latitude:.6}"
+                    )));
+                };
+                values.push(Bytes::from(score.to_string()));
+                values.push(part_to_bytes(&triple[2])?);
+            }
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values = values;
+            cmd.expire_flags = flags;
+            Ok(cmd)
+        }
+        OpCode::GeoPos | OpCode::GeoHash => {
+            // One ZSCORE op per member; the reply arm decodes each score.
+            if parts.len() < 2 {
+                return Err(wrong_arity(if op == OpCode::GeoPos {
+                    "geopos"
+                } else {
+                    "geohash"
+                }));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            let mut values = Vec::with_capacity(parts.len() - 2);
+            for part in parts.iter().skip(2) {
+                values.push(part_to_bytes(part)?);
+            }
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values = values;
+            Ok(cmd)
+        }
+        OpCode::GeoDist => {
+            if parts.len() < 4 {
+                return Err(wrong_arity("geodist"));
+            }
+            if parts.len() > 5 {
+                return Err(ParseError::Error("syntax error"));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            let unit = if parts.len() == 5 {
+                part_to_bytes(&parts[4])?
+            } else {
+                Bytes::from_static(b"m")
+            };
+            if geo_unit_meters(unit.as_ref()).is_none() {
+                return Err(ParseError::Error(GEO_UNIT_ERROR));
+            }
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                Some(unit),
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values = vec![part_to_bytes(&parts[2])?, part_to_bytes(&parts[3])?];
+            Ok(cmd)
+        }
+        OpCode::GeoSearch => parse_geo_search(&parts),
         OpCode::Object => {
             if parts.len() < 2 {
                 return Err(wrong_arity("object"));
@@ -4875,6 +5069,11 @@ fn write_parse_error<W: Write>(w: &mut W, err: ParseError) -> std::io::Result<()
             w.write_all(msg.as_bytes())?;
             w.write_all(b"\r\n")
         }
+        ParseError::Owned(msg) => {
+            w.write_all(b"-ERR ")?;
+            w.write_all(msg.as_bytes())?;
+            w.write_all(b"\r\n")
+        }
         ParseError::WrongArity { command } => {
             w.write_all(b"-ERR wrong number of arguments for '")?;
             w.write_all(command.as_bytes())?;
@@ -6492,6 +6691,84 @@ fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)
                     group_id: 0,
                 });
             }
+            OpCode::GeoAdd => {
+                // Same op as ZADD: cmd.values already holds the geohash score
+                // and member for each position, in ZADD's packed order.
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                let payload = pack_bytes_list(&cmd.values);
+                payloads.push(payload);
+                let payload = payloads.last().unwrap();
+                ops.push(TxnOperation {
+                    op: TXN_OP_ZADD,
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr: payload.as_ptr(),
+                    val_len: payload.len(),
+                    flags: cmd.expire_flags,
+                    expire_at_ms: -1,
+                    group_id: 0,
+                });
+            }
+            OpCode::GeoPos | OpCode::GeoHash | OpCode::GeoDist => {
+                // One ZSCORE op per member, all in one request so the reads
+                // are consistent. GEODIST always asks for exactly two.
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                for member in &cmd.values {
+                    ops.push(TxnOperation {
+                        op: TXN_OP_ZSCORE,
+                        key_ptr: key.as_ptr(),
+                        key_len: key.len(),
+                        val_ptr: member.as_ptr(),
+                        val_len: member.len(),
+                        flags: 0,
+                        expire_at_ms: -1,
+                        group_id: 0,
+                    });
+                }
+            }
+            OpCode::GeoSearch => {
+                // One ZRANGEBYSCORE-with-scores op per geohash box (the center
+                // cell plus the neighbors that can still intersect the shape),
+                // all in one request so every box is read at the same instant.
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                let Some(spec) = cmd.geo.as_deref() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                if spec.resolve_error != GeoResolve::Ok || spec.from_member.is_some() {
+                    spans.push((start, 0));
+                    continue;
+                }
+                for (min, max) in geo_search_ranges(spec) {
+                    // Redis reads [min, max): the max is the next box's min.
+                    let bounds = [
+                        Bytes::from(min.to_string()),
+                        Bytes::from(format!("({max}")),
+                    ];
+                    let payload = pack_bytes_list(&bounds);
+                    payloads.push(payload);
+                    let payload = payloads.last().unwrap();
+                    ops.push(TxnOperation {
+                        op: TXN_OP_ZRANGE,
+                        key_ptr: key.as_ptr(),
+                        key_len: key.len(),
+                        val_ptr: payload.as_ptr(),
+                        val_len: payload.len(),
+                        flags: TXN_FLAG_Z_BYSCORE | TXN_FLAG_Z_WITHSCORES,
+                        expire_at_ms: -1,
+                        group_id: 0,
+                    });
+                }
+            }
             OpCode::PfAdd | OpCode::PfCount | OpCode::PfMerge => {
                 let Some(key) = cmd.keys.first() else {
                     spans.push((start, 0));
@@ -7455,6 +7732,11 @@ fn command_needs_retry(cmd: &Command) -> bool {
             | OpCode::BZPopMax
             | OpCode::ZRandMember
             | OpCode::ZScan
+            | OpCode::GeoAdd
+            | OpCode::GeoPos
+            | OpCode::GeoDist
+            | OpCode::GeoHash
+            | OpCode::GeoSearch
     )
 }
 
@@ -8544,6 +8826,39 @@ fn write_command_result<W: Write>(
         return Ok(());
     }
 
+    if matches!(cmd.op, OpCode::GeoPos | OpCode::GeoHash) && cmd.values.is_empty() {
+        // `GEOPOS key` with no members is legal and returns an empty array.
+        write_array_header(writer, 0)?;
+        return Ok(());
+    }
+    if cmd.op == OpCode::GeoSearch {
+        if let Some(spec) = cmd.geo.as_deref() {
+            // The FROMMEMBER center lookup already ran and failed, so no range
+            // reads were built for this command.
+            match spec.resolve_error {
+                GeoResolve::KeyMissing => {
+                    // No key at all: Redis searches an empty set, it does not
+                    // complain about the member.
+                    write_array_header(writer, 0)?;
+                    return Ok(());
+                }
+                GeoResolve::MemberMissing => {
+                    write_err(writer, "could not decode requested zset member")?;
+                    return Ok(());
+                }
+                GeoResolve::WrongType => {
+                    write_wrongtype(writer)?;
+                    return Ok(());
+                }
+                GeoResolve::Failed => {
+                    write_err(writer, "backend")?;
+                    return Ok(());
+                }
+                GeoResolve::Ok => {}
+            }
+        }
+    }
+
     let Some(response) = response else {
         write_err(writer, "operation failed")?;
         return Ok(());
@@ -8638,6 +8953,197 @@ fn write_command_result<W: Write>(
                 write_integer(writer, first.int_value)?;
             } else {
                 write_wrongtype(writer)?;
+            }
+        }
+        OpCode::GeoAdd => {
+            if first.success {
+                write_integer(writer, first.int_value)?;
+            } else {
+                write_wrongtype(writer)?;
+            }
+        }
+        OpCode::GeoPos | OpCode::GeoHash => {
+            // One ZSCORE result per member. A wrong-type key fails the whole
+            // reply, so scan for that before opening the array.
+            let mut scores = Vec::with_capacity(len);
+            for index in start..start + len {
+                let result = unsafe { &*response.results.add(index) };
+                if !result.success {
+                    write_wrongtype(writer)?;
+                    return Ok(());
+                }
+                scores.push(
+                    geo_score_from_bytes(result_value_bytes(result))
+                        .filter(|_| result.value_present),
+                );
+            }
+            write_array_header(writer, scores.len())?;
+            for score in scores {
+                match score {
+                    // GEOPOS reports the center of the member's geohash box.
+                    Some(score) if cmd.op == OpCode::GeoPos => {
+                        let (lon, lat) = geo_decode_score(score);
+                        write_array_header(writer, 2)?;
+                        write_score(writer, geo_format_coord(lon).as_bytes(), protocol_version)?;
+                        write_score(writer, geo_format_coord(lat).as_bytes(), protocol_version)?;
+                    }
+                    Some(score) => match geo_hash_string(score) {
+                        Some(text) => write_bulk(writer, text.as_bytes())?,
+                        None => write_null(writer, protocol_version)?,
+                    },
+                    // A member the set does not hold is a nil, not an error.
+                    None => write_null(writer, protocol_version)?,
+                }
+            }
+        }
+        OpCode::GeoDist => {
+            let mut positions = Vec::with_capacity(2);
+            for index in start..start + len {
+                let result = unsafe { &*response.results.add(index) };
+                if !result.success {
+                    write_wrongtype(writer)?;
+                    return Ok(());
+                }
+                match geo_score_from_bytes(result_value_bytes(result))
+                    .filter(|_| result.value_present)
+                {
+                    Some(score) => positions.push(geo_decode_score(score)),
+                    // Either member missing makes the whole reply a nil.
+                    None => {
+                        write_null(writer, protocol_version)?;
+                        return Ok(());
+                    }
+                }
+            }
+            if positions.len() != 2 {
+                write_null(writer, protocol_version)?;
+            } else {
+                let unit = cmd
+                    .val
+                    .as_ref()
+                    .and_then(|unit| geo_unit_meters(unit.as_ref()))
+                    .unwrap_or(1.0);
+                let meters = geo_distance(
+                    positions[0].0,
+                    positions[0].1,
+                    positions[1].0,
+                    positions[1].1,
+                );
+                write_bulk(writer, geo_format_distance(meters / unit).as_bytes())?;
+            }
+        }
+        OpCode::GeoSearch => {
+            let Some(spec) = cmd.geo.as_deref() else {
+                write_err(writer, "operation failed")?;
+                return Ok(());
+            };
+            // Merge the candidates of every box, keep the ones the exact shape
+            // test accepts, then sort, truncate and format as Redis does.
+            let mut points: Vec<GeoPoint> = Vec::new();
+            let mut seen: HashSet<Vec<u8>> = HashSet::new();
+            // COUNT ... ANY stops as soon as enough candidates are in hand.
+            let early_stop = if spec.any { spec.count } else { None };
+            'boxes: for index in start..start + len {
+                let result = unsafe { &*response.results.add(index) };
+                if !result.success {
+                    write_wrongtype(writer)?;
+                    return Ok(());
+                }
+                let data = result_value_bytes(result);
+                let items = if data.is_empty() {
+                    Vec::new()
+                } else {
+                    match parse_list_payload(data) {
+                        Some(items) => items,
+                        None => {
+                            write_err(writer, "operation failed")?;
+                            return Ok(());
+                        }
+                    }
+                };
+                for pair in items.chunks_exact(2) {
+                    let Some(score) = geo_score_from_bytes(&pair[1]) else {
+                        continue;
+                    };
+                    let (lon, lat) = geo_decode_score(score);
+                    let Some(dist) = geo_distance_if_inside(spec, lon, lat) else {
+                        continue;
+                    };
+                    if !seen.insert(pair[0].clone()) {
+                        continue;
+                    }
+                    points.push(GeoPoint {
+                        member: pair[0].clone(),
+                        lon,
+                        lat,
+                        score,
+                        dist,
+                    });
+                    if let Some(limit) = early_stop {
+                        if points.len() >= limit {
+                            break 'boxes;
+                        }
+                    }
+                }
+            }
+
+            // Redis sorts ascending before truncating when COUNT was given
+            // without ANY, because the N closest are what COUNT means.
+            let mut sort = spec.sort;
+            if spec.count.is_some() && sort == GeoSort::None && !spec.any {
+                sort = GeoSort::Asc;
+            }
+            match sort {
+                GeoSort::Asc => points.sort_by(|a, b| {
+                    a.dist
+                        .partial_cmp(&b.dist)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                }),
+                GeoSort::Desc => points.sort_by(|a, b| {
+                    b.dist
+                        .partial_cmp(&a.dist)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                }),
+                GeoSort::None => {}
+            }
+            let returned = spec.count.map_or(points.len(), |c| c.min(points.len()));
+
+            write_array_header(writer, returned)?;
+            if !spec.withcoord && !spec.withdist && !spec.withhash {
+                for point in points.iter().take(returned) {
+                    write_bulk(writer, &point.member)?;
+                }
+            } else {
+                let columns = usize::from(spec.withdist)
+                    + usize::from(spec.withhash)
+                    + usize::from(spec.withcoord);
+                for point in points.iter().take(returned) {
+                    write_array_header(writer, columns + 1)?;
+                    write_bulk(writer, &point.member)?;
+                    // Redis emits the columns in this order: dist, hash, coord.
+                    if spec.withdist {
+                        write_bulk(
+                            writer,
+                            geo_format_distance(point.dist / spec.unit_meters).as_bytes(),
+                        )?;
+                    }
+                    if spec.withhash {
+                        write_integer(writer, point.score as i64)?;
+                    }
+                    if spec.withcoord {
+                        write_array_header(writer, 2)?;
+                        write_score(
+                            writer,
+                            geo_format_coord(point.lon).as_bytes(),
+                            protocol_version,
+                        )?;
+                        write_score(
+                            writer,
+                            geo_format_coord(point.lat).as_bytes(),
+                            protocol_version,
+                        )?;
+                    }
+                }
             }
         }
         OpCode::PfAdd | OpCode::PfCount => {
@@ -10170,6 +10676,8 @@ fn is_dirty_command(op: OpCode) -> bool {
             | OpCode::ZUnionStore
             | OpCode::ZInterStore
             | OpCode::ZDiffStore
+            // GEOADD is the only geo writer: everything else reads scores.
+            | OpCode::GeoAdd
     )
 }
 
@@ -10514,7 +11022,12 @@ fn should_defer_dirty_command(client: &ClientConn, cmd: &Command) -> bool {
 }
 
 fn should_wait_for_blocked_completion(cmd: &Command) -> bool {
-    matches!(cmd.op, OpCode::LPush | OpCode::RPush | OpCode::ZAdd)
+    // GEOADD is a ZADD, so it can serve a client blocked in BZPOPMIN/BZMPOP
+    // and has to wait for that client the same way ZADD does.
+    matches!(
+        cmd.op,
+        OpCode::LPush | OpCode::RPush | OpCode::ZAdd | OpCode::GeoAdd
+    )
 }
 
 enum RawMakoCommand<'a> {
@@ -11119,6 +11632,965 @@ fn handle_command_command<W: Write>(cmd: &Command, writer: &mut W) -> std::io::R
 }
 
 // ===== Bitmap helpers (computed in Rust over a GET result) =====
+
+// ===== Geo commands =====
+//
+// A geo set is an ordinary sorted set whose score is Redis's 52-bit
+// interleaved geohash (`geohash.c`). That integer is exactly representable as
+// an f64, so TYPE reports zset and every zset command keeps working on a geo
+// key. Nothing below makoCon changes: GEOADD is a ZADD op, GEOPOS/GEODIST/
+// GEOHASH are one ZSCORE op per member, and the searches are one
+// ZRANGEBYSCORE-with-scores op per geohash box, all inside one request.
+
+/// Redis `GEO_LAT_MIN` / `GEO_LAT_MAX`: the Mercator cut-off, not ±90.
+const GEO_LAT_MIN: f64 = -85.05112878;
+const GEO_LAT_MAX: f64 = 85.05112878;
+const GEO_LONG_MIN: f64 = -180.0;
+const GEO_LONG_MAX: f64 = 180.0;
+/// Redis `GEO_STEP_MAX`: 26 bits per axis, 52 bits of score.
+const GEO_STEP_MAX: u8 = 26;
+/// Redis `MERCATOR_MAX`.
+const GEO_MERCATOR_MAX: f64 = 20_037_726.37;
+/// Redis `EARTH_RADIUS_IN_METERS`, the WGS-84 quadratic mean radius.
+const GEO_EARTH_RADIUS_M: f64 = 6_372_797.560856;
+
+const GEO_UNIT_ERROR: &str = "unsupported unit provided. please use M, KM, FT, MI";
+const GEO_STORE_ERROR: &str = "STORE option in GEORADIUS is not supported by this server";
+
+/// Redis `interleave64`: x (latitude) into the even bits, y (longitude) into
+/// the odd ones.
+fn geo_interleave64(xlo: u32, ylo: u32) -> u64 {
+    const B: [u64; 5] = [
+        0x5555_5555_5555_5555,
+        0x3333_3333_3333_3333,
+        0x0f0f_0f0f_0f0f_0f0f,
+        0x00ff_00ff_00ff_00ff,
+        0x0000_ffff_0000_ffff,
+    ];
+    const S: [u32; 5] = [1, 2, 4, 8, 16];
+    let spread = |mut v: u64| {
+        v = (v | (v << S[4])) & B[4];
+        v = (v | (v << S[3])) & B[3];
+        v = (v | (v << S[2])) & B[2];
+        v = (v | (v << S[1])) & B[1];
+        (v | (v << S[0])) & B[0]
+    };
+    spread(xlo as u64) | (spread(ylo as u64) << 1)
+}
+
+/// Redis `deinterleave64`: latitude back in the low 32 bits, longitude in the
+/// high 32.
+fn geo_deinterleave64(interleaved: u64) -> u64 {
+    const B: [u64; 6] = [
+        0x5555_5555_5555_5555,
+        0x3333_3333_3333_3333,
+        0x0f0f_0f0f_0f0f_0f0f,
+        0x00ff_00ff_00ff_00ff,
+        0x0000_ffff_0000_ffff,
+        0x0000_0000_ffff_ffff,
+    ];
+    const S: [u32; 6] = [0, 1, 2, 4, 8, 16];
+    let gather = |mut v: u64| {
+        v = (v | (v >> S[0])) & B[0];
+        v = (v | (v >> S[1])) & B[1];
+        v = (v | (v >> S[2])) & B[2];
+        v = (v | (v >> S[3])) & B[3];
+        v = (v | (v >> S[4])) & B[4];
+        (v | (v >> S[5])) & B[5]
+    };
+    gather(interleaved) | (gather(interleaved >> 1) << 32)
+}
+
+/// Redis `geohashEncode`. `step` bits per axis; None when the point is outside
+/// the supported range.
+fn geo_encode(
+    long_min: f64,
+    long_max: f64,
+    lat_min: f64,
+    lat_max: f64,
+    longitude: f64,
+    latitude: f64,
+    step: u8,
+) -> Option<u64> {
+    if step == 0 || step > 32 {
+        return None;
+    }
+    if !(GEO_LONG_MIN..=GEO_LONG_MAX).contains(&longitude)
+        || !(GEO_LAT_MIN..=GEO_LAT_MAX).contains(&latitude)
+    {
+        return None;
+    }
+    if latitude < lat_min || latitude > lat_max || longitude < long_min || longitude > long_max {
+        return None;
+    }
+    let cells = (1u64 << step) as f64;
+    let lat_offset = (latitude - lat_min) / (lat_max - lat_min) * cells;
+    let long_offset = (longitude - long_min) / (long_max - long_min) * cells;
+    Some(geo_interleave64(lat_offset as u32, long_offset as u32))
+}
+
+/// Redis `geohashEncodeWGS84` at the given step.
+fn geo_encode_wgs84(longitude: f64, latitude: f64, step: u8) -> Option<u64> {
+    geo_encode(
+        GEO_LONG_MIN,
+        GEO_LONG_MAX,
+        GEO_LAT_MIN,
+        GEO_LAT_MAX,
+        longitude,
+        latitude,
+        step,
+    )
+}
+
+/// The 52-bit sorted-set score Redis stores for a position.
+fn geo_score_for_position(longitude: f64, latitude: f64) -> Option<u64> {
+    // Redis `geohashAlign52Bits` is a no-op at GEO_STEP_MAX.
+    geo_encode_wgs84(longitude, latitude, GEO_STEP_MAX)
+}
+
+struct GeoArea {
+    lon_min: f64,
+    lon_max: f64,
+    lat_min: f64,
+    lat_max: f64,
+}
+
+/// Redis `geohashDecode`: the cell a hash covers.
+fn geo_decode(
+    long_min: f64,
+    long_max: f64,
+    lat_min: f64,
+    lat_max: f64,
+    bits: u64,
+    step: u8,
+) -> GeoArea {
+    let separated = geo_deinterleave64(bits);
+    let ilato = (separated & 0xffff_ffff) as f64;
+    let ilono = (separated >> 32) as f64;
+    let cells = (1u64 << step) as f64;
+    let lat_scale = lat_max - lat_min;
+    let long_scale = long_max - long_min;
+    GeoArea {
+        lon_min: long_min + (ilono / cells) * long_scale,
+        lon_max: long_min + ((ilono + 1.0) / cells) * long_scale,
+        lat_min: lat_min + (ilato / cells) * lat_scale,
+        lat_max: lat_min + ((ilato + 1.0) / cells) * lat_scale,
+    }
+}
+
+fn geo_decode_wgs84(bits: u64, step: u8) -> GeoArea {
+    geo_decode(
+        GEO_LONG_MIN,
+        GEO_LONG_MAX,
+        GEO_LAT_MIN,
+        GEO_LAT_MAX,
+        bits,
+        step,
+    )
+}
+
+/// Redis `decodeGeohash`: a stored score back to the center of its box.
+fn geo_decode_score(score: u64) -> (f64, f64) {
+    let area = geo_decode_wgs84(score, GEO_STEP_MAX);
+    let lon = ((area.lon_min + area.lon_max) / 2.0).clamp(GEO_LONG_MIN, GEO_LONG_MAX);
+    let lat = ((area.lat_min + area.lat_max) / 2.0).clamp(GEO_LAT_MIN, GEO_LAT_MAX);
+    (lon, lat)
+}
+
+/// A score as the zset ops report it (a decimal f64) back to geohash bits.
+fn geo_score_from_bytes(data: &[u8]) -> Option<u64> {
+    let value: f64 = std::str::from_utf8(data).ok()?.parse().ok()?;
+    if !value.is_finite() {
+        return None;
+    }
+    Some(value.max(0.0) as u64)
+}
+
+fn geo_deg_rad(degrees: f64) -> f64 {
+    degrees * (std::f64::consts::PI / 180.0)
+}
+
+fn geo_rad_deg(radians: f64) -> f64 {
+    radians * (180.0 / std::f64::consts::PI)
+}
+
+/// Redis `geohashGetLatDistance`.
+fn geo_lat_distance(lat1d: f64, lat2d: f64) -> f64 {
+    GEO_EARTH_RADIUS_M * (geo_deg_rad(lat2d) - geo_deg_rad(lat1d)).abs()
+}
+
+/// Redis `geohashGetDistance`: haversine on the quadratic mean Earth radius.
+fn geo_distance(lon1d: f64, lat1d: f64, lon2d: f64, lat2d: f64) -> f64 {
+    let lon1r = geo_deg_rad(lon1d);
+    let lon2r = geo_deg_rad(lon2d);
+    let v = ((lon2r - lon1r) / 2.0).sin();
+    if v == 0.0 {
+        return geo_lat_distance(lat1d, lat2d);
+    }
+    let lat1r = geo_deg_rad(lat1d);
+    let lat2r = geo_deg_rad(lat2d);
+    let u = ((lat2r - lat1r) / 2.0).sin();
+    let a = u * u + lat1r.cos() * lat2r.cos() * v * v;
+    2.0 * GEO_EARTH_RADIUS_M * a.sqrt().asin()
+}
+
+/// Redis `geohash_move_x`: shift the longitude half of a hash by one cell.
+fn geo_move_x(bits: u64, step: u8, direction: i8) -> u64 {
+    if direction == 0 {
+        return bits;
+    }
+    let shift = 64 - (step as u32) * 2;
+    let mut x = bits & 0xaaaa_aaaa_aaaa_aaaa;
+    let y = bits & 0x5555_5555_5555_5555;
+    let zz = 0x5555_5555_5555_5555u64 >> shift;
+    if direction > 0 {
+        x = x.wrapping_add(zz + 1);
+    } else {
+        x |= zz;
+        x = x.wrapping_sub(zz + 1);
+    }
+    x &= 0xaaaa_aaaa_aaaa_aaaau64 >> shift;
+    x | y
+}
+
+/// Redis `geohash_move_y`: the same for the latitude half.
+fn geo_move_y(bits: u64, step: u8, direction: i8) -> u64 {
+    if direction == 0 {
+        return bits;
+    }
+    let shift = 64 - (step as u32) * 2;
+    let x = bits & 0xaaaa_aaaa_aaaa_aaaa;
+    let mut y = bits & 0x5555_5555_5555_5555;
+    let zz = 0xaaaa_aaaa_aaaa_aaaau64 >> shift;
+    if direction > 0 {
+        y = y.wrapping_add(zz + 1);
+    } else {
+        y |= zz;
+        y = y.wrapping_sub(zz + 1);
+    }
+    y &= 0x5555_5555_5555_5555u64 >> shift;
+    x | y
+}
+
+/// Redis `geohashNeighbors`, in the order `membersOfAllNeighbors` visits them:
+/// north, south, east, west, north-east, north-west, south-east, south-west.
+fn geo_neighbors(bits: u64, step: u8) -> [u64; 8] {
+    let mv = |dx: i8, dy: i8| geo_move_y(geo_move_x(bits, step, dx), step, dy);
+    [
+        mv(0, 1),
+        mv(0, -1),
+        mv(1, 0),
+        mv(-1, 0),
+        mv(1, 1),
+        mv(-1, 1),
+        mv(1, -1),
+        mv(-1, -1),
+    ]
+}
+
+/// Redis `geohashEstimateStepsByRadius`.
+fn geo_estimate_steps_by_radius(range_meters: f64, lat: f64) -> u8 {
+    if range_meters == 0.0 {
+        return GEO_STEP_MAX;
+    }
+    let mut range = range_meters;
+    let mut step: i32 = 1;
+    while range < GEO_MERCATOR_MAX {
+        range *= 2.0;
+        step += 1;
+        if step > 64 {
+            break;
+        }
+    }
+    step -= 2;
+    if !(-66.0..=66.0).contains(&lat) {
+        step -= 1;
+        if !(-80.0..=80.0).contains(&lat) {
+            step -= 1;
+        }
+    }
+    step.clamp(1, GEO_STEP_MAX as i32) as u8
+}
+
+/// Redis `geohashBoundingBox`. `half_width`/`half_height` are in meters.
+/// Returns (min_lon, min_lat, max_lon, max_lat).
+fn geo_bounding_box(lon: f64, lat: f64, half_width: f64, half_height: f64) -> (f64, f64, f64, f64) {
+    let lat_delta = geo_rad_deg(half_height / GEO_EARTH_RADIUS_M);
+    let long_delta_top =
+        geo_rad_deg(half_width / GEO_EARTH_RADIUS_M / geo_deg_rad(lat + lat_delta).cos());
+    let long_delta_bottom =
+        geo_rad_deg(half_width / GEO_EARTH_RADIUS_M / geo_deg_rad(lat - lat_delta).cos());
+    // North and south of the equator the wider edge is on opposite sides.
+    let long_delta = if lat < 0.0 {
+        long_delta_bottom
+    } else {
+        long_delta_top
+    };
+    (
+        lon - long_delta,
+        lat - lat_delta,
+        lon + long_delta,
+        lat + lat_delta,
+    )
+}
+
+/// How many `[min, max)` score ranges one search may read before it is cheaper
+/// to scan the whole set. Every range op costs a full pass over the staged
+/// sorted set in the executor, so a long list of ranges is slower than one
+/// scan, not faster.
+const GEO_MAX_SEARCH_RANGES: usize = 16;
+
+/// The cell column a longitude falls in. The caller wraps it into range: a
+/// search area may run off either end of the -180..180 strip.
+fn geo_lon_cell(longitude: f64, cells: u64) -> i64 {
+    let ratio = (longitude - GEO_LONG_MIN) / (GEO_LONG_MAX - GEO_LONG_MIN);
+    (ratio * cells as f64).floor() as i64
+}
+
+/// The cell row a latitude falls in, clamped: latitude does not wrap, and
+/// anything past the Mercator cut-off belongs to the outermost row.
+fn geo_lat_cell(latitude: f64, cells: u64) -> u64 {
+    let ratio = (latitude - GEO_LAT_MIN) / (GEO_LAT_MAX - GEO_LAT_MIN);
+    let cell = (ratio * cells as f64).floor();
+    if cell < 0.0 {
+        0
+    } else if cell >= (cells - 1) as f64 {
+        cells - 1
+    } else {
+        cell as u64
+    }
+}
+
+/// The `[min, max)` score ranges a search has to read.
+///
+/// The step comes from Redis (`geohashEstimateStepsByRadius` plus its
+/// "decrease the step near an edge" correction), so an ordinary search reads
+/// the same resolution Redis does. Which cells to read is then taken straight
+/// from the search area's bounding box rather than from Redis's fixed nine
+/// neighbors: near the poles a degree of longitude is so short that the
+/// matching cell can be two columns away, and a search whose area runs over a
+/// pole reaches every column at all. Redis answers those cases from nine
+/// boxes and misses points (its own tests/unit/geo.tcl "oblique direction" and
+/// "crossing pole" cases); reading the cells the bounding box actually covers
+/// is both simpler and right, and the exact distance filter that follows makes
+/// the answer identical everywhere else.
+fn geo_search_ranges(spec: &GeoSearchSpec) -> Vec<(u64, u64)> {
+    let full_scan = vec![(0u64, 1u64 << (GEO_STEP_MAX * 2))];
+    let (half_width, half_height) = if spec.circular {
+        (spec.radius_m, spec.radius_m)
+    } else {
+        (spec.width_m / 2.0, spec.height_m / 2.0)
+    };
+    let (min_lon, min_lat, max_lon, max_lat) =
+        geo_bounding_box(spec.center_lon, spec.center_lat, half_width, half_height);
+    if !min_lat.is_finite() || !max_lat.is_finite() {
+        return full_scan;
+    }
+
+    let Some(mut steps) = geo_search_step(spec, half_width, half_height) else {
+        return full_scan;
+    };
+
+    // A search area that runs over a pole comes out the other side, so it
+    // touches every column. So does one wider than the world.
+    let over_the_pole = max_lat >= 90.0 || min_lat <= -90.0;
+    let unbounded_longitude = over_the_pole
+        || !min_lon.is_finite()
+        || !max_lon.is_finite()
+        || (max_lon - min_lon) >= 360.0;
+
+    // Redis's latitude term in geohashEstimateStepsByRadius is admittedly
+    // coarse ("it is possible to do better ... by computing the distance
+    // between meridians at this latitude"), so above 66 degrees the bounding
+    // box can still span many columns. Dropping one step halves that span and
+    // doubles each cell, which covers exactly the same ground with fewer range
+    // reads, so keep dropping until the box is the three-by-three the estimate
+    // was aiming for.
+    let (mut cells, mut col_lo, mut col_hi, mut row_lo, mut row_hi);
+    loop {
+        cells = 1u64 << steps;
+        row_lo = geo_lat_cell(min_lat, cells);
+        row_hi = geo_lat_cell(max_lat, cells);
+        (col_lo, col_hi) = if unbounded_longitude {
+            (0i64, cells as i64 - 1)
+        } else {
+            let lo = geo_lon_cell(min_lon, cells);
+            let hi = geo_lon_cell(max_lon, cells);
+            if hi < lo || (hi - lo) as u64 >= cells {
+                (0i64, cells as i64 - 1)
+            } else {
+                (lo, hi)
+            }
+        };
+        if steps > 1 && (col_hi - col_lo > 2 || row_hi.saturating_sub(row_lo) > 2) {
+            steps -= 1;
+            continue;
+        }
+        break;
+    }
+    let shift = 52 - (steps as u32) * 2;
+
+    let columns = (col_hi - col_lo + 1) as usize;
+    let rows = (row_hi.saturating_sub(row_lo) + 1) as usize;
+    if columns.saturating_mul(rows) > GEO_MAX_SEARCH_RANGES {
+        return full_scan;
+    }
+
+    // Without ASC/DESC the reply keeps the order the ranges were read in, so
+    // read the cell holding the center first and the rest in Redis's neighbor
+    // order (north, south, east, west, then the diagonals).
+    let center_col = geo_lon_cell(spec.center_lon, cells).rem_euclid(cells as i64);
+    let center_row = geo_lat_cell(spec.center_lat, cells) as i64;
+    let mut cells_to_read = Vec::with_capacity(columns * rows);
+    let mut seen = HashSet::with_capacity(columns * rows);
+    for column in col_lo..=col_hi {
+        let column = column.rem_euclid(cells as i64);
+        for row in row_lo..=row_hi {
+            let bits = geo_interleave64(row as u32, column as u32);
+            if !seen.insert(bits) {
+                continue;
+            }
+            // Wrap the column difference into [-cells/2, cells/2] so a cell
+            // just across the date line still counts as the eastern neighbor.
+            let mut column_delta = column - center_col;
+            if column_delta > cells as i64 / 2 {
+                column_delta -= cells as i64;
+            } else if column_delta < -(cells as i64) / 2 {
+                column_delta += cells as i64;
+            }
+            cells_to_read.push((
+                geo_neighbor_rank(column_delta, row as i64 - center_row),
+                bits,
+            ));
+        }
+    }
+    if cells_to_read.is_empty() {
+        return full_scan;
+    }
+    cells_to_read.sort_by_key(|(rank, _)| *rank);
+    cells_to_read
+        .into_iter()
+        .map(|(_, bits)| (bits << shift, (bits + 1) << shift))
+        .collect()
+}
+
+/// Where a cell sits in the order `membersOfAllNeighbors` visits boxes. Cells
+/// outside the immediate ring share the last rank and keep their sweep order.
+fn geo_neighbor_rank(column_delta: i64, row_delta: i64) -> usize {
+    match (column_delta, row_delta) {
+        (0, 0) => 0,
+        (0, 1) => 1,
+        (0, -1) => 2,
+        (1, 0) => 3,
+        (-1, 0) => 4,
+        (1, 1) => 5,
+        (-1, 1) => 6,
+        (1, -1) => 7,
+        (-1, -1) => 8,
+        _ => 9,
+    }
+}
+
+/// Redis `geohashCalculateAreasByShapeWGS84`'s step: the estimate from the
+/// radius, dropped by one when one of the four side cells sits inside the
+/// search area and so cannot cover its own side.
+fn geo_search_step(spec: &GeoSearchSpec, half_width: f64, half_height: f64) -> Option<u8> {
+    let lon = spec.center_lon;
+    let lat = spec.center_lat;
+    // A box is only covered accurately by its half-diagonal.
+    let radius_meters = if spec.circular {
+        spec.radius_m
+    } else {
+        (half_width * half_width + half_height * half_height).sqrt()
+    };
+    let steps = geo_estimate_steps_by_radius(radius_meters, lat);
+    let hash = geo_encode_wgs84(lon, lat, steps)?;
+    let neighbors = geo_neighbors(hash, steps);
+    let north = geo_decode_wgs84(neighbors[0], steps);
+    let south = geo_decode_wgs84(neighbors[1], steps);
+    let east = geo_decode_wgs84(neighbors[2], steps);
+    let west = geo_decode_wgs84(neighbors[3], steps);
+    let decrease_step = geo_distance(lon, lat, lon, north.lat_max) < radius_meters
+        || geo_distance(lon, lat, lon, south.lat_min) < radius_meters
+        || geo_distance(lon, lat, east.lon_max, lat) < radius_meters
+        || geo_distance(lon, lat, west.lon_min, lat) < radius_meters;
+    if steps > 1 && decrease_step {
+        Some(steps - 1)
+    } else {
+        Some(steps)
+    }
+}
+
+/// Redis `geohashGetDistanceIfInRadiusWGS84` / `geohashGetDistanceIfInRectangle`.
+fn geo_distance_if_inside(spec: &GeoSearchSpec, lon: f64, lat: f64) -> Option<f64> {
+    if spec.circular {
+        let distance = geo_distance(spec.center_lon, spec.center_lat, lon, lat);
+        if distance > spec.radius_m {
+            return None;
+        }
+        return Some(distance);
+    }
+    // Latitude first: it is the cheaper of the two checks.
+    if geo_lat_distance(lat, spec.center_lat) > spec.height_m / 2.0 {
+        return None;
+    }
+    if geo_distance(lon, lat, spec.center_lon, lat) > spec.width_m / 2.0 {
+        return None;
+    }
+    Some(geo_distance(spec.center_lon, spec.center_lat, lon, lat))
+}
+
+/// Redis `ld2string(..., LD_STR_HUMAN)`: "%.17Lf" with trailing zeros removed.
+/// The last digits are not bit-identical to Redis's long double, which is why
+/// the functional tests compare coordinates with a tolerance.
+fn geo_format_coord(value: f64) -> String {
+    let mut text = format!("{value:.17}");
+    if text.contains('.') {
+        while text.ends_with('0') {
+            text.pop();
+        }
+        if text.ends_with('.') {
+            text.pop();
+        }
+    }
+    if text == "-0" {
+        text.clear();
+        text.push('0');
+    }
+    text
+}
+
+/// Redis `addReplyDoubleDistance`: fixed 4 decimals, always a bulk string.
+fn geo_format_distance(value: f64) -> String {
+    format!("{value:.4}")
+}
+
+/// Redis `geohashCommand`: decode the stored position, re-encode it with the
+/// standard -90..90 latitude range and emit 11 base32 characters.
+fn geo_hash_string(score: u64) -> Option<String> {
+    const GEOALPHA: &[u8; 32] = b"0123456789bcdefghjkmnpqrstuvwxyz";
+    let (lon, lat) = geo_decode_score(score);
+    let bits = geo_encode(
+        GEO_LONG_MIN,
+        GEO_LONG_MAX,
+        -90.0,
+        90.0,
+        lon,
+        lat,
+        GEO_STEP_MAX,
+    )?;
+    let mut out = String::with_capacity(11);
+    for index in 0..11u32 {
+        // 52 bits only, so the 55-bit base32 string is zero padded at the end.
+        let slot = if index == 10 {
+            0
+        } else {
+            ((bits >> (52 - (index + 1) * 5)) & 0x1f) as usize
+        };
+        out.push(GEOALPHA[slot] as char);
+    }
+    Some(out)
+}
+
+/// Redis `extractUnitOrReply`, in meters per unit.
+fn geo_unit_meters(unit: &[u8]) -> Option<f64> {
+    if ascii_eq_ci(unit, b"m") {
+        Some(1.0)
+    } else if ascii_eq_ci(unit, b"km") {
+        Some(1000.0)
+    } else if ascii_eq_ci(unit, b"ft") {
+        Some(0.3048)
+    } else if ascii_eq_ci(unit, b"mi") {
+        Some(1609.34)
+    } else {
+        None
+    }
+}
+
+/// GEOSEARCH, GEORADIUS, GEORADIUSBYMEMBER and the two _RO spellings. They
+/// share the whole option tail and reply shape, so one parser and one opcode
+/// cover all five; only the way the center and the shape are given differs.
+fn parse_geo_search(parts: &[BytesFrame]) -> Result<Command, ParseError> {
+    let name = part_to_bytes(&parts[0])?;
+    let is_search = ascii_eq_ci(name.as_ref(), b"GEOSEARCH");
+    let by_member = ascii_eq_ci(name.as_ref(), b"GEORADIUSBYMEMBER")
+        || ascii_eq_ci(name.as_ref(), b"GEORADIUSBYMEMBER_RO");
+    let read_only = ascii_eq_ci(name.as_ref(), b"GEORADIUS_RO")
+        || ascii_eq_ci(name.as_ref(), b"GEORADIUSBYMEMBER_RO");
+    let (command_name, min_args) = if is_search {
+        ("geosearch", 7)
+    } else if by_member && read_only {
+        ("georadiusbymember_ro", 5)
+    } else if by_member {
+        ("georadiusbymember", 5)
+    } else if read_only {
+        ("georadius_ro", 6)
+    } else {
+        ("georadius", 6)
+    };
+    if parts.len() < min_args {
+        return Err(wrong_arity(command_name));
+    }
+
+    let key = part_to_bytes(&parts[1])?;
+    validate_user_key(&key)?;
+
+    let mut spec = GeoSearchSpec {
+        center_lon: 0.0,
+        center_lat: 0.0,
+        from_member: None,
+        resolve_error: GeoResolve::Ok,
+        circular: true,
+        radius_m: 0.0,
+        width_m: 0.0,
+        height_m: 0.0,
+        unit_meters: 1.0,
+        sort: GeoSort::None,
+        count: None,
+        any: false,
+        withcoord: false,
+        withdist: false,
+        withhash: false,
+    };
+    let mut have_center = false;
+    let mut have_shape = false;
+    let mut index;
+
+    if is_search {
+        index = 2;
+    } else {
+        if by_member {
+            spec.from_member = Some(part_to_bytes(&parts[2])?);
+            index = 3;
+        } else {
+            let longitude = parse_f64_error_arg(
+                part_to_bytes(&parts[2])?.as_ref(),
+                "value is not a valid float",
+            )?;
+            let latitude = parse_f64_error_arg(
+                part_to_bytes(&parts[3])?.as_ref(),
+                "value is not a valid float",
+            )?;
+            geo_check_position(longitude, latitude)?;
+            spec.center_lon = longitude;
+            spec.center_lat = latitude;
+            index = 4;
+        }
+        have_center = true;
+        let radius =
+            parse_f64_error_arg(part_to_bytes(&parts[index])?.as_ref(), "need numeric radius")?;
+        if radius < 0.0 {
+            return Err(ParseError::Error("radius cannot be negative"));
+        }
+        let unit = part_to_bytes(&parts[index + 1])?;
+        let Some(meters) = geo_unit_meters(unit.as_ref()) else {
+            return Err(ParseError::Error(GEO_UNIT_ERROR));
+        };
+        spec.circular = true;
+        spec.radius_m = radius * meters;
+        spec.unit_meters = meters;
+        have_shape = true;
+        index += 2;
+    }
+
+    while index < parts.len() {
+        let arg = part_to_bytes(&parts[index])?;
+        if ascii_eq_ci(arg.as_ref(), b"ASC") {
+            spec.sort = GeoSort::Asc;
+            index += 1;
+        } else if ascii_eq_ci(arg.as_ref(), b"DESC") {
+            spec.sort = GeoSort::Desc;
+            index += 1;
+        } else if ascii_eq_ci(arg.as_ref(), b"WITHCOORD") {
+            spec.withcoord = true;
+            index += 1;
+        } else if ascii_eq_ci(arg.as_ref(), b"WITHDIST") {
+            spec.withdist = true;
+            index += 1;
+        } else if ascii_eq_ci(arg.as_ref(), b"WITHHASH") {
+            spec.withhash = true;
+            index += 1;
+        } else if ascii_eq_ci(arg.as_ref(), b"COUNT") && index + 1 < parts.len() {
+            let count = parse_i64_error_arg(
+                part_to_bytes(&parts[index + 1])?.as_ref(),
+                "value is not an integer or out of range",
+            )?;
+            if count <= 0 {
+                return Err(ParseError::Error("COUNT must be > 0"));
+            }
+            spec.count = Some(count as usize);
+            index += 2;
+            if index < parts.len()
+                && ascii_eq_ci(part_to_bytes(&parts[index])?.as_ref(), b"ANY")
+            {
+                spec.any = true;
+                index += 1;
+            }
+        } else if ascii_eq_ci(arg.as_ref(), b"ANY") {
+            // ANY only means anything attached to a COUNT.
+            return Err(ParseError::Error("the ANY argument requires COUNT argument"));
+        } else if is_search
+            && !have_center
+            && ascii_eq_ci(arg.as_ref(), b"FROMMEMBER")
+            && index + 1 < parts.len()
+        {
+            spec.from_member = Some(part_to_bytes(&parts[index + 1])?);
+            have_center = true;
+            index += 2;
+        } else if is_search
+            && !have_center
+            && ascii_eq_ci(arg.as_ref(), b"FROMLONLAT")
+            && index + 2 < parts.len()
+        {
+            let longitude = parse_f64_error_arg(
+                part_to_bytes(&parts[index + 1])?.as_ref(),
+                "value is not a valid float",
+            )?;
+            let latitude = parse_f64_error_arg(
+                part_to_bytes(&parts[index + 2])?.as_ref(),
+                "value is not a valid float",
+            )?;
+            geo_check_position(longitude, latitude)?;
+            spec.center_lon = longitude;
+            spec.center_lat = latitude;
+            have_center = true;
+            index += 3;
+        } else if is_search
+            && !have_shape
+            && ascii_eq_ci(arg.as_ref(), b"BYRADIUS")
+            && index + 2 < parts.len()
+        {
+            let radius = parse_f64_error_arg(
+                part_to_bytes(&parts[index + 1])?.as_ref(),
+                "need numeric radius",
+            )?;
+            if radius < 0.0 {
+                return Err(ParseError::Error("radius cannot be negative"));
+            }
+            let unit = part_to_bytes(&parts[index + 2])?;
+            let Some(meters) = geo_unit_meters(unit.as_ref()) else {
+                return Err(ParseError::Error(GEO_UNIT_ERROR));
+            };
+            spec.circular = true;
+            spec.radius_m = radius * meters;
+            spec.unit_meters = meters;
+            have_shape = true;
+            index += 3;
+        } else if is_search
+            && !have_shape
+            && ascii_eq_ci(arg.as_ref(), b"BYBOX")
+            && index + 3 < parts.len()
+        {
+            let width = parse_f64_error_arg(
+                part_to_bytes(&parts[index + 1])?.as_ref(),
+                "need numeric width",
+            )?;
+            let height = parse_f64_error_arg(
+                part_to_bytes(&parts[index + 2])?.as_ref(),
+                "need numeric height",
+            )?;
+            if width < 0.0 || height < 0.0 {
+                return Err(ParseError::Error("height or width cannot be negative"));
+            }
+            let unit = part_to_bytes(&parts[index + 3])?;
+            let Some(meters) = geo_unit_meters(unit.as_ref()) else {
+                return Err(ParseError::Error(GEO_UNIT_ERROR));
+            };
+            spec.circular = false;
+            spec.width_m = width * meters;
+            spec.height_m = height * meters;
+            spec.unit_meters = meters;
+            have_shape = true;
+            index += 4;
+        } else if !is_search
+            && !read_only
+            && (ascii_eq_ci(arg.as_ref(), b"STORE") || ascii_eq_ci(arg.as_ref(), b"STOREDIST"))
+        {
+            // Writing the result back is a separate package; refuse it rather
+            // than silently dropping the destination key.
+            return Err(ParseError::Error(GEO_STORE_ERROR));
+        } else {
+            return Err(ParseError::Error("syntax error"));
+        }
+    }
+
+    if !have_center {
+        return Err(ParseError::Error(
+            "exactly one of FROMMEMBER or FROMLONLAT can be specified for GEOSEARCH",
+        ));
+    }
+    if !have_shape {
+        return Err(ParseError::Error(
+            "exactly one of BYRADIUS and BYBOX can be specified for GEOSEARCH",
+        ));
+    }
+
+    let mut cmd = Command::new(
+        OpCode::GeoSearch,
+        vec![key],
+        None,
+        command_args(parts).ok_or(ParseError::Protocol("invalid argument"))?,
+    );
+    cmd.geo = Some(Box::new(spec));
+    Ok(cmd)
+}
+
+/// Redis `extractLongLatOrReply`'s range check, with its exact error text.
+fn geo_check_position(longitude: f64, latitude: f64) -> Result<(), ParseError> {
+    if !(GEO_LONG_MIN..=GEO_LONG_MAX).contains(&longitude)
+        || !(GEO_LAT_MIN..=GEO_LAT_MAX).contains(&latitude)
+    {
+        return Err(ParseError::Owned(format!(
+            "invalid longitude,latitude pair {longitude:.6},{latitude:.6}"
+        )));
+    }
+    Ok(())
+}
+
+/// Outcome of looking a geo member's position up.
+enum GeoMemberLookup {
+    Position(f64, f64),
+    KeyMissing,
+    MemberMissing,
+    WrongType,
+    Failed,
+}
+
+/// Run an already-built op list as its own request, with the same retry policy
+/// as `ffi_execute_single`, and hand the results to `consume`. The response is
+/// freed before returning.
+fn ffi_run_ops<T>(ops: &[TxnOperation], consume: impl FnOnce(Option<&[TxnOpResult]>) -> T) -> T {
+    if redis_backend() == RedisBackend::Memory {
+        let owned = memory_execute_transaction(ops);
+        let response = owned.as_response();
+        if response.num_results >= ops.len() {
+            return consume(Some(unsafe {
+                std::slice::from_raw_parts(response.results, ops.len())
+            }));
+        }
+        return consume(None);
+    }
+
+    let request = TxnRequest {
+        num_ops: ops.len(),
+        ops: ops.as_ptr(),
+    };
+    let mut response = TxnResponse {
+        transaction_success: false,
+        num_results: 0,
+        results: std::ptr::null_mut(),
+    };
+    let mut call_ok = false;
+    for attempt in 0..TXN_MAX_ATTEMPTS {
+        response = TxnResponse {
+            transaction_success: false,
+            num_results: 0,
+            results: std::ptr::null_mut(),
+        };
+        call_ok = unsafe { cpp_execute_transaction(&request, &mut response) };
+        if call_ok && response.transaction_success && response.num_results >= ops.len() {
+            break;
+        }
+        unsafe { cpp_free_transaction_response(&mut response) };
+        if attempt + 1 < TXN_MAX_ATTEMPTS {
+            unsafe { cpp_record_txn_retry() };
+            sleep_for_retry(attempt);
+        }
+    }
+
+    let value = if call_ok && response.transaction_success && response.num_results >= ops.len() {
+        consume(Some(unsafe {
+            std::slice::from_raw_parts(response.results, ops.len())
+        }))
+    } else {
+        consume(None)
+    };
+    unsafe { cpp_free_transaction_response(&mut response) };
+    value
+}
+
+/// FROMMEMBER / GEORADIUSBYMEMBER center lookup. It is its own request because
+/// a later op in a request cannot read an earlier op's result, so the range
+/// reads that follow cannot see this score. Recorded in known_divergences.txt.
+fn geo_lookup_member(key: &Bytes, member: &Bytes) -> GeoMemberLookup {
+    // ZSCORE says where the member is; ZCARD separates "there is no such key"
+    // (Redis answers an empty result) from "the key has no such member"
+    // (Redis answers an error). Both read the same key in one request.
+    let ops = [
+        TxnOperation {
+            op: TXN_OP_ZSCORE,
+            key_ptr: key.as_ptr(),
+            key_len: key.len(),
+            val_ptr: member.as_ptr(),
+            val_len: member.len(),
+            flags: 0,
+            expire_at_ms: -1,
+            group_id: 0,
+        },
+        TxnOperation {
+            op: TXN_OP_ZCARD,
+            key_ptr: key.as_ptr(),
+            key_len: key.len(),
+            val_ptr: std::ptr::null(),
+            val_len: 0,
+            flags: 0,
+            expire_at_ms: -1,
+            group_id: 0,
+        },
+    ];
+    ffi_run_ops(&ops, |results| {
+        let Some(results) = results else {
+            return GeoMemberLookup::Failed;
+        };
+        let (score, cardinality) = (&results[0], &results[1]);
+        if !score.success || !cardinality.success {
+            return GeoMemberLookup::WrongType;
+        }
+        if score.value_present {
+            if let Some(bits) = geo_score_from_bytes(result_value_bytes(score)) {
+                let (lon, lat) = geo_decode_score(bits);
+                return GeoMemberLookup::Position(lon, lat);
+            }
+        }
+        if cardinality.int_value <= 0 {
+            GeoMemberLookup::KeyMissing
+        } else {
+            GeoMemberLookup::MemberMissing
+        }
+    })
+}
+
+/// Resolve a FROMMEMBER search center. Returns a copy of the command with the
+/// center filled in, or None when there is nothing to resolve.
+fn geo_resolve_search_center(cmd: &Command) -> Option<Command> {
+    let spec = cmd.geo.as_deref()?;
+    let member = spec.from_member.clone()?;
+    let key = cmd.keys.first()?.clone();
+    let lookup = geo_lookup_member(&key, &member);
+    let mut resolved = cmd.clone();
+    let spec = resolved.geo.as_deref_mut()?;
+    spec.from_member = None;
+    match lookup {
+        GeoMemberLookup::Position(lon, lat) => {
+            spec.center_lon = lon;
+            spec.center_lat = lat;
+        }
+        GeoMemberLookup::KeyMissing => spec.resolve_error = GeoResolve::KeyMissing,
+        GeoMemberLookup::MemberMissing => spec.resolve_error = GeoResolve::MemberMissing,
+        GeoMemberLookup::WrongType => spec.resolve_error = GeoResolve::WrongType,
+        GeoMemberLookup::Failed => spec.resolve_error = GeoResolve::Failed,
+    }
+    Some(resolved)
+}
+
+/// One candidate of a geo search, after the exact shape test.
+struct GeoPoint {
+    member: Vec<u8>,
+    lon: f64,
+    lat: f64,
+    score: u64,
+    dist: f64,
+}
 
 fn result_value_bytes(result: &TxnOpResult) -> &[u8] {
     if result.value_present && result.data_len > 0 && !result.data_ptr.is_null() {
@@ -12359,7 +13831,11 @@ fn handle_command<W: Write>(
         | OpCode::BZPopMin
         | OpCode::BZPopMax
         | OpCode::ZRandMember
-        | OpCode::ZScan => {
+        | OpCode::ZScan
+        | OpCode::GeoAdd
+        | OpCode::GeoPos
+        | OpCode::GeoDist
+        | OpCode::GeoHash => {
             if txn_state.in_multi {
                 // Queue command for later execution
                 txn_state.queue_command(cmd.clone());
@@ -12368,6 +13844,20 @@ fn handle_command<W: Write>(
                 // Execute immediately as single-operation transaction
                 // Uses ffi_execute_single which returns result without array wrapper
                 ffi_execute_single(cmd, client_state.protocol_version, writer)?;
+            }
+        }
+        OpCode::GeoSearch => {
+            // FROMMEMBER / GEORADIUSBYMEMBER needs the member's own score
+            // before the range reads can be built, and a later op cannot read
+            // an earlier op's result inside one request, so that lookup runs as
+            // a request of its own. The range reads then still go out together.
+            let resolved = geo_resolve_search_center(cmd);
+            let target = resolved.as_ref().unwrap_or(cmd);
+            if txn_state.in_multi {
+                txn_state.queue_command(target.clone());
+                write_queued(writer)?;
+            } else {
+                ffi_execute_single(target, client_state.protocol_version, writer)?;
             }
         }
     }
@@ -13573,6 +15063,312 @@ Note that u64 is not supported but i64 is.\r\n"
             run_raw(b"*4\r\n$8\r\nBITFIELD\r\n$1\r\nk\r\n$3\r\nGET\r\n$2\r\nu8\r\n"),
             b"-ERR syntax error\r\n"
         );
+    }
+
+    /// The two positions from the Redis GEOADD documentation and the 52-bit
+    /// scores Redis stores for them.
+    const PALERMO: (f64, f64, u64) = (13.361389, 38.115556, 3479099956230698);
+    const CATANIA: (f64, f64, u64) = (15.087269, 37.502669, 3479447370796909);
+
+    /// The `[min, max)` score ranges a built geo search asks for.
+    fn decode_range_payloads(payloads: &[Bytes]) -> Vec<(u64, u64)> {
+        payloads
+            .iter()
+            .map(|payload| {
+                let bounds = parse_list_payload(payload).unwrap();
+                let min: u64 = String::from_utf8(bounds[0].clone()).unwrap().parse().unwrap();
+                // The upper bound is exclusive, so it is spelled "(N".
+                let max: u64 = String::from_utf8(bounds[1][1..].to_vec())
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                (min, max)
+            })
+            .collect()
+    }
+
+    fn covered(ranges: &[(u64, u64)], score: u64) -> bool {
+        ranges.iter().any(|(min, max)| score >= *min && score < *max)
+    }
+
+    fn resp_command(args: &[&str]) -> Vec<u8> {
+        let mut out = format!("*{}\r\n", args.len()).into_bytes();
+        for arg in args {
+            out.extend_from_slice(format!("${}\r\n{arg}\r\n", arg.len()).as_bytes());
+        }
+        out
+    }
+
+    fn geo_search_payloads(args: &[&str]) -> Vec<(u64, u64)> {
+        let cmd = parse_one(&resp_command(args));
+        decode_range_payloads(&build_txn_ops(std::slice::from_ref(&cmd)).2)
+    }
+
+    #[test]
+    fn geohash_encoding_matches_redis() {
+        // Scores are Redis's interleaved 52-bit geohash, exactly.
+        assert_eq!(
+            geo_score_for_position(PALERMO.0, PALERMO.1),
+            Some(PALERMO.2)
+        );
+        assert_eq!(
+            geo_score_for_position(CATANIA.0, CATANIA.1),
+            Some(CATANIA.2)
+        );
+
+        // Decoding lands on the center of the box, within the tolerance the
+        // Redis documentation itself quotes for GEOPOS.
+        let (lon, lat) = geo_decode_score(PALERMO.2);
+        assert!((lon - PALERMO.0).abs() < 1e-4, "lon {lon}");
+        assert!((lat - PALERMO.1).abs() < 1e-4, "lat {lat}");
+
+        // The 11-character base32 strings from the GEOHASH documentation.
+        assert_eq!(geo_hash_string(PALERMO.2).as_deref(), Some("sqc8b49rny0"));
+        assert_eq!(geo_hash_string(CATANIA.2).as_deref(), Some("sqdtr74hyu0"));
+
+        // Outside the Mercator cut-off there is no score at all.
+        assert_eq!(geo_score_for_position(200.0, 100.0), None);
+    }
+
+    #[test]
+    fn geo_distance_matches_the_documented_example() {
+        let (plon, plat) = geo_decode_score(PALERMO.2);
+        let (clon, clat) = geo_decode_score(CATANIA.2);
+        let meters = geo_distance(plon, plat, clon, clat);
+        assert_eq!(geo_format_distance(meters), "166274.1516");
+        assert_eq!(geo_format_distance(meters / 1000.0), "166.2742");
+        assert_eq!(geo_format_distance(meters / 1609.34), "103.3182");
+
+        // Units, as Redis's extractUnitOrReply defines them.
+        assert_eq!(geo_unit_meters(b"m"), Some(1.0));
+        assert_eq!(geo_unit_meters(b"KM"), Some(1000.0));
+        assert_eq!(geo_unit_meters(b"ft"), Some(0.3048));
+        assert_eq!(geo_unit_meters(b"mi"), Some(1609.34));
+        assert_eq!(geo_unit_meters(b"yards"), None);
+    }
+
+    #[test]
+    fn geoadd_builds_one_zadd_op_with_geohash_scores() {
+        let cmd = parse_one(
+            b"*8\r\n$6\r\nGEOADD\r\n$6\r\nSicily\r\n$9\r\n13.361389\r\n$9\r\n38.115556\r\n\
+$7\r\nPalermo\r\n$9\r\n15.087269\r\n$9\r\n37.502669\r\n$7\r\nCatania\r\n",
+        );
+        assert!(cmd.op == OpCode::GeoAdd);
+        assert_eq!(cmd.keys, vec![Bytes::from_static(b"Sicily")]);
+        let (ops, spans, payloads) = build_txn_ops(std::slice::from_ref(&cmd));
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, TXN_OP_ZADD);
+        assert_eq!(spans, vec![(0, 1)]);
+        assert_eq!(
+            parse_list_payload(&payloads[0]).unwrap(),
+            vec![
+                PALERMO.2.to_string().into_bytes(),
+                b"Palermo".to_vec(),
+                CATANIA.2.to_string().into_bytes(),
+                b"Catania".to_vec(),
+            ]
+        );
+
+        // NX/XX/CH ride along as ZADD flags.
+        let cmd = parse_one(
+            b"*7\r\n$6\r\nGEOADD\r\n$1\r\nk\r\n$2\r\nNX\r\n$2\r\nCH\r\n$1\r\n1\r\n$1\r\n2\r\n$1\r\nm\r\n",
+        );
+        assert_eq!(cmd.expire_flags & TXN_FLAG_ZADD_NX, TXN_FLAG_ZADD_NX);
+        assert_eq!(cmd.expire_flags & TXN_FLAG_ZADD_CH, TXN_FLAG_ZADD_CH);
+
+        // GEOADD is the only geo writer; every geo command retries on abort.
+        assert!(is_dirty_command(OpCode::GeoAdd));
+        assert!(!is_dirty_command(OpCode::GeoSearch));
+        assert!(command_needs_retry(&cmd));
+    }
+
+    #[test]
+    fn geopos_geohash_and_geodist_build_one_zscore_per_member() {
+        let cmd = parse_one(
+            b"*4\r\n$6\r\nGEOPOS\r\n$6\r\nSicily\r\n$7\r\nPalermo\r\n$11\r\nNonExisting\r\n",
+        );
+        assert!(cmd.op == OpCode::GeoPos);
+        let (ops, spans, _) = build_txn_ops(std::slice::from_ref(&cmd));
+        assert_eq!(ops.len(), 2);
+        assert!(ops.iter().all(|op| op.op == TXN_OP_ZSCORE));
+        assert_eq!(spans, vec![(0, 2)]);
+
+        let cmd = parse_one(b"*3\r\n$7\r\nGEOHASH\r\n$6\r\nSicily\r\n$7\r\nPalermo\r\n");
+        assert!(cmd.op == OpCode::GeoHash);
+        assert_eq!(build_txn_ops(std::slice::from_ref(&cmd)).0.len(), 1);
+
+        // GEODIST keeps the unit in cmd.val so the reply can convert back.
+        let cmd = parse_one(
+            b"*5\r\n$7\r\nGEODIST\r\n$6\r\nSicily\r\n$7\r\nPalermo\r\n$7\r\nCatania\r\n$2\r\nkm\r\n",
+        );
+        assert!(cmd.op == OpCode::GeoDist);
+        assert_eq!(cmd.val.as_deref(), Some(&b"km"[..]));
+        let (ops, spans, _) = build_txn_ops(std::slice::from_ref(&cmd));
+        assert_eq!(ops.len(), 2);
+        assert_eq!(spans, vec![(0, 2)]);
+    }
+
+    #[test]
+    fn geo_searches_build_one_by_score_range_per_neighbor_box() {
+        // GEORADIUS Sicily 15 37 200 km: the center cell plus the neighbors
+        // that can still intersect, all read in one request.
+        let cmd = parse_one(
+            b"*7\r\n$9\r\nGEORADIUS\r\n$6\r\nSicily\r\n$2\r\n15\r\n$2\r\n37\r\n$3\r\n200\r\n\
+$2\r\nkm\r\n$8\r\nWITHDIST\r\n",
+        );
+        assert!(cmd.op == OpCode::GeoSearch);
+        let spec = cmd.geo.as_deref().unwrap();
+        assert!(spec.circular);
+        assert_eq!(spec.radius_m, 200_000.0);
+        assert!(spec.withdist && !spec.withcoord && !spec.withhash);
+        let (ops, spans, payloads) = build_txn_ops(std::slice::from_ref(&cmd));
+        assert!(!ops.is_empty() && ops.len() <= GEO_MAX_SEARCH_RANGES);
+        assert_eq!(spans, vec![(0, ops.len())]);
+        assert!(ops
+            .iter()
+            .all(|op| op.op == TXN_OP_ZRANGE
+                && op.flags == TXN_FLAG_Z_BYSCORE | TXN_FLAG_Z_WITHSCORES));
+
+        // Both documented points fall inside one of the requested ranges.
+        let ranges = decode_range_payloads(&payloads);
+        for score in [PALERMO.2, CATANIA.2] {
+            assert!(
+                covered(&ranges, score),
+                "score {score} is in no searched box"
+            );
+        }
+
+        // GEOSEARCH BYBOX and the option tail parse into the same spec.
+        let cmd = parse_one(
+            b"*12\r\n$9\r\nGEOSEARCH\r\n$6\r\nSicily\r\n$10\r\nFROMLONLAT\r\n$2\r\n15\r\n\
+$2\r\n37\r\n$5\r\nBYBOX\r\n$3\r\n400\r\n$3\r\n400\r\n$2\r\nkm\r\n$3\r\nASC\r\n\
+$9\r\nWITHCOORD\r\n$8\r\nWITHDIST\r\n",
+        );
+        let spec = cmd.geo.as_deref().unwrap();
+        assert!(!spec.circular);
+        assert_eq!(spec.width_m, 400_000.0);
+        assert_eq!(spec.height_m, 400_000.0);
+        assert!(spec.sort == GeoSort::Asc);
+        assert!(spec.withcoord && spec.withdist);
+
+        // FROMMEMBER leaves the center unresolved; the lookup is its own
+        // request, so no range reads are built until it has run.
+        let cmd = parse_one(
+            b"*7\r\n$9\r\nGEOSEARCH\r\n$6\r\nSicily\r\n$10\r\nFROMMEMBER\r\n$7\r\nPalermo\r\n\
+$8\r\nBYRADIUS\r\n$3\r\n200\r\n$2\r\nkm\r\n",
+        );
+        let spec = cmd.geo.as_deref().unwrap();
+        assert_eq!(spec.from_member.as_deref(), Some(&b"Palermo"[..]));
+        assert_eq!(build_txn_ops(std::slice::from_ref(&cmd)).0.len(), 0);
+
+        // COUNT n ANY and DESC are carried too.
+        let cmd = parse_one(
+            b"*10\r\n$17\r\nGEORADIUSBYMEMBER\r\n$6\r\nSicily\r\n$9\r\nAgrigento\r\n$3\r\n100\r\n\
+$2\r\nkm\r\n$5\r\nCOUNT\r\n$1\r\n1\r\n$3\r\nANY\r\n$4\r\nDESC\r\n$8\r\nWITHHASH\r\n",
+        );
+        let spec = cmd.geo.as_deref().unwrap();
+        assert_eq!(spec.count, Some(1));
+        assert!(spec.any);
+        assert!(spec.sort == GeoSort::Desc);
+        assert!(spec.withhash);
+    }
+
+    #[test]
+    fn geo_searches_near_the_pole_still_cover_their_targets() {
+        // The three regressions from Redis tests/unit/geo.tcl that nine fixed
+        // neighbor boxes miss: near the pole a degree of longitude is short
+        // enough that the matching cell is two columns away, and a search area
+        // that runs over a pole reaches every column.
+        let target = |lon: f64, lat: f64| geo_score_for_position(lon, lat).unwrap();
+
+        // "search areas contain satisfied points in oblique direction".
+        let ranges = geo_search_payloads(&[
+            "GEORADIUS",
+            "k1",
+            "-0.15307903289794921875",
+            "85",
+            "4891.94",
+            "m",
+        ]);
+        assert!(covered(&ranges, target(0.3515625, 85.00019260486917)));
+
+        let ranges = geo_search_payloads(&[
+            "GEORADIUS",
+            "k1",
+            "-4.95211958885192871094",
+            "85",
+            "156544",
+            "m",
+        ]);
+        assert!(covered(&ranges, target(11.25, 85.0511)));
+
+        // "crossing pole search": the area wraps over the north pole, so the
+        // target sits half a world away in longitude.
+        let ranges = geo_search_payloads(&["GEORADIUS", "k1", "45", "65", "5009431", "m"]);
+        assert!(covered(&ranges, target(-135.0, 85.05)));
+        assert!(ranges.len() <= GEO_MAX_SEARCH_RANGES);
+
+        // A search large enough to need more boxes than the cap reads the whole
+        // score space once, which is cheaper here than many range ops.
+        let ranges = geo_search_payloads(&["GEORADIUS", "k1", "0", "0", "20000000", "km"]);
+        assert!(ranges.len() <= GEO_MAX_SEARCH_RANGES);
+        assert!(covered(&ranges, target(-135.0, 85.05)));
+        assert!(covered(&ranges, target(179.0, -85.0)));
+    }
+
+    #[test]
+    fn geo_commands_report_redis_error_texts() {
+        assert_eq!(
+            run_raw(
+                b"*6\r\n$6\r\nGEOADD\r\n$1\r\nk\r\n$3\r\n200\r\n$3\r\n100\r\n$1\r\nm\r\n$1\r\nx\r\n"
+            ),
+            b"-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            run_raw(b"*5\r\n$6\r\nGEOADD\r\n$1\r\nk\r\n$3\r\n200\r\n$3\r\n100\r\n$1\r\nm\r\n"),
+            b"-ERR invalid longitude,latitude pair 200.000000,100.000000\r\n"
+        );
+        assert_eq!(
+            run_raw(
+                b"*5\r\n$7\r\nGEODIST\r\n$1\r\nk\r\n$1\r\na\r\n$1\r\nb\r\n$5\r\nyards\r\n"
+            ),
+            b"-ERR unsupported unit provided. please use M, KM, FT, MI\r\n"
+        );
+        assert_eq!(
+            run_raw(
+                b"*8\r\n$9\r\nGEORADIUS\r\n$1\r\nk\r\n$1\r\n1\r\n$1\r\n2\r\n$2\r\n-1\r\n$2\r\nkm\r\n$3\r\nASC\r\n$4\r\nDESC\r\n"
+            ),
+            b"-ERR radius cannot be negative\r\n"
+        );
+        assert_eq!(
+            run_raw(
+                b"*8\r\n$9\r\nGEORADIUS\r\n$1\r\nk\r\n$1\r\n1\r\n$1\r\n2\r\n$1\r\n5\r\n$2\r\nkm\r\n$5\r\nSTORE\r\n$3\r\ndst\r\n"
+            ),
+            b"-ERR STORE option in GEORADIUS is not supported by this server\r\n"
+        );
+        assert_eq!(
+            run_raw(
+                b"*8\r\n$9\r\nGEORADIUS\r\n$1\r\nk\r\n$1\r\n1\r\n$1\r\n2\r\n$1\r\n5\r\n$2\r\nkm\r\n$5\r\nCOUNT\r\n$1\r\n0\r\n"
+            ),
+            b"-ERR COUNT must be > 0\r\n"
+        );
+        // GEOSEARCH needs both a center and a shape.
+        assert_eq!(
+            run_raw(
+                b"*7\r\n$9\r\nGEOSEARCH\r\n$1\r\nk\r\n$10\r\nFROMLONLAT\r\n$1\r\n1\r\n$1\r\n2\r\n$3\r\nASC\r\n$8\r\nWITHDIST\r\n"
+            ),
+            b"-ERR exactly one of BYRADIUS and BYBOX can be specified for GEOSEARCH\r\n"
+        );
+        assert_eq!(
+            run_raw(b"*2\r\n$6\r\nGEOADD\r\n$1\r\nk\r\n"),
+            b"-ERR wrong number of arguments for 'geoadd' command\r\n"
+        );
+        assert_eq!(
+            run_raw(b"*2\r\n$20\r\nGEORADIUSBYMEMBER_RO\r\n$1\r\nk\r\n"),
+            b"-ERR wrong number of arguments for 'georadiusbymember_ro' command\r\n"
+        );
+        // GEOSEARCHSTORE is deliberately not recognized in this package.
+        assert!(parse_opcode(b"GEOSEARCHSTORE").is_none());
     }
 
     #[test]
