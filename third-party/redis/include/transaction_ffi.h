@@ -27,9 +27,10 @@
  * Reserved internal keys:
  *   Redis-visible keys must not use the 0x01 prefix. The Redis layer stores
  *   TTL metadata under "\x01TTL:<key>", set internals under "\x01S:" /
- *   "\x01S#:", list internals under "\x01L:" / "\x01L#:", and sorted-set
- *   internals under "\x01Z:" / "\x01ZS:" / "\x01Z#:". These records are
- *   hidden from Redis keyspace commands.
+ *   "\x01S#:", list internals under "\x01L:" / "\x01L#:", hash internals under
+ *   "\x01H:" / "\x01H#:" plus per-field expirations under "\x01HX:", and
+ *   sorted-set internals under "\x01Z:" / "\x01ZS:" / "\x01Z#:". These records
+ *   are hidden from Redis keyspace commands.
  *
  * Sorted-set score encoding:
  *   Sorted-set score indexes use order-preserving IEEE-754 double encoding:
@@ -155,6 +156,34 @@ typedef enum {
     // command order: the decimal result, or an empty string for the nil an
     // OVERFLOW FAIL subcommand returns when it performed no write.
     TXN_OP_BITFIELD = 82,
+    // Redis 7.4 hash field expiration (HEXPIRE/HTTL/HPERSIST families). A
+    // field's expiration is a side key next to the field key, in the hidden
+    // "\x01HX:" namespace, holding the absolute Unix millisecond time as
+    // decimal text. All three ops touch only op.key, so they keep the default
+    // single-key lock stripe. Rust validates syntax, conditions and time
+    // conversion, so the executor only ever sees absolute milliseconds and a
+    // well-formed field list.
+    //
+    // HFIELD_EXPIRE: key = the hash; expire_at_ms = the absolute Unix ms;
+    //   value = packed [mode, field ...] where mode is one of
+    //   "NONE" | "NX" | "XX" | "GT" | "LT". The result value is a packed list
+    //   with one decimal code per field, in order:
+    //     -2 no such field (also when the key does not exist)
+    //      0 the NX/XX/GT/LT condition was not met
+    //      1 the expiration was set or updated
+    //      2 the time was already in the past, so the field was deleted
+    // HFIELD_TTL: key = the hash; value = packed [field ...]. Read-only.
+    //   The result value is a packed list with one decimal per field: -2 for
+    //   no such field, -1 for a field with no expiration, otherwise the
+    //   absolute Unix ms. Rust converts that to the remaining seconds or
+    //   milliseconds (HTTL/HPTTL) or to absolute seconds or milliseconds
+    //   (HEXPIRETIME/HPEXPIRETIME).
+    // HFIELD_PERSIST: key = the hash; value = packed [field ...]. The result
+    //   value is a packed list of decimal codes: -2 no such field, -1 no
+    //   expiration to remove, 1 removed.
+    TXN_OP_HFIELD_EXPIRE = 83,
+    TXN_OP_HFIELD_TTL = 84,
+    TXN_OP_HFIELD_PERSIST = 85,
 } TxnOpCode;
 
 /**

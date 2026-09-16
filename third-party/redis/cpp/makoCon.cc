@@ -723,6 +723,11 @@ static bool redis_op_is_read_only(const TxnOperation& op) {
         case TXN_OP_HVALS:
         case TXN_OP_HSTRLEN:
         case TXN_OP_HSCAN:
+        // HTTL/HPTTL/HEXPIRETIME/HPEXPIRETIME only read the per-field TTL side
+        // keys. Like the other hash reads it can still drop a field whose time
+        // has already passed, which is the same lazy-expiry write the key-level
+        // TTL check has always done from a read path.
+        case TXN_OP_HFIELD_TTL:
         case TXN_OP_GETBIT:
         case TXN_OP_GETRANGE:
         case TXN_OP_DUMP:
@@ -1367,6 +1372,27 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
             key.push_back(static_cast<char>((static_cast<uint64_t>(hash_key.size()) >> shift) & 0xff));
         }
         key.append(hash_key);
+        return key;
+    };
+
+    // Per-field expiration (HEXPIRE family): one side key beside the field key
+    // holding the absolute Unix millisecond time as decimal text. The "\x01HX:"
+    // prefix sorts outside the "\x01H:" range a hash field scan walks, so
+    // collect_hash_entries never sees these records.
+    auto make_hash_field_ttl_prefix = [](const std::string& hash_key) {
+        std::string prefix;
+        prefix.reserve(sizeof("\x01HX:") - 1 + 8 + hash_key.size());
+        prefix.append("\x01HX:", sizeof("\x01HX:") - 1);
+        for (int shift = 0; shift < 64; shift += 8) {
+            prefix.push_back(static_cast<char>((static_cast<uint64_t>(hash_key.size()) >> shift) & 0xff));
+        }
+        prefix.append(hash_key);
+        return prefix;
+    };
+
+    auto make_hash_field_ttl_key = [&](const std::string& hash_key, const std::string& field) {
+        std::string key = make_hash_field_ttl_prefix(hash_key);
+        key.append(field);
         return key;
     };
 
@@ -2643,6 +2669,130 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
         return write_set_cardinality(txn, set_key, static_cast<int64_t>(values.size()));
     };
 
+    auto read_hash_field_ttl = [&](void* txn, const std::string& hash_key, const std::string& field,
+                                   int64_t& expire_at_ms, bool& exists) {
+        expire_at_ms = -1;
+        exists = false;
+        std::string value;
+        bool raw_exists = false;
+        mako::Status s = read_internal_current(
+            txn, make_hash_field_ttl_key(hash_key, field), value, raw_exists);
+        if (!s.ok() || !raw_exists) {
+            return s;
+        }
+        if (!parse_int64(value, expire_at_ms)) {
+            expire_at_ms = -1;
+            return mako::Status::OK();
+        }
+        exists = true;
+        return mako::Status::OK();
+    };
+
+    auto write_hash_field_ttl = [&](void* txn, const std::string& hash_key, const std::string& field,
+                                    int64_t expire_at_ms) {
+        std::string ttl_key = make_hash_field_ttl_key(hash_key, field);
+        std::string payload = std::to_string(expire_at_ms);
+        mako::Status s = put_raw(txn, ttl_key, payload);
+        if (s.ok()) {
+            batch_exists[ttl_key] = true;
+            batch_values[ttl_key] = payload;
+        }
+        return s;
+    };
+
+    auto clear_hash_field_ttl = [&](void* txn, const std::string& hash_key, const std::string& field) {
+        std::string ttl_key = make_hash_field_ttl_key(hash_key, field);
+        auto batch_it = batch_exists.find(ttl_key);
+        if (batch_it != batch_exists.end() && !batch_it->second) {
+            // Already removed earlier in this transaction; deleting the same
+            // record twice inside one transaction is not worth the risk.
+            return mako::Status::OK();
+        }
+        mako::Status s = delete_raw_if_exists(txn, ttl_key);
+        if (s.ok()) {
+            batch_exists[ttl_key] = false;
+            batch_values.erase(ttl_key);
+        }
+        return s;
+    };
+
+    // Every field of the hash that carries an expiration, with its absolute
+    // Unix ms. One range read over the hash's TTL prefix, so the cost is
+    // proportional to the number of fields with a TTL, not to the hash size.
+    auto collect_hash_field_ttls = [&](void* txn, const std::string& hash_key,
+                                       std::map<std::string, int64_t>& ttls) {
+        ttls.clear();
+        const std::string ttl_prefix = make_hash_field_ttl_prefix(hash_key);
+        std::optional<std::string> scan_end = storage_prefix_upper(ttl_prefix);
+        const std::string* scan_end_ptr = scan_end ? &*scan_end : nullptr;
+
+        class HashFieldTtlScanCallback : public oi_scan_callback {
+        public:
+            HashFieldTtlScanCallback(
+                std::map<std::string, std::string>& rows,
+                std::string_view ttl_prefix,
+                size_t ttl_prefix_len)
+                : rows_(rows),
+                  ttl_prefix_(ttl_prefix),
+                  ttl_prefix_len_(ttl_prefix_len) {}
+
+            bool invoke(const char* keyp, size_t keylen, const std::string& value) override {
+                std::string_view storage_key(keyp, keylen);
+                if (storage_key.rfind(ttl_prefix_, 0) != 0) {
+                    return true;
+                }
+                rows_[std::string(storage_key.substr(ttl_prefix_len_))] = value;
+                return true;
+            }
+
+        private:
+            std::map<std::string, std::string>& rows_;
+            std::string_view ttl_prefix_;
+            size_t ttl_prefix_len_;
+        };
+
+        std::map<std::string, std::string> rows;
+        HashFieldTtlScanCallback callback(rows, ttl_prefix, ttl_prefix.size());
+        tx_scan(g_table, txn, ttl_prefix, scan_end_ptr, callback, tl_arena);
+        for (const auto& [storage_key, exists] : batch_exists) {
+            if (storage_key.rfind(ttl_prefix, 0) != 0) {
+                continue;
+            }
+            std::string field = storage_key.substr(ttl_prefix.size());
+            if (!exists) {
+                rows.erase(field);
+                continue;
+            }
+            auto value_it = batch_values.find(storage_key);
+            if (value_it != batch_values.end()) {
+                rows[field] = value_it->second;
+            }
+        }
+        for (const auto& [field, raw] : rows) {
+            int64_t parsed = 0;
+            if (parse_int64(raw, parsed)) {
+                ttls[field] = parsed;
+            }
+        }
+        return mako::Status::OK();
+    };
+
+    auto clear_all_hash_field_ttls = [&](void* txn, const std::string& hash_key) {
+        std::map<std::string, int64_t> ttls;
+        mako::Status s = collect_hash_field_ttls(txn, hash_key, ttls);
+        if (!s.ok()) {
+            return s;
+        }
+        for (const auto& [field, expire_at_ms] : ttls) {
+            (void)expire_at_ms;
+            s = clear_hash_field_ttl(txn, hash_key, field);
+            if (!s.ok()) {
+                return s;
+            }
+        }
+        return mako::Status::OK();
+    };
+
     auto collect_hash_entries = [&](void* txn, const std::string& hash_key, std::map<std::string, std::string>& entries) {
         entries.clear();
         const std::string field_prefix = make_hash_field_prefix(hash_key);
@@ -2708,7 +2858,131 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
             batch_exists[field_key] = false;
             batch_values.erase(field_key);
         }
+        // Every path that removes or replaces a hash wholesale (DEL, FLUSHDB,
+        // RESTORE, SORT STORE, RENAME, COPY, key-level expiry) funnels through
+        // here, so clearing the side keys here clears them everywhere.
+        s = clear_all_hash_field_ttls(txn, hash_key);
+        if (!s.ok()) {
+            return s;
+        }
         return write_hash_cardinality(txn, hash_key, 0);
+    };
+
+    // Lazy per-field expiry for a single field: if it carries an expiration
+    // that has passed, drop the field and its side key and shrink the hash,
+    // deleting the whole hash when it was the last field.
+    auto expire_hash_field_if_needed = [&](void* txn, const std::string& hash_key,
+                                           const std::string& field, bool& expired) {
+        expired = false;
+        int64_t expire_at_ms = 0;
+        bool ttl_exists = false;
+        mako::Status s = read_hash_field_ttl(txn, hash_key, field, expire_at_ms, ttl_exists);
+        if (!s.ok() || !ttl_exists || expire_at_ms > now_unix_ms()) {
+            return s;
+        }
+        std::string field_key = hash_field_storage_key(hash_key, field);
+        std::string ignored;
+        bool field_exists = false;
+        s = read_internal_current(txn, field_key, ignored, field_exists);
+        if (!s.ok()) {
+            return s;
+        }
+        s = clear_hash_field_ttl(txn, hash_key, field);
+        if (!s.ok() || !field_exists) {
+            return s;
+        }
+        s = delete_raw_if_exists(txn, field_key);
+        if (!s.ok()) {
+            return s;
+        }
+        batch_exists[field_key] = false;
+        batch_values.erase(field_key);
+        expired = true;
+        int64_t cardinality = 0;
+        s = read_hash_cardinality(txn, hash_key, cardinality);
+        if (!s.ok()) {
+            return s;
+        }
+        cardinality -= 1;
+        s = write_hash_cardinality(txn, hash_key, cardinality);
+        if (s.ok() && cardinality <= 0) {
+            // The last field went, so the key itself disappears, as HDEL does.
+            s = delete_hash(txn, hash_key);
+            if (s.ok()) {
+                s = clear_ttl_meta(txn, hash_key);
+            }
+        }
+        return s;
+    };
+
+    // Lazy per-field expiry for the whole-hash paths: one range read of the
+    // hash's TTL prefix, then drop every field whose time has passed.
+    auto expire_hash_fields_due = [&](void* txn, const std::string& hash_key) {
+        std::map<std::string, int64_t> ttls;
+        mako::Status s = collect_hash_field_ttls(txn, hash_key, ttls);
+        if (!s.ok() || ttls.empty()) {
+            return s;
+        }
+        const int64_t now_ms = now_unix_ms();
+        int64_t removed = 0;
+        for (const auto& [field, expire_at_ms] : ttls) {
+            if (expire_at_ms > now_ms) {
+                continue;
+            }
+            std::string field_key = hash_field_storage_key(hash_key, field);
+            std::string ignored;
+            bool field_exists = false;
+            s = read_internal_current(txn, field_key, ignored, field_exists);
+            if (!s.ok()) {
+                return s;
+            }
+            s = clear_hash_field_ttl(txn, hash_key, field);
+            if (!s.ok()) {
+                return s;
+            }
+            if (!field_exists) {
+                continue;
+            }
+            s = delete_raw_if_exists(txn, field_key);
+            if (!s.ok()) {
+                return s;
+            }
+            batch_exists[field_key] = false;
+            batch_values.erase(field_key);
+            ++removed;
+        }
+        if (removed == 0) {
+            return mako::Status::OK();
+        }
+        int64_t cardinality = 0;
+        s = read_hash_cardinality(txn, hash_key, cardinality);
+        if (!s.ok()) {
+            return s;
+        }
+        cardinality -= removed;
+        s = write_hash_cardinality(txn, hash_key, cardinality);
+        if (s.ok() && cardinality <= 0) {
+            s = delete_hash(txn, hash_key);
+            if (s.ok()) {
+                s = clear_ttl_meta(txn, hash_key);
+            }
+        }
+        return s;
+    };
+
+    // Hash cardinality with expired fields already dropped. The sweep only runs
+    // when the key really is a hash, so EXISTS/TYPE/DUMP of anything else costs
+    // nothing extra.
+    auto read_hash_cardinality_live = [&](void* txn, const std::string& hash_key, int64_t& count) {
+        mako::Status s = read_hash_cardinality(txn, hash_key, count);
+        if (!s.ok() || count <= 0) {
+            return s;
+        }
+        s = expire_hash_fields_due(txn, hash_key);
+        if (!s.ok()) {
+            return s;
+        }
+        return read_hash_cardinality(txn, hash_key, count);
     };
 
     auto delete_set = [&](void* txn, const std::string& set_key) {
@@ -2847,7 +3121,9 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
             return s;
         }
         int64_t hash_count = 0;
-        s = read_hash_cardinality(txn, user_key, hash_count);
+        // A hash whose every field has expired is gone, so EXISTS/TYPE/DEL and
+        // the key-level TTL commands must see it that way too.
+        s = read_hash_cardinality_live(txn, user_key, hash_count);
         if (!s.ok() || hash_count > 0) {
             exists = hash_count > 0;
             return s;
@@ -3981,7 +4257,7 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                     continue;
                 }
                 int64_t hash_count = 0;
-                s = read_hash_cardinality(txn, user_key, hash_count);
+                s = read_hash_cardinality_live(txn, user_key, hash_count);
                 result.success = s.ok();
                 result.value_present = true;
                 result.int_value = string_exists ? 1
@@ -4081,6 +4357,9 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                 std::vector<std::string> list_values;
                 std::map<std::string, double> zset_values;
                 std::map<std::string, std::string> hash_entries;
+                // RENAME and COPY move the whole object, so the per-field
+                // expirations travel with the fields.
+                std::map<std::string, int64_t> hash_field_ttls;
                 if (string_exists) {
                     bool exists = false;
                     s = read_internal_current(txn, source_storage_key, string_value, exists);
@@ -4097,6 +4376,9 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                     s = collect_zset_values(txn, user_key, zset_values);
                 } else {
                     s = collect_hash_entries(txn, user_key, hash_entries);
+                    if (s.ok()) {
+                        s = collect_hash_field_ttls(txn, user_key, hash_field_ttls);
+                    }
                 }
                 int64_t source_expire_at_ms = -1;
                 bool source_ttl_exists = false;
@@ -4188,6 +4470,15 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                         }
                         batch_exists[field_key] = true;
                         batch_values[field_key] = value;
+                    }
+                    for (const auto& [field, expire_at_ms] : hash_field_ttls) {
+                        if (!s.ok()) {
+                            break;
+                        }
+                        if (hash_entries.find(field) == hash_entries.end()) {
+                            continue;
+                        }
+                        s = write_hash_field_ttl(txn, destination, field, expire_at_ms);
                     }
                     if (s.ok()) {
                         s = write_hash_cardinality(txn, destination, static_cast<int64_t>(hash_entries.size()));
@@ -4297,6 +4588,9 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                 std::vector<std::string> list_values;
                 std::map<std::string, double> zset_values;
                 std::map<std::string, std::string> hash_entries;
+                // RENAME and COPY move the whole object, so the per-field
+                // expirations travel with the fields.
+                std::map<std::string, int64_t> hash_field_ttls;
                 if (string_exists) {
                     bool exists = false;
                     s = read_internal_current(txn, source_storage_key, string_value, exists);
@@ -4314,6 +4608,9 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                     s = collect_zset_values(txn, user_key, zset_values);
                 } else {
                     s = collect_hash_entries(txn, user_key, hash_entries);
+                    if (s.ok()) {
+                        s = collect_hash_field_ttls(txn, user_key, hash_field_ttls);
+                    }
                 }
                 int64_t source_expire_at_ms = -1;
                 bool source_ttl_exists = false;
@@ -4387,6 +4684,15 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                         batch_exists[field_key] = true;
                         batch_values[field_key] = value;
                     }
+                    for (const auto& [field, expire_at_ms] : hash_field_ttls) {
+                        if (!s.ok()) {
+                            break;
+                        }
+                        if (hash_entries.find(field) == hash_entries.end()) {
+                            continue;
+                        }
+                        s = write_hash_field_ttl(txn, destination, field, expire_at_ms);
+                    }
                     if (s.ok()) {
                         s = write_hash_cardinality(txn, destination, static_cast<int64_t>(hash_entries.size()));
                     }
@@ -4417,7 +4723,8 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                 }
                 int64_t hash_count = 0;
                 if (s.ok()) {
-                    s = read_hash_cardinality(txn, user_key, hash_count);
+                    // DUMP must not serialize a field whose time has passed.
+                    s = read_hash_cardinality_live(txn, user_key, hash_count);
                 }
                 int64_t set_count = 0;
                 if (s.ok()) {
@@ -5173,7 +5480,20 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                     if (!s.ok()) {
                         break;
                     }
-                    if ((op.flags & TXN_FLAG_SET_NX) != 0 && exists) {
+                    int64_t field_expire_at_ms = 0;
+                    bool field_ttl_exists = false;
+                    s = read_hash_field_ttl(txn, user_key, field, field_expire_at_ms, field_ttl_exists);
+                    if (!s.ok()) {
+                        break;
+                    }
+                    // A field whose time has passed counts as absent, so HSET
+                    // reports it as added and HSETNX writes over it. The record
+                    // is overwritten in place rather than deleted first:
+                    // deleting and re-inserting one storage key inside a single
+                    // Mako transaction leaves that key unreadable.
+                    const bool live =
+                        exists && !(field_ttl_exists && field_expire_at_ms <= now_unix_ms());
+                    if ((op.flags & TXN_FLAG_SET_NX) != 0 && live) {
                         continue;
                     }
                     s = put_raw(txn, field_key, value);
@@ -5182,8 +5502,20 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                     }
                     batch_exists[field_key] = true;
                     batch_values[field_key] = value;
-                    if (!exists) {
+                    if (field_ttl_exists) {
+                        // Redis 7.4 discards a field's expiration whenever its
+                        // value is overwritten.
+                        s = clear_hash_field_ttl(txn, user_key, field);
+                        if (!s.ok()) {
+                            break;
+                        }
+                    }
+                    if (!live) {
                         ++added;
+                    }
+                    // The cardinality counts stored records, and an expired
+                    // field still had one, so it only grows for a new record.
+                    if (!exists) {
                         ++cardinality;
                     }
                 }
@@ -5207,6 +5539,13 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                     continue;
                 }
                 std::string field(reinterpret_cast<const char*>(op.val_ptr), op.val_len);
+                bool expired = false;
+                s = expire_hash_field_if_needed(txn, user_key, field, expired);
+                if (!s.ok()) {
+                    result.success = false;
+                    all_success = false;
+                    continue;
+                }
                 std::string value;
                 bool exists = false;
                 s = read_internal_current(txn, hash_field_storage_key(user_key, field), value, exists);
@@ -5235,6 +5574,11 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                 std::vector<std::string> payload_items;
                 payload_items.reserve(fields.size() * 2);
                 for (const auto& field : fields) {
+                    bool expired = false;
+                    s = expire_hash_field_if_needed(txn, user_key, field, expired);
+                    if (!s.ok()) {
+                        break;
+                    }
                     std::string value;
                     bool exists = false;
                     s = read_internal_current(txn, hash_field_storage_key(user_key, field), value, exists);
@@ -5262,6 +5606,15 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                     continue;
                 }
                 if (!allowed) {
+                    continue;
+                }
+                // HGETALL/HKEYS/HVALS/HSCAN and HRANDFIELD (which shares this
+                // op) must not report a field whose time has passed: one sweep
+                // of the TTL prefix drops them before the entries are read.
+                s = expire_hash_fields_due(txn, user_key);
+                if (!s.ok()) {
+                    result.success = false;
+                    all_success = false;
                     continue;
                 }
                 std::map<std::string, std::string> entries;
@@ -5333,6 +5686,21 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                     }
                     batch_exists[field_key] = false;
                     batch_values.erase(field_key);
+                    // Redis deliberately does not skip an already-expired field
+                    // here -- HDEL still reports it as deleted -- but the side
+                    // key has to go with the field either way.
+                    int64_t field_expire_at_ms = 0;
+                    bool field_ttl_exists = false;
+                    s = read_hash_field_ttl(txn, user_key, field, field_expire_at_ms, field_ttl_exists);
+                    if (!s.ok()) {
+                        break;
+                    }
+                    if (field_ttl_exists) {
+                        s = clear_hash_field_ttl(txn, user_key, field);
+                        if (!s.ok()) {
+                            break;
+                        }
+                    }
                     ++removed;
                     --cardinality;
                 }
@@ -5359,6 +5727,13 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                     continue;
                 }
                 std::string field(reinterpret_cast<const char*>(op.val_ptr), op.val_len);
+                bool expired = false;
+                s = expire_hash_field_if_needed(txn, user_key, field, expired);
+                if (!s.ok()) {
+                    result.success = false;
+                    all_success = false;
+                    continue;
+                }
                 std::string value;
                 bool exists = false;
                 s = read_internal_current(txn, hash_field_storage_key(user_key, field), value, exists);
@@ -5381,7 +5756,7 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                     continue;
                 }
                 int64_t cardinality = 0;
-                s = read_hash_cardinality(txn, user_key, cardinality);
+                s = read_hash_cardinality_live(txn, user_key, cardinality);
                 result.success = s.ok();
                 result.value_present = true;
                 result.int_value = s.ok() ? cardinality : 0;
@@ -5412,12 +5787,28 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                     all_success = false;
                     continue;
                 }
+                int64_t field_expire_at_ms = 0;
+                bool field_ttl_exists = false;
+                s = read_hash_field_ttl(txn, user_key, field, field_expire_at_ms, field_ttl_exists);
+                if (!s.ok()) {
+                    result.success = false;
+                    all_success = false;
+                    continue;
+                }
+                // An expired field is discarded and the increment starts from
+                // zero again; a live one keeps its expiration, because HINCRBY
+                // changes the value and not the time. The stale record is
+                // overwritten in place, never deleted and re-inserted inside
+                // the same transaction.
+                const bool field_expired =
+                    field_ttl_exists && field_expire_at_ms <= now_unix_ms();
+                const bool live = exists && !field_expired;
                 std::string next_str;
                 if (op.op == TXN_OP_HINCRBY) {
                     int64_t base = 0;
                     int64_t delta = 0;
                     int64_t next = 0;
-                    if ((exists && !parse_int64(current, base)) || !parse_int64(parts[1], delta)) {
+                    if ((live && !parse_int64(current, base)) || !parse_int64(parts[1], delta)) {
                         result.success = false;
                         result.int_value = -1;
                         continue;
@@ -5432,7 +5823,7 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                 } else {
                     long double base = 0;
                     long double delta = 0;
-                    if ((exists && !parse_float(current, base)) || !parse_float(parts[1], delta)) {
+                    if ((live && !parse_float(current, base)) || !parse_float(parts[1], delta)) {
                         result.success = false;
                         result.int_value = -3;
                         continue;
@@ -5449,7 +5840,12 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                 if (s.ok()) {
                     batch_exists[field_key] = true;
                     batch_values[field_key] = next_str;
-                    if (!exists) {
+                    if (field_expired) {
+                        s = clear_hash_field_ttl(txn, user_key, field);
+                    }
+                    // The cardinality counts stored records, and an expired
+                    // field still had one, so it only grows for a new record.
+                    if (s.ok() && !exists) {
                         int64_t cardinality = 0;
                         s = read_hash_cardinality(txn, user_key, cardinality);
                         if (s.ok()) {
@@ -5462,6 +5858,184 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                 if (!s.ok()) {
                     all_success = false;
                 } else if (op.op == TXN_OP_HINCRBYFLOAT && !copy_result_value(result, next_str)) {
+                    all_success = false;
+                }
+            } else if (op.op == TXN_OP_HFIELD_EXPIRE) {
+                // HEXPIRE/HPEXPIRE/HEXPIREAT/HPEXPIREAT. Rust has already
+                // turned the requested time into absolute Unix ms in
+                // op.expire_at_ms and packed [mode, field ...] into the value.
+                std::vector<std::string> parts;
+                if (!unpack_bytes_list(op.val_ptr, op.val_len, parts) || parts.empty()) {
+                    all_success = false;
+                    continue;
+                }
+                bool allowed = false;
+                mako::Status s = hash_key_allowed(txn, user_key, result, allowed);
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                if (!allowed) {
+                    continue;
+                }
+                const std::string& mode = parts[0];
+                const int64_t now_ms = now_unix_ms();
+                std::vector<std::string> codes;
+                codes.reserve(parts.size() - 1);
+                for (size_t index = 1; index < parts.size(); ++index) {
+                    const std::string& field = parts[index];
+                    bool expired = false;
+                    s = expire_hash_field_if_needed(txn, user_key, field, expired);
+                    if (!s.ok()) {
+                        break;
+                    }
+                    std::string ignored;
+                    bool field_exists = false;
+                    s = read_internal_current(
+                        txn, hash_field_storage_key(user_key, field), ignored, field_exists);
+                    if (!s.ok()) {
+                        break;
+                    }
+                    if (!field_exists) {
+                        codes.push_back("-2");
+                        continue;
+                    }
+                    int64_t current_expire_at_ms = 0;
+                    bool ttl_exists = false;
+                    s = read_hash_field_ttl(txn, user_key, field, current_expire_at_ms, ttl_exists);
+                    if (!s.ok()) {
+                        break;
+                    }
+                    bool should_update = true;
+                    if (mode == "NX") {
+                        should_update = !ttl_exists;
+                    } else if (mode == "XX") {
+                        should_update = ttl_exists;
+                    } else if (mode == "GT") {
+                        should_update = ttl_exists && op.expire_at_ms > current_expire_at_ms;
+                    } else if (mode == "LT") {
+                        should_update = !ttl_exists || op.expire_at_ms < current_expire_at_ms;
+                    }
+                    if (!should_update) {
+                        codes.push_back("0");
+                        continue;
+                    }
+                    if (op.expire_at_ms > now_ms) {
+                        s = write_hash_field_ttl(txn, user_key, field, op.expire_at_ms);
+                        if (!s.ok()) {
+                            break;
+                        }
+                        codes.push_back("1");
+                        continue;
+                    }
+                    // The time is already past, so Redis deletes the field now
+                    // and answers 2 instead of storing an expiration.
+                    if (ttl_exists) {
+                        s = clear_hash_field_ttl(txn, user_key, field);
+                        if (!s.ok()) {
+                            break;
+                        }
+                    }
+                    std::string field_key = hash_field_storage_key(user_key, field);
+                    s = delete_raw_if_exists(txn, field_key);
+                    if (!s.ok()) {
+                        break;
+                    }
+                    batch_exists[field_key] = false;
+                    batch_values.erase(field_key);
+                    int64_t cardinality = 0;
+                    s = read_hash_cardinality(txn, user_key, cardinality);
+                    if (!s.ok()) {
+                        break;
+                    }
+                    cardinality -= 1;
+                    s = write_hash_cardinality(txn, user_key, cardinality);
+                    if (!s.ok()) {
+                        break;
+                    }
+                    if (cardinality <= 0) {
+                        s = delete_hash(txn, user_key);
+                        if (s.ok()) {
+                            s = clear_ttl_meta(txn, user_key);
+                        }
+                        if (!s.ok()) {
+                            break;
+                        }
+                    }
+                    codes.push_back("2");
+                }
+                if (!s.ok()) {
+                    result.success = false;
+                    all_success = false;
+                    continue;
+                }
+                result.success = true;
+                if (!copy_result_value(result, pack_bytes_list(codes))) {
+                    all_success = false;
+                }
+            } else if (op.op == TXN_OP_HFIELD_TTL || op.op == TXN_OP_HFIELD_PERSIST) {
+                // HTTL/HPTTL/HEXPIRETIME/HPEXPIRETIME report the absolute time
+                // and let Rust convert it; HPERSIST removes it.
+                std::vector<std::string> fields;
+                if (!unpack_bytes_list(op.val_ptr, op.val_len, fields)) {
+                    all_success = false;
+                    continue;
+                }
+                bool allowed = false;
+                mako::Status s = hash_key_allowed(txn, user_key, result, allowed);
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                if (!allowed) {
+                    continue;
+                }
+                std::vector<std::string> codes;
+                codes.reserve(fields.size());
+                for (const auto& field : fields) {
+                    bool expired = false;
+                    s = expire_hash_field_if_needed(txn, user_key, field, expired);
+                    if (!s.ok()) {
+                        break;
+                    }
+                    std::string ignored;
+                    bool field_exists = false;
+                    s = read_internal_current(
+                        txn, hash_field_storage_key(user_key, field), ignored, field_exists);
+                    if (!s.ok()) {
+                        break;
+                    }
+                    if (!field_exists) {
+                        codes.push_back("-2");
+                        continue;
+                    }
+                    int64_t expire_at_ms = 0;
+                    bool ttl_exists = false;
+                    s = read_hash_field_ttl(txn, user_key, field, expire_at_ms, ttl_exists);
+                    if (!s.ok()) {
+                        break;
+                    }
+                    if (!ttl_exists) {
+                        codes.push_back("-1");
+                        continue;
+                    }
+                    if (op.op == TXN_OP_HFIELD_TTL) {
+                        codes.push_back(std::to_string(expire_at_ms));
+                        continue;
+                    }
+                    s = clear_hash_field_ttl(txn, user_key, field);
+                    if (!s.ok()) {
+                        break;
+                    }
+                    codes.push_back("1");
+                }
+                if (!s.ok()) {
+                    result.success = false;
+                    all_success = false;
+                    continue;
+                }
+                result.success = true;
+                if (!copy_result_value(result, pack_bytes_list(codes))) {
                     all_success = false;
                 }
             } else if (op.op == TXN_OP_SADD) {

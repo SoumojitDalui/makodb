@@ -149,6 +149,14 @@ const TXN_OP_HLL_ADD: u32 = 79;
 const TXN_OP_HLL_COUNT: u32 = 80;
 const TXN_OP_HLL_MERGE: u32 = 81;
 const TXN_OP_BITFIELD: u32 = 82;
+const TXN_OP_HFIELD_EXPIRE: u32 = 83;
+const TXN_OP_HFIELD_TTL: u32 = 84;
+const TXN_OP_HFIELD_PERSIST: u32 = 85;
+
+/// Redis stores a hash field's expiration in 46 bits of absolute Unix
+/// milliseconds (`EB_EXPIRE_TIME_MAX` in `ebuckets.h`), and every command of
+/// the HEXPIRE family refuses a time past it.
+const HASH_FIELD_EXPIRE_TIME_MAX_MS: i64 = (1i64 << 46) - 1;
 
 /// Mirrors TXN_HLL_ERR_NOT_HLL in transaction_ffi.h: an HLL op reports a key
 /// holding a string that is not a valid sketch through int_value.
@@ -567,6 +575,22 @@ enum OpCode {
     // spellings: they differ only in argument syntax, and the shape they search
     // with plus the requested output columns live in `Command::geo`.
     GeoSearch = 186,
+    // Redis 7.4 hash field expiration. One opcode per command: they differ in
+    // the time unit, in whether the argument is relative or absolute, and in
+    // how the reply is formatted, and keeping them apart lets the reply arm
+    // convert without a second field on `Command`. HEXPIRE/HPEXPIRE/HEXPIREAT/
+    // HPEXPIREAT all build TXN_OP_HFIELD_EXPIRE, HTTL/HPTTL/HEXPIRETIME/
+    // HPEXPIRETIME all build TXN_OP_HFIELD_TTL, HPERSIST builds
+    // TXN_OP_HFIELD_PERSIST.
+    HExpire = 187,
+    HPExpire = 188,
+    HExpireAt = 189,
+    HPExpireAt = 190,
+    HTtl = 191,
+    HPTtl = 192,
+    HExpireTime = 193,
+    HPExpireTime = 194,
+    HPersist = 195,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -1247,6 +1271,24 @@ fn parse_opcode(name: &[u8]) -> Option<OpCode> {
         Some(OpCode::HRandField)
     } else if ascii_eq_ci(name, b"HSCAN") {
         Some(OpCode::HScan)
+    } else if ascii_eq_ci(name, b"HEXPIRE") {
+        Some(OpCode::HExpire)
+    } else if ascii_eq_ci(name, b"HPEXPIRE") {
+        Some(OpCode::HPExpire)
+    } else if ascii_eq_ci(name, b"HEXPIREAT") {
+        Some(OpCode::HExpireAt)
+    } else if ascii_eq_ci(name, b"HPEXPIREAT") {
+        Some(OpCode::HPExpireAt)
+    } else if ascii_eq_ci(name, b"HTTL") {
+        Some(OpCode::HTtl)
+    } else if ascii_eq_ci(name, b"HPTTL") {
+        Some(OpCode::HPTtl)
+    } else if ascii_eq_ci(name, b"HEXPIRETIME") {
+        Some(OpCode::HExpireTime)
+    } else if ascii_eq_ci(name, b"HPEXPIRETIME") {
+        Some(OpCode::HPExpireTime)
+    } else if ascii_eq_ci(name, b"HPERSIST") {
+        Some(OpCode::HPersist)
     } else if ascii_eq_ci(name, b"TYPE") {
         Some(OpCode::Type)
     } else if ascii_eq_ci(name, b"WAIT") {
@@ -1549,8 +1591,73 @@ fn invalid_expire_error(command: &'static str) -> ParseError {
         "pexpire" => "invalid expire time in 'pexpire' command",
         "expireat" => "invalid expire time in 'expireat' command",
         "pexpireat" => "invalid expire time in 'pexpireat' command",
+        "hexpire" => "invalid expire time in 'hexpire' command",
+        "hpexpire" => "invalid expire time in 'hpexpire' command",
+        "hexpireat" => "invalid expire time in 'hexpireat' command",
+        "hpexpireat" => "invalid expire time in 'hpexpireat' command",
         _ => "invalid expire time",
     })
+}
+
+/// Absolute Unix ms for one HEXPIRE-family argument, with Redis's checks in
+/// Redis's order: negative first, then the unit's own ceiling, then the
+/// ceiling on the resulting absolute time.
+fn hash_field_expire_at_ms(
+    raw: &[u8],
+    seconds: bool,
+    absolute: bool,
+    command: &'static str,
+) -> Result<i64, ParseError> {
+    let text = std::str::from_utf8(raw).map_err(|_| integer_error())?;
+    let amount: i64 = text.parse().map_err(|_| integer_error())?;
+    if amount < 0 {
+        return Err(ParseError::Error("invalid expire time, must be >= 0"));
+    }
+    let ceiling = if seconds {
+        HASH_FIELD_EXPIRE_TIME_MAX_MS / 1000
+    } else {
+        HASH_FIELD_EXPIRE_TIME_MAX_MS
+    };
+    if amount > ceiling {
+        return Err(invalid_expire_error(command));
+    }
+    let requested_ms = if seconds { amount * 1000 } else { amount };
+    let basetime = if absolute { 0 } else { unix_time_ms() };
+    if requested_ms > HASH_FIELD_EXPIRE_TIME_MAX_MS - basetime {
+        return Err(invalid_expire_error(command));
+    }
+    Ok(requested_ms + basetime)
+}
+
+/// The `FIELDS numfields field [field ...]` tail every HEXPIRE-family command
+/// ends with. `fields_at` is the index of the FIELDS token itself, which the
+/// caller has already matched.
+fn parse_hash_fields_tail(
+    parts: &[BytesFrame],
+    fields_at: usize,
+) -> Result<Vec<Bytes>, ParseError> {
+    const BAD_COUNT: &str = "Parameter `numFields` should be greater than 0";
+    const MISMATCH: &str = "The `numfields` parameter must match the number of arguments";
+    if fields_at + 1 >= parts.len() {
+        return Err(ParseError::Error(BAD_COUNT));
+    }
+    let raw = part_to_bytes(&parts[fields_at + 1])?;
+    let count: i64 = std::str::from_utf8(raw.as_ref())
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .ok_or(ParseError::Error(BAD_COUNT))?;
+    if count <= 0 {
+        return Err(ParseError::Error(BAD_COUNT));
+    }
+    let given = (parts.len() - fields_at - 2) as i64;
+    if count != given {
+        return Err(ParseError::Error(MISMATCH));
+    }
+    let mut fields = Vec::with_capacity(given as usize);
+    for part in parts.iter().skip(fields_at + 2) {
+        fields.push(part_to_bytes(part)?);
+    }
+    Ok(fields)
 }
 
 fn integer_error() -> ParseError {
@@ -3466,6 +3573,100 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 }
                 cmd.set_return_old = true;
             }
+            Ok(cmd)
+        }
+        OpCode::HExpire | OpCode::HPExpire | OpCode::HExpireAt | OpCode::HPExpireAt => {
+            // <cmd> key ttl [NX|XX|GT|LT] FIELDS numfields field [field ...]
+            let (name, seconds, absolute) = match op {
+                OpCode::HExpire => ("hexpire", true, false),
+                OpCode::HPExpire => ("hpexpire", false, false),
+                OpCode::HExpireAt => ("hexpireat", true, true),
+                _ => ("hpexpireat", false, true),
+            };
+            if parts.len() < 6 {
+                return Err(wrong_arity(name));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            let ttl = part_to_bytes(&parts[2])?;
+            // Redis reads at most one condition here, between the time and
+            // FIELDS. A second one is reported as incompatible when it cannot
+            // be combined, and otherwise falls through to the FIELDS check.
+            let condition = part_to_bytes(&parts[3])?;
+            let (mode, fields_at): (&'static [u8], usize) =
+                if ascii_eq_ci(condition.as_ref(), b"NX") {
+                    (b"NX", 4)
+                } else if ascii_eq_ci(condition.as_ref(), b"XX") {
+                    (b"XX", 4)
+                } else if ascii_eq_ci(condition.as_ref(), b"GT") {
+                    (b"GT", 4)
+                } else if ascii_eq_ci(condition.as_ref(), b"LT") {
+                    (b"LT", 4)
+                } else {
+                    (b"NONE", 3)
+                };
+            if fields_at == 4 && fields_at < parts.len() {
+                let next = part_to_bytes(&parts[fields_at])?;
+                if let Ok(second) = parse_expire_modifier(next.as_ref()) {
+                    let first = parse_expire_modifier(mode)?;
+                    validate_expire_flags(first | second)?;
+                }
+            }
+            if fields_at >= parts.len()
+                || !ascii_eq_ci(part_to_bytes(&parts[fields_at])?.as_ref(), b"FIELDS")
+            {
+                return Err(ParseError::Error(
+                    "Mandatory argument FIELDS is missing or not at the right position",
+                ));
+            }
+            let fields = parse_hash_fields_tail(&parts, fields_at)?;
+            let expire_at_ms = hash_field_expire_at_ms(ttl.as_ref(), seconds, absolute, name)?;
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            // The executor receives [mode, field ...]; the time is absolute in
+            // `expire_at_ms`, so C++ never has to know the unit or the basetime.
+            let mut values = Vec::with_capacity(fields.len() + 1);
+            values.push(Bytes::from_static(mode));
+            values.extend(fields);
+            cmd.values = values;
+            cmd.expire_at_ms = expire_at_ms;
+            Ok(cmd)
+        }
+        OpCode::HTtl
+        | OpCode::HPTtl
+        | OpCode::HExpireTime
+        | OpCode::HPExpireTime
+        | OpCode::HPersist => {
+            // <cmd> key FIELDS numfields field [field ...]
+            let name = match op {
+                OpCode::HTtl => "httl",
+                OpCode::HPTtl => "hpttl",
+                OpCode::HExpireTime => "hexpiretime",
+                OpCode::HPExpireTime => "hpexpiretime",
+                _ => "hpersist",
+            };
+            if parts.len() < 5 {
+                return Err(wrong_arity(name));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            if !ascii_eq_ci(part_to_bytes(&parts[2])?.as_ref(), b"FIELDS") {
+                return Err(ParseError::Error(
+                    "Mandatory argument FIELDS is missing or not at the right position",
+                ));
+            }
+            let fields = parse_hash_fields_tail(&parts, 2)?;
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values = fields;
             Ok(cmd)
         }
         OpCode::HScan => {
@@ -6880,6 +7081,43 @@ fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)
                     group_id: 0,
                 });
             }
+            OpCode::HExpire
+            | OpCode::HPExpire
+            | OpCode::HExpireAt
+            | OpCode::HPExpireAt
+            | OpCode::HTtl
+            | OpCode::HPTtl
+            | OpCode::HExpireTime
+            | OpCode::HPExpireTime
+            | OpCode::HPersist => {
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                // One op for the whole field list so the per-field reads,
+                // condition checks and writes stay inside one Mako transaction.
+                let op_code = match cmd.op {
+                    OpCode::HPersist => TXN_OP_HFIELD_PERSIST,
+                    OpCode::HTtl
+                    | OpCode::HPTtl
+                    | OpCode::HExpireTime
+                    | OpCode::HPExpireTime => TXN_OP_HFIELD_TTL,
+                    _ => TXN_OP_HFIELD_EXPIRE,
+                };
+                let payload = pack_bytes_list(&cmd.values);
+                payloads.push(payload);
+                let payload = payloads.last().unwrap();
+                ops.push(TxnOperation {
+                    op: op_code,
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr: payload.as_ptr(),
+                    val_len: payload.len(),
+                    flags: 0,
+                    expire_at_ms: cmd.expire_at_ms,
+                    group_id: 0,
+                });
+            }
             OpCode::HGet | OpCode::HExists | OpCode::HStrLen => {
                 let (Some(key), Some(value)) = (cmd.keys.first(), cmd.val.as_ref()) else {
                     spans.push((start, 0));
@@ -7663,6 +7901,15 @@ fn command_needs_retry(cmd: &Command) -> bool {
             | OpCode::HIncrByFloat
             | OpCode::HRandField
             | OpCode::HScan
+            | OpCode::HExpire
+            | OpCode::HPExpire
+            | OpCode::HExpireAt
+            | OpCode::HPExpireAt
+            | OpCode::HTtl
+            | OpCode::HPTtl
+            | OpCode::HExpireTime
+            | OpCode::HPExpireTime
+            | OpCode::HPersist
             | OpCode::SAdd
             | OpCode::SMembers
             | OpCode::SIsMember
@@ -9534,6 +9781,45 @@ fn write_command_result<W: Write>(
                 write_wrongtype(writer)?;
             }
         }
+        OpCode::HExpire
+        | OpCode::HPExpire
+        | OpCode::HExpireAt
+        | OpCode::HPExpireAt
+        | OpCode::HTtl
+        | OpCode::HPTtl
+        | OpCode::HExpireTime
+        | OpCode::HPExpireTime
+        | OpCode::HPersist => {
+            if !first.success {
+                write_wrongtype(writer)?;
+            } else {
+                // One packed decimal per field, in order. The HEXPIRE and
+                // HPERSIST families already carry their reply codes; the TTL
+                // family carries the absolute Unix ms of a field that has an
+                // expiration, and the negative codes -1 and -2 otherwise.
+                let items = parse_list_payload(result_value_bytes(first)).unwrap_or_default();
+                write_array_header(writer, items.len())?;
+                let now_ms = unix_time_ms();
+                for item in items {
+                    let raw = parse_i64_lossy(&item).unwrap_or(-2);
+                    let value = if raw < 0 {
+                        raw
+                    } else {
+                        // Redis converts with the same rounding as TTL: the
+                        // second-granularity replies round the remaining or
+                        // absolute milliseconds up.
+                        match cmd.op {
+                            OpCode::HTtl => (raw + 999 - now_ms) / 1000,
+                            OpCode::HPTtl => raw - now_ms,
+                            OpCode::HExpireTime => (raw + 999) / 1000,
+                            OpCode::HPExpireTime => raw,
+                            _ => raw,
+                        }
+                    };
+                    write_integer(writer, value)?;
+                }
+            }
+        }
         OpCode::HGet | OpCode::HIncrByFloat => {
             if !first.success && cmd.op == OpCode::HIncrByFloat && first.int_value == -3 {
                 write_err(
@@ -10610,6 +10896,12 @@ fn is_dirty_command(op: OpCode) -> bool {
             | OpCode::Sort
             | OpCode::BitOp
             | OpCode::BitField
+            // HTTL/HPTTL/HEXPIRETIME/HPEXPIRETIME are reads, so they stay out.
+            | OpCode::HExpire
+            | OpCode::HPExpire
+            | OpCode::HExpireAt
+            | OpCode::HPExpireAt
+            | OpCode::HPersist
             | OpCode::PfAdd
             | OpCode::PfMerge
             | OpCode::Del
@@ -13759,6 +14051,15 @@ fn handle_command<W: Write>(
         | OpCode::HIncrByFloat
         | OpCode::HRandField
         | OpCode::HScan
+        | OpCode::HExpire
+        | OpCode::HPExpire
+        | OpCode::HExpireAt
+        | OpCode::HPExpireAt
+        | OpCode::HTtl
+        | OpCode::HPTtl
+        | OpCode::HExpireTime
+        | OpCode::HPExpireTime
+        | OpCode::HPersist
         | OpCode::SAdd
         | OpCode::SMembers
         | OpCode::SIsMember
@@ -15373,6 +15674,126 @@ $2\r\nkm\r\n$5\r\nCOUNT\r\n$1\r\n1\r\n$3\r\nANY\r\n$4\r\nDESC\r\n$8\r\nWITHHASH\
         );
         // GEOSEARCHSTORE is deliberately not recognized in this package.
         assert!(parse_opcode(b"GEOSEARCHSTORE").is_none());
+    }
+
+    #[test]
+    fn hash_field_expire_builds_one_op_with_mode_and_fields() {
+        // HEXPIRE key 10 FIELDS 2 f1 f2: no condition, so the mode is NONE and
+        // the relative seconds become absolute milliseconds.
+        let before = unix_time_ms();
+        let cmd = parse_one(
+            b"*7\r\n$7\r\nHEXPIRE\r\n$1\r\nh\r\n$2\r\n10\r\n$6\r\nFIELDS\r\n$1\r\n2\r\n\
+$2\r\nf1\r\n$2\r\nf2\r\n",
+        );
+        assert!(cmd.op == OpCode::HExpire);
+        assert_eq!(cmd.keys, vec![Bytes::from_static(b"h")]);
+        assert!(cmd.expire_at_ms >= before + 10_000);
+        assert!(cmd.expire_at_ms <= unix_time_ms() + 10_000);
+        let (ops, spans, payloads) = build_txn_ops(std::slice::from_ref(&cmd));
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, TXN_OP_HFIELD_EXPIRE);
+        assert_eq!(ops[0].expire_at_ms, cmd.expire_at_ms);
+        assert_eq!(spans, vec![(0, 1)]);
+        assert_eq!(
+            parse_list_payload(&payloads[0]).unwrap(),
+            vec![b"NONE".to_vec(), b"f1".to_vec(), b"f2".to_vec()]
+        );
+
+        // A condition shifts FIELDS by one and travels as the first payload
+        // item. HPEXPIREAT takes the time as it stands.
+        let cmd = parse_one(
+            b"*7\r\n$10\r\nHPEXPIREAT\r\n$1\r\nh\r\n$4\r\n5000\r\n$2\r\nlt\r\n$6\r\nFIELDS\r\n\
+$1\r\n1\r\n$2\r\nf1\r\n",
+        );
+        assert!(cmd.op == OpCode::HPExpireAt);
+        assert_eq!(cmd.expire_at_ms, 5000);
+        assert_eq!(
+            parse_list_payload(&build_txn_ops(std::slice::from_ref(&cmd)).2[0]).unwrap(),
+            vec![b"LT".to_vec(), b"f1".to_vec()]
+        );
+
+        // HTTL and HPERSIST carry only the fields, and HTTL is a read.
+        let httl = parse_one(
+            b"*5\r\n$4\r\nHTTL\r\n$1\r\nh\r\n$6\r\nFIELDS\r\n$1\r\n1\r\n$2\r\nf1\r\n",
+        );
+        let (ops, _, payloads) = build_txn_ops(std::slice::from_ref(&httl));
+        assert_eq!(ops[0].op, TXN_OP_HFIELD_TTL);
+        assert_eq!(parse_list_payload(&payloads[0]).unwrap(), vec![b"f1".to_vec()]);
+        assert!(!is_dirty_command(OpCode::HTtl));
+        assert!(command_needs_retry(&httl));
+
+        let hpersist = parse_one(
+            b"*5\r\n$8\r\nHPERSIST\r\n$1\r\nh\r\n$6\r\nFIELDS\r\n$1\r\n1\r\n$2\r\nf1\r\n",
+        );
+        assert_eq!(
+            build_txn_ops(std::slice::from_ref(&hpersist)).0[0].op,
+            TXN_OP_HFIELD_PERSIST
+        );
+        assert!(is_dirty_command(OpCode::HPersist));
+        assert!(is_dirty_command(OpCode::HExpire));
+        assert!(command_needs_retry(&hpersist));
+    }
+
+    #[test]
+    fn hash_field_expire_rejects_malformed_arguments() {
+        assert_eq!(
+            run_raw(b"*5\r\n$7\r\nHEXPIRE\r\n$1\r\nh\r\n$2\r\n10\r\n$6\r\nFIELDS\r\n$1\r\n1\r\n"),
+            b"-ERR wrong number of arguments for 'hexpire' command\r\n"
+        );
+        assert_eq!(
+            run_raw(b"*4\r\n$8\r\nHPERSIST\r\n$1\r\nh\r\n$6\r\nFIELDS\r\n$1\r\n1\r\n"),
+            b"-ERR wrong number of arguments for 'hpersist' command\r\n"
+        );
+        assert_eq!(
+            run_raw(
+                b"*6\r\n$7\r\nHEXPIRE\r\n$1\r\nh\r\n$2\r\n10\r\n$6\r\nFIELDS\r\n$1\r\n0\r\n$2\r\nf1\r\n"
+            ),
+            "-ERR Parameter `numFields` should be greater than 0\r\n".as_bytes()
+        );
+        assert_eq!(
+            run_raw(
+                b"*6\r\n$7\r\nHEXPIRE\r\n$1\r\nh\r\n$2\r\n10\r\n$6\r\nFIELDS\r\n$1\r\n2\r\n$2\r\nf1\r\n"
+            ),
+            "-ERR The `numfields` parameter must match the number of arguments\r\n".as_bytes()
+        );
+        assert_eq!(
+            run_raw(
+                b"*6\r\n$7\r\nHEXPIRE\r\n$1\r\nh\r\n$2\r\n10\r\n$5\r\nWRONG\r\n$1\r\n1\r\n$2\r\nf1\r\n"
+            ),
+            b"-ERR Mandatory argument FIELDS is missing or not at the right position\r\n"
+        );
+        assert_eq!(
+            run_raw(
+                b"*6\r\n$7\r\nHEXPIRE\r\n$1\r\nh\r\n$2\r\n-1\r\n$6\r\nFIELDS\r\n$1\r\n1\r\n$2\r\nf1\r\n"
+            ),
+            b"-ERR invalid expire time, must be >= 0\r\n"
+        );
+        // Past Redis's 46-bit ceiling on the absolute expiration time.
+        let huge = (1i64 << 48) / 1000;
+        let frame = format!(
+            "*6\r\n$7\r\nHEXPIRE\r\n$1\r\nh\r\n${}\r\n{}\r\n$6\r\nFIELDS\r\n$1\r\n1\r\n$2\r\nf1\r\n",
+            huge.to_string().len(),
+            huge
+        );
+        assert_eq!(
+            run_raw(frame.as_bytes()),
+            b"-ERR invalid expire time in 'hexpire' command\r\n"
+        );
+        // Two conditions that cannot be combined.
+        assert_eq!(
+            run_raw(
+                b"*8\r\n$7\r\nHEXPIRE\r\n$1\r\nh\r\n$2\r\n10\r\n$2\r\nNX\r\n$2\r\nXX\r\n\
+$6\r\nFIELDS\r\n$1\r\n1\r\n$2\r\nf1\r\n"
+            ),
+            b"-ERR NX and XX, GT or LT options at the same time are not compatible\r\n"
+        );
+        assert_eq!(
+            run_raw(
+                b"*8\r\n$7\r\nHEXPIRE\r\n$1\r\nh\r\n$2\r\n10\r\n$2\r\nGT\r\n$2\r\nLT\r\n\
+$6\r\nFIELDS\r\n$1\r\n1\r\n$2\r\nf1\r\n"
+            ),
+            b"-ERR GT and LT options at the same time are not compatible\r\n"
+        );
     }
 
     #[test]

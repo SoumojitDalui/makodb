@@ -562,6 +562,280 @@ def main():
     check("ZRANGE Sicily by geohash score", c.cmd("ZRANGE", "Sicily", "0", "-1"),
           [b"Agrigento", b"Palermo", b"Catania"])
 
+    # ----- Hash field expiration (Redis 7.4 HEXPIRE family) -----
+
+    # Documentation example
+    c.cmd("DEL", "hfe")
+    check("HSET for hfe", c.cmd("HSET", "hfe", "f1", "v1", "f2", "v2", "f3", "v3"), 3)
+    check("HEXPIRE sets one field", c.cmd("HEXPIRE", "hfe", "10", "FIELDS", "1", "f1"), [1])
+    check("HTTL mixes ttl, no-ttl and missing", c.cmd("HTTL", "hfe", "FIELDS", "3", "f1", "f2", "nofield"),
+          pred=lambda g: len(g) == 3 and 8 <= g[0] <= 10 and g[1] == -1 and g[2] == -2)
+    check("HPEXPIRE sets milliseconds", c.cmd("HPEXPIRE", "hfe", "1500", "FIELDS", "1", "f2"), [1])
+    check("HPTTL in range", c.cmd("HPTTL", "hfe", "FIELDS", "1", "f2"),
+          pred=lambda g: len(g) == 1 and 1000 < g[0] <= 1500)
+    now_s = int(time.time())
+    check("HEXPIRETIME is an absolute unix second", c.cmd("HEXPIRETIME", "hfe", "FIELDS", "1", "f1"),
+          pred=lambda g: len(g) == 1 and now_s + 8 <= g[0] <= now_s + 11)
+    check("HPEXPIRETIME is an absolute unix millisecond",
+          c.cmd("HPEXPIRETIME", "hfe", "FIELDS", "1", "f1"),
+          pred=lambda g: len(g) == 1 and (now_s + 8) * 1000 <= g[0] <= (now_s + 11) * 1000)
+    check("HEXPIRETIME and HPEXPIRETIME agree",
+          (c.cmd("HEXPIRETIME", "hfe", "FIELDS", "1", "f1")[0],
+           c.cmd("HPEXPIRETIME", "hfe", "FIELDS", "1", "f1")[0]),
+          pred=lambda g: abs(g[0] * 1000 - g[1]) < 1000)
+    check("HPERSIST removes and reports missing", c.cmd("HPERSIST", "hfe", "FIELDS", "2", "f1", "nofield"),
+          [1, -2])
+    check("HTTL after HPERSIST", c.cmd("HTTL", "hfe", "FIELDS", "1", "f1"), [-1])
+    check("HPERSIST without expiration", c.cmd("HPERSIST", "hfe", "FIELDS", "1", "f1"), [-1])
+
+    # Conditions
+    c.cmd("DEL", "hfc")
+    c.cmd("HSET", "hfc", "f1", "v1", "f2", "v2", "f3", "v3")
+    check("HEXPIRE NX on a field without a TTL", c.cmd("HEXPIRE", "hfc", "100", "NX", "FIELDS", "1", "f1"), [1])
+    check("HEXPIRE NX on a field with a TTL", c.cmd("HEXPIRE", "hfc", "200", "NX", "FIELDS", "1", "f1"), [0])
+    check("HEXPIRE XX on a field with a TTL", c.cmd("HEXPIRE", "hfc", "300", "XX", "FIELDS", "1", "f1"), [1])
+    check("HEXPIRE XX on a field without one", c.cmd("HEXPIRE", "hfc", "300", "XX", "FIELDS", "1", "f2"), [0])
+    check("HEXPIRE GT raises only a larger time",
+          c.cmd("HEXPIRE", "hfc", "400", "GT", "FIELDS", "2", "f1", "f2"), [1, 0])
+    check("HEXPIRE GT refuses a smaller time", c.cmd("HEXPIRE", "hfc", "100", "GT", "FIELDS", "1", "f1"), [0])
+    check("HEXPIRE LT lowers and sets a field with none",
+          c.cmd("HEXPIRE", "hfc", "200", "LT", "FIELDS", "2", "f1", "f2"), [1, 1])
+    check("HEXPIRE LT refuses a larger time", c.cmd("HEXPIRE", "hfc", "900", "LT", "FIELDS", "1", "f1"), [0])
+    check("HEXPIRE mixes a condition with a missing field",
+          c.cmd("HEXPIRE", "hfc", "50", "LT", "FIELDS", "2", "f1", "nofield"), [1, -2])
+
+    # Time in the past deletes the field outright
+    check("HEXPIRE 0 deletes the field", c.cmd("HEXPIRE", "hfe", "0", "FIELDS", "1", "f3"), [2])
+    check("HEXISTS after HEXPIRE 0", c.cmd("HEXISTS", "hfe", "f3"), 0)
+    check("HEXPIREAT in the past deletes the field",
+          c.cmd("HEXPIREAT", "hfe", "1", "FIELDS", "1", "f2"), [2])
+    check("HGET after a past HEXPIREAT", c.cmd("HGET", "hfe", "f2"), None)
+    check("HPEXPIREAT in the past deletes the field",
+          c.cmd("HPEXPIREAT", "hfe", "1000", "FIELDS", "1", "f1"), [2])
+    check("the hash is gone once its last field went", c.cmd("EXISTS", "hfe"), 0)
+
+    # Lazy expiry: an expired field is absent everywhere
+    c.cmd("DEL", "hlazy")
+    c.cmd("HSET", "hlazy", "f1", "v1", "f2", "v2", "f3", "v3")
+    check("HPEXPIRE for the lazy check", c.cmd("HPEXPIRE", "hlazy", "150", "FIELDS", "1", "f1"), [1])
+    time.sleep(0.3)
+    check("HGET of an expired field", c.cmd("HGET", "hlazy", "f1"), None)
+    check("HEXISTS of an expired field", c.cmd("HEXISTS", "hlazy", "f1"), 0)
+    check("HSTRLEN of an expired field", c.cmd("HSTRLEN", "hlazy", "f1"), 0)
+    check("HMGET skips an expired field", c.cmd("HMGET", "hlazy", "f1", "f2"), [None, b"v2"])
+    check("HGETALL omits an expired field", sorted(c.cmd("HGETALL", "hlazy")),
+          sorted([b"f2", b"v2", b"f3", b"v3"]))
+    check("HLEN excludes an expired field", c.cmd("HLEN", "hlazy"), 2)
+    check("HKEYS omits an expired field", sorted(c.cmd("HKEYS", "hlazy")), [b"f2", b"f3"])
+    check("HVALS omits an expired field", sorted(c.cmd("HVALS", "hlazy")), [b"v2", b"v3"])
+    check("HSCAN omits an expired field", sorted(c.cmd("HSCAN", "hlazy", "0")[1]),
+          sorted([b"f2", b"v2", b"f3", b"v3"]))
+    check("HTTL of an expired field reports no field", c.cmd("HTTL", "hlazy", "FIELDS", "1", "f1"), [-2])
+    randomized = set()
+    for _ in range(20):
+        randomized.add(c.cmd("HRANDFIELD", "hlazy"))
+    check("HRANDFIELD never returns an expired field", randomized, pred=lambda g: g == {b"f2", b"f3"})
+    check("HRANDFIELD with a count omits it too", sorted(c.cmd("HRANDFIELD", "hlazy", "10")),
+          [b"f2", b"f3"])
+
+    # The key disappears when its last field expires
+    c.cmd("DEL", "hsolo")
+    c.cmd("HSET", "hsolo", "only", "v")
+    check("HPEXPIRE the only field", c.cmd("HPEXPIRE", "hsolo", "100", "FIELDS", "1", "only"), [1])
+    time.sleep(0.3)
+    check("EXISTS after the last field expired", c.cmd("EXISTS", "hsolo"), 0)
+    check("TYPE after the last field expired", c.cmd("TYPE", "hsolo"), "none")
+    check("HGETALL after the last field expired", c.cmd("HGETALL", "hsolo"), [])
+    check("HLEN after the last field expired", c.cmd("HLEN", "hsolo"), 0)
+
+    # Writes and the field TTL
+    c.cmd("DEL", "hw")
+    c.cmd("HSET", "hw", "f1", "v1", "f2", "10")
+    c.cmd("HEXPIRE", "hw", "100", "FIELDS", "2", "f1", "f2")
+    check("HSET discards the field TTL", c.cmd("HSET", "hw", "f1", "v2"), 0)
+    check("HTTL after the overwrite", c.cmd("HTTL", "hw", "FIELDS", "1", "f1"), [-1])
+    check("HINCRBY preserves the field TTL", c.cmd("HINCRBY", "hw", "f2", "5"), 15)
+    check("HTTL after HINCRBY", c.cmd("HTTL", "hw", "FIELDS", "1", "f2"),
+          pred=lambda g: len(g) == 1 and 90 <= g[0] <= 100)
+    check("HINCRBYFLOAT preserves the field TTL", c.cmd("HINCRBYFLOAT", "hw", "f2", "0.5"), b"15.5")
+    check("HTTL after HINCRBYFLOAT", c.cmd("HTTL", "hw", "FIELDS", "1", "f2"),
+          pred=lambda g: len(g) == 1 and 90 <= g[0] <= 100)
+    check("HDEL removes the field TTL", c.cmd("HDEL", "hw", "f2"), 1)
+    check("HSET recreates the field without a TTL", c.cmd("HSET", "hw", "f2", "v2"), 1)
+    check("HTTL of the recreated field", c.cmd("HTTL", "hw", "FIELDS", "1", "f2"), [-1])
+    c.cmd("HEXPIRE", "hw", "100", "FIELDS", "1", "f2")
+    c.cmd("DEL", "hw")
+    c.cmd("HSET", "hw", "f2", "v2")
+    check("DEL drops every field TTL", c.cmd("HTTL", "hw", "FIELDS", "1", "f2"), [-1])
+    check("HSETNX on a new field has no TTL",
+          (c.cmd("HSETNX", "hw", "f9", "v9"), c.cmd("HTTL", "hw", "FIELDS", "1", "f9")), (1, [-1]))
+    c.cmd("HEXPIRE", "hw", "100", "FIELDS", "1", "f9")
+    check("HSETNX leaves an existing field's TTL alone",
+          (c.cmd("HSETNX", "hw", "f9", "other"), c.cmd("HTTL", "hw", "FIELDS", "1", "f9")),
+          pred=lambda g: g[0] == 0 and 90 <= g[1][0] <= 100)
+
+    # A write over an expired field replaces it in place: the field counts as
+    # new, and the hash stays readable afterwards.
+    c.cmd("DEL", "hover")
+    c.cmd("HSET", "hover", "f1", "v1", "f2", "keep")
+    c.cmd("HPEXPIRE", "hover", "10", "FIELDS", "1", "f1")
+    time.sleep(0.05)
+    check("HSET over an expired field counts it as new", c.cmd("HSET", "hover", "f1", "v2"), 1)
+    check("HGET after writing over an expired field", c.cmd("HGET", "hover", "f1"), b"v2")
+    check("HTTL after writing over an expired field", c.cmd("HTTL", "hover", "FIELDS", "1", "f1"), [-1])
+    check("HLEN after writing over an expired field", c.cmd("HLEN", "hover"), 2)
+    check("HGETALL after writing over an expired field", sorted(c.cmd("HGETALL", "hover")),
+          sorted([b"f1", b"v2", b"f2", b"keep"]))
+    check("DEL after writing over an expired field", c.cmd("DEL", "hover"), 1)
+    c.cmd("DEL", "hover2")
+    c.cmd("HSET", "hover2", "f1", "10")
+    c.cmd("HPEXPIRE", "hover2", "10", "FIELDS", "1", "f1")
+    time.sleep(0.05)
+    check("HINCRBY over an expired field restarts from zero", c.cmd("HINCRBY", "hover2", "f1", "1"), 1)
+    check("HTTL after HINCRBY over an expired field", c.cmd("HTTL", "hover2", "FIELDS", "1", "f1"), [-1])
+    check("EXISTS after HINCRBY over an expired field", c.cmd("EXISTS", "hover2"), 1)
+    check("DEL after HINCRBY over an expired field", c.cmd("DEL", "hover2"), 1)
+    c.cmd("DEL", "hover3")
+    c.cmd("HSET", "hover3", "f1", "10")
+    c.cmd("HPEXPIRE", "hover3", "10", "FIELDS", "1", "f1")
+    time.sleep(0.05)
+    check("HINCRBYFLOAT over an expired field restarts from zero",
+          c.cmd("HINCRBYFLOAT", "hover3", "f1", "1.5"), b"1.5")
+    check("HSETNX writes over an expired field",
+          (c.cmd("HPEXPIRE", "hover3", "10", "FIELDS", "1", "f1"), time.sleep(0.05),
+           c.cmd("HSETNX", "hover3", "f1", "fresh"), c.cmd("HGET", "hover3", "f1")),
+          pred=lambda g: g[0] == [1] and g[2] == 1 and g[3] == b"fresh")
+    check("HLEN after HSETNX over an expired field", c.cmd("HLEN", "hover3"), 1)
+    check("DEL after HSETNX over an expired field", c.cmd("DEL", "hover3"), 1)
+
+    # A key-level TTL and field TTLs coexist
+    c.cmd("DEL", "hboth")
+    c.cmd("HSET", "hboth", "f1", "v1", "f2", "v2")
+    check("EXPIRE on the hash", c.cmd("EXPIRE", "hboth", "500"), 1)
+    check("HEXPIRE on one of its fields", c.cmd("HEXPIRE", "hboth", "100", "FIELDS", "1", "f1"), [1])
+    check("the key TTL is untouched", c.cmd("TTL", "hboth"), pred=lambda g: 490 <= g <= 500)
+    check("the field TTL is untouched", c.cmd("HTTL", "hboth", "FIELDS", "2", "f1", "f2"),
+          pred=lambda g: 90 <= g[0] <= 100 and g[1] == -1)
+    check("PERSIST leaves the field TTLs alone",
+          (c.cmd("PERSIST", "hboth"), c.cmd("TTL", "hboth")), (1, -1))
+    check("the field TTL survives PERSIST", c.cmd("HTTL", "hboth", "FIELDS", "1", "f1"),
+          pred=lambda g: 90 <= g[0] <= 100)
+
+    # Missing key, wrong type and argument errors
+    check("HEXPIRE on a missing key", c.cmd("HEXPIRE", "hfe-missing", "10", "FIELDS", "2", "a", "b"),
+          [-2, -2])
+    check("HTTL on a missing key", c.cmd("HTTL", "hfe-missing", "FIELDS", "1", "a"), [-2])
+    check("HPTTL on a missing key", c.cmd("HPTTL", "hfe-missing", "FIELDS", "1", "a"), [-2])
+    check("HEXPIRETIME on a missing key", c.cmd("HEXPIRETIME", "hfe-missing", "FIELDS", "1", "a"), [-2])
+    check("HPEXPIRETIME on a missing key", c.cmd("HPEXPIRETIME", "hfe-missing", "FIELDS", "1", "a"), [-2])
+    check("HPERSIST on a missing key", c.cmd("HPERSIST", "hfe-missing", "FIELDS", "1", "a"), [-2])
+    c.cmd("SET", "hfe-string", "plain")
+    for name, args in (("HEXPIRE", ("10", "FIELDS", "1", "f")),
+                       ("HPEXPIRE", ("10", "FIELDS", "1", "f")),
+                       ("HEXPIREAT", (str(int(time.time()) + 100), "FIELDS", "1", "f")),
+                       ("HPEXPIREAT", (str(int(time.time() * 1000) + 100000), "FIELDS", "1", "f")),
+                       ("HTTL", ("FIELDS", "1", "f")),
+                       ("HPTTL", ("FIELDS", "1", "f")),
+                       ("HEXPIRETIME", ("FIELDS", "1", "f")),
+                       ("HPEXPIRETIME", ("FIELDS", "1", "f")),
+                       ("HPERSIST", ("FIELDS", "1", "f"))):
+        check("%s wrongtype" % name, c.cmd(name, "hfe-string", *args),
+              pred=lambda g: is_err(g, "WRONGTYPE"))
+    check("HEXPIRE numfields 0", c.cmd("HEXPIRE", "hfc", "10", "FIELDS", "0", "f1"),
+          pred=lambda g: is_err(g, "ERR Parameter `numFields` should be greater than 0"))
+    check("HEXPIRE numfields too large", c.cmd("HEXPIRE", "hfc", "10", "FIELDS", "4", "f1", "f2", "f3"),
+          pred=lambda g: is_err(g, "ERR The `numfields` parameter must match the number of arguments"))
+    check("HEXPIRE numfields too small", c.cmd("HEXPIRE", "hfc", "10", "FIELDS", "2", "f1", "f2", "f3"),
+          pred=lambda g: is_err(g, "ERR The `numfields` parameter must match the number of arguments"))
+    check("HTTL numfields mismatch", c.cmd("HTTL", "hfc", "FIELDS", "3", "f1", "f2"),
+          pred=lambda g: is_err(g, "ERR The `numfields` parameter must match the number of arguments"))
+    check("HPERSIST numfields mismatch", c.cmd("HPERSIST", "hfc", "FIELDS", "4", "f1", "f2", "f3"),
+          pred=lambda g: is_err(g, "ERR The `numfields` parameter must match the number of arguments"))
+    check("HEXPIRE without FIELDS", c.cmd("HEXPIRE", "hfc", "10", "NOTFIELDS", "1", "f1"),
+          pred=lambda g: is_err(g, "ERR Mandatory argument FIELDS is missing or not at the right position"))
+    check("HTTL without FIELDS", c.cmd("HTTL", "hfc", "COUNT", "1", "f1"),
+          pred=lambda g: is_err(g, "ERR Mandatory argument FIELDS is missing or not at the right position"))
+    check("HEXPIRE negative time", c.cmd("HEXPIRE", "hfc", "-1", "FIELDS", "1", "f1"),
+          pred=lambda g: is_err(g, "ERR invalid expire time, must be >= 0"))
+    check("HEXPIRE beyond the expire-time ceiling",
+          c.cmd("HEXPIRE", "hfc", str((1 << 48) // 1000), "FIELDS", "1", "f1"),
+          pred=lambda g: is_err(g, "ERR invalid expire time in 'hexpire' command"))
+    check("HPEXPIRE beyond the expire-time ceiling",
+          c.cmd("HPEXPIRE", "hfc", str(1 << 48), "FIELDS", "1", "f1"),
+          pred=lambda g: is_err(g, "ERR invalid expire time in 'hpexpire' command"))
+    check("HEXPIREAT beyond the expire-time ceiling",
+          c.cmd("HEXPIREAT", "hfc", str((1 << 48) // 1000 + int(time.time()) + 100), "FIELDS", "1", "f1"),
+          pred=lambda g: is_err(g, "ERR invalid expire time in 'hexpireat' command"))
+    check("HPEXPIREAT beyond the expire-time ceiling",
+          c.cmd("HPEXPIREAT", "hfc", str((1 << 48) + int(time.time() * 1000) + 100), "FIELDS", "1", "f1"),
+          pred=lambda g: is_err(g, "ERR invalid expire time in 'hpexpireat' command"))
+    check("HPEXPIRE just below the ceiling",
+          c.cmd("HPEXPIRE", "hfc", str((1 << 46) - int(time.time() * 1000) - 1000), "FIELDS", "1", "f1"),
+          [1])
+    check("HPEXPIRE just above the ceiling",
+          c.cmd("HPEXPIRE", "hfc", str((1 << 46) - int(time.time() * 1000) + 100000), "FIELDS", "1", "f1"),
+          pred=lambda g: is_err(g, "ERR invalid expire time in 'hpexpire' command"))
+    check("HEXPIRE NX with XX", c.cmd("HEXPIRE", "hfc", "10", "NX", "XX", "FIELDS", "1", "f1"),
+          pred=lambda g: is_err(g, "ERR NX and XX, GT or LT options at the same time are not compatible"))
+    check("HEXPIRE GT with LT", c.cmd("HEXPIRE", "hfc", "10", "GT", "LT", "FIELDS", "1", "f1"),
+          pred=lambda g: is_err(g, "ERR GT and LT options at the same time are not compatible"))
+    check("HEXPIRE arity", c.cmd("HEXPIRE", "hfc", "10", "FIELDS", "1"),
+          pred=lambda g: is_err(g, "ERR wrong number of arguments for 'hexpire' command"))
+    check("HPERSIST arity", c.cmd("HPERSIST", "hfc"),
+          pred=lambda g: is_err(g, "ERR wrong number of arguments for 'hpersist' command"))
+
+    # Repeated fields are processed in order
+    c.cmd("DEL", "hrep")
+    c.cmd("HSET", "hrep", "f", "v")
+    check("HEXPIRE repeats a field in order",
+          c.cmd("HEXPIRE", "hrep", "100", "NX", "FIELDS", "2", "f", "f"), [1, 0])
+    check("HTTL repeats a field", c.cmd("HTTL", "hrep", "FIELDS", "2", "f", "f"),
+          pred=lambda g: len(g) == 2 and g[0] == g[1] and 90 <= g[0] <= 100)
+
+    # RENAME and COPY move the whole object, so field TTLs travel with it
+    c.cmd("DEL", "hcopy", "hdst")
+    c.cmd("HSET", "hcopy", "f", "v", "g", "v")
+    c.cmd("HEXPIRE", "hcopy", "100", "FIELDS", "1", "f")
+    c.cmd("COPY", "hcopy", "hdst")
+    check("COPY carries the field TTL to the destination",
+          c.cmd("HTTL", "hdst", "FIELDS", "2", "f", "g"),
+          pred=lambda g: 90 <= g[0] <= 100 and g[1] == -1)
+    check("COPY keeps the source field TTL", c.cmd("HTTL", "hcopy", "FIELDS", "1", "f"),
+          pred=lambda g: 90 <= g[0] <= 100)
+    c.cmd("DEL", "hren", "hren2")
+    c.cmd("HSET", "hren", "f", "v", "g", "v")
+    c.cmd("HEXPIRE", "hren", "100", "FIELDS", "1", "f")
+    c.cmd("RENAME", "hren", "hren2")
+    check("RENAME carries the field TTL", c.cmd("HTTL", "hren2", "FIELDS", "2", "f", "g"),
+          pred=lambda g: 90 <= g[0] <= 100 and g[1] == -1)
+    check("RENAME leaves nothing behind", c.cmd("EXISTS", "hren"), 0)
+    c.cmd("DEL", "hdump")
+    c.cmd("HSET", "hdump", "f", "v")
+    c.cmd("HEXPIRE", "hdump", "100", "FIELDS", "1", "f")
+    payload = c.cmd("DUMP", "hdump")
+    c.cmd("DEL", "hdump")
+    c.cmd("RESTORE", "hdump", "0", payload)
+    check("RESTORE brings back a hash without field TTLs",
+          c.cmd("HTTL", "hdump", "FIELDS", "1", "f"), [-1])
+    c.cmd("DEL", "hsortsrc", "hsortdst")
+    c.cmd("RPUSH", "hsortsrc", "2", "1")
+    c.cmd("HSET", "hsortdst", "f", "v")
+    c.cmd("HEXPIRE", "hsortdst", "100", "FIELDS", "1", "f")
+    check("SORT STORE replaces the hash", c.cmd("SORT", "hsortsrc", "STORE", "hsortdst"), 2)
+    check("SORT STORE dropped the field TTLs", c.cmd("TYPE", "hsortdst"), "list")
+    c.cmd("DEL", "hsortdst")
+    c.cmd("HSET", "hsortdst", "f", "v")
+    check("the recreated hash has no leftover field TTL",
+          c.cmd("HTTL", "hsortdst", "FIELDS", "1", "f"), [-1])
+    c.cmd("DEL", "hflush")
+    c.cmd("HSET", "hflush", "f", "v")
+    c.cmd("HEXPIRE", "hflush", "100", "FIELDS", "1", "f")
+    c.cmd("FLUSHALL")
+    c.cmd("HSET", "hflush", "f", "v")
+    check("FLUSHALL dropped the field TTLs", c.cmd("HTTL", "hflush", "FIELDS", "1", "f"), [-1])
+    c.cmd("SET", "t1", "v")
+    c.cmd("SADD", "s1", "a")
+
     # Untouched basics still work
     check("SET/GET regression", c.cmd("GET", "t1"), b"v")
     check("EXISTS regression", c.cmd("EXISTS", "t1", "s1"), 2)
