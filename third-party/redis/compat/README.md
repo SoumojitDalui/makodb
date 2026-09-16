@@ -200,8 +200,10 @@ networking, and Pub/Sub.
 
 The runner uses `--singledb --ignore-encoding --ignore-digest` and denies the
 `slow`, `needs:debug`, and `needs:repl` tags. This tests external command
-semantics without claiming Redis object encodings, debug internals, replication
-behavior, or multiple logical databases.
+semantics without claiming Redis object encodings, debug internals, or
+replication behavior. `--singledb` keeps the whole suite on database 0, so the
+logical databases the adapter now offers are covered by
+`test_phase2_commands.py` rather than by the TCL guard.
 
 Explicit skips are kept in `tcl_known_skips.txt`:
 
@@ -337,8 +339,10 @@ The authoritative list is `known_divergences.txt`. Current decisions include:
   hidden set, list, or sorted-set composite keys.
 - `makoConMultiTrd` remains ABI-compatible but is not the extended-command
   semantic target.
-- Mako Redis is a single-keyspace service. `SELECT 0` is accepted, while
-  `FLUSHDB` and `FLUSHALL` clear that one keyspace.
+- Redis's sixteen logical databases are emulated with a hidden key prefix
+  rather than separate Mako namespaces: `SELECT 0`..`SELECT 15` work, `FLUSHDB`
+  clears the selected database and `FLUSHALL` all of them, and `SELECT` inside
+  `MULTI` takes effect when it is queued rather than at `EXEC`.
 
 These are design differences, not test passes. Any newly discovered in-scope
 failure must be fixed or added to the divergence file with review.
@@ -407,8 +411,9 @@ no changes below `makoCon`:
 | DUMP/RESTORE | string, set, and sorted-set payloads (`MAKO_STRING_DUMP`, `MAKO_SET_DUMP`, `MAKO_ZSET_DUMP`), TTL and `ABSTTL` honored on RESTORE |
 | Pub/Sub | `SPUBLISH`, `SSUBSCRIBE`, `SUNSUBSCRIBE`, `PUBSUB SHARDCHANNELS/SHARDNUMSUB` (process-local, like classic Pub/Sub) |
 | Cluster | `CLUSTER INFO/MYID/SLOTS/SHARDS/NODES/KEYSLOT/COUNTKEYSINSLOT/GETKEYSINSLOT/HELP`, `READONLY`, `READWRITE`, `INFO cluster` — opt-in through `MAKO_REDIS_CLUSTER_MODE`. The default `off` answers all three commands with `ERR This instance has cluster support disabled` and reports `cluster_enabled:0`. `emulated` presents the single server as a one-node cluster owning slots 0-16383, the way Dragonfly's emulated mode does, so client libraries that will only speak to a cluster can build a slot map: `KEYSLOT` is Redis's CRC16 (XMODEM) of the hash tag mod 16384 with `keyHashSlot`'s `{...}` rules, and the advertised address comes from `MAKO_REDIS_ANNOUNCE_HOST`/`MAKO_REDIS_ANNOUNCE_PORT` falling back to `MAKO_HOST`/`MAKO_PORT`. Nothing is sharded: no `MOVED`/`ASK`, no slot migration, and `COUNTKEYSINSLOT`/`GETKEYSINSLOT` answer 0 and empty |
+| Logical databases | `SELECT n` for 0..15, `MOVE key db`, `COPY ... DB n`, and per-database `KEYS`/`SCAN`/`DBSIZE`/`RANDOMKEY`/`FLUSHDB`/`INFO keyspace`, with `CONFIG GET databases` reporting 16 — database 0 keys are stored under exactly the bytes the client sends, so nothing about the existing keyspace moves, and a key in database 1..15 is stored under the hidden prefix `0x02 <db> ':'` applied to the Redis-visible name before any storage prefix, which is what makes every type, TTL, `WATCH`, lock stripe and `DUMP`/`RESTORE` mechanism work per database unchanged. The prefix is applied in one place, the parser's key validator, and stripped again in every reply that returns key names (`KEYS`, `SCAN`, `RANDOMKEY` and the key element of `BLPOP`/`BRPOP`/`BLMPOP`/`LMPOP`/`BZPOPMIN`/`BZPOPMAX`/`BZMPOP`/`ZMPOP`). `MOVE` is one atomic executor op that copies the whole object — string, set, list, hash, zset, TTL and hash-field TTLs — and deletes the source, answering 0 when the source is missing or the destination name is taken. `FLUSHDB` clears the selected database alone, `FLUSHALL` clears all of them, and Pub/Sub channels stay global as in Redis. A user key may not begin with `0x02`, for the same reason it may not begin with `0x01` |
 | Monitoring | `MONITOR` — the client replies `OK` and then receives one status line per command any client runs on this process, in Redis's format `+<unix_seconds>.<microseconds> [<db> <ip>:<port>] "CMD" "arg"...`, with arguments quoted the way Redis's `sdscatrepr` quotes them (`\"`, `\\`, `\n`, `\r`, `\t`, `\a`, `\b`, and `\xHH` for every other non-printable byte) and AUTH/HELLO credentials redacted. Lines are delivered through the same weak-queue and worker-wake path as Pub/Sub, so a monitor parked on another worker thread is woken. `MULTI`, the commands queued after it and `EXEC` all appear, in that order; a monitor never sees its own commands but still gets their replies; `RESET`, `QUIT` and a disconnect all leave monitor mode; `INFO clients` reports `monitor_clients:<n>`. While any monitor is attached the raw GET/SET fast frame path falls through to the general parser so those two are reported too, gated by a single relaxed atomic load so nothing changes when no monitor is attached |
-| Observability shims | `SLOWLOG`, `LATENCY`, `ACL` (single implicit `default` user), `INFO keyspace` (`db0:keys=N`, cached 2 s), `CONFIG GET` for `maxmemory-policy`, `timeout`, `maxclients`, `tcp-keepalive`, `hz`, `notify-keyspace-events`, `protected-mode`, `port` |
+| Observability shims | `SLOWLOG`, `LATENCY`, `ACL` (single implicit `default` user), `INFO keyspace` (`db0:keys=N`, cached 2 s per database; `MAKO_REDIS_INFO_ALL_DBS=1` also reports databases 1..15 that hold a key), `CONFIG GET` for `maxmemory-policy`, `timeout`, `maxclients`, `tcp-keepalive`, `hz`, `notify-keyspace-events`, `protected-mode`, `port` |
 
 `test_phase2_commands.py HOST PORT [cluster]` exercises every addition against a
 live server with a dependency-free RESP client. The optional third argument, or

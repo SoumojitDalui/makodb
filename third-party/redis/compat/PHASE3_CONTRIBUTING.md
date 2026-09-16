@@ -21,7 +21,7 @@ Search for these anchors; do not rely on line numbers.
 
 | Step | Anchor | Notes |
 |---|---|---|
-| Opcode | `enum OpCode {` | Explicit discriminants. Next free values start at 178. Never reuse a number. |
+| Opcode | `enum OpCode {` | Explicit discriminants. Next free values start at 201. Never reuse a number. |
 | Name lookup | `fn parse_opcode(name: &[u8])` | Chain of `ascii_eq_ci`. Add before the final `else { None }`. |
 | Parsing | `fn parse_resp3(` → `match op {` | One arm per command: validate arity with `wrong_arity("name")`, keys via `part_to_bytes` + `validate_user_key`, extra args go in `cmd.values`, raw args in `command_args(&parts)`. Return `Err(ParseError::Protocol("syntax error"))` for bad options, `ParseError::Error("...")` for Redis-style `ERR` text. |
 | Op building | `fn build_txn_ops(` | Push `TxnOperation`s. Extra data travels as `pack_bytes_list(&cmd.values)` in `val_ptr/val_len`; keep the `Bytes` alive by pushing into `payloads`. All 32 `flags` bits are taken; pass options inside the packed payload instead. |
@@ -111,7 +111,7 @@ with a `*_meta_key` carrying the cardinality. Follow the same pattern for any
 new type: one meta key per logical key plus one composite key per element.
 
 When you add a C++ op you must also:
-1. Add `TXN_OP_NEW = <n>` to `include/transaction_ffi.h` (next free: 79) and
+1. Add `TXN_OP_NEW = <n>` to `include/transaction_ffi.h` (next free: 87) and
    `const TXN_OP_NEW: u32 = <n>;` in `lib.rs`.
 2. Classify it in `redis_op_is_read_only` (reads only) and, if it touches
    keys other than `op.key`, in `redis_op_uses_only_primary_lock_key` (return
@@ -121,6 +121,38 @@ When you add a C++ op you must also:
 
 `makoConMultiTrd.cc` is a separate binary that must keep compiling; it only
 needs the header to build, and it deliberately supports a small op subset.
+
+## Logical databases
+
+Every Redis-visible key must go through `validate_user_key` in `lib.rs`. It is
+the one place that turns a key the client sent into the name it is stored
+under, by putting the connection's logical database in front of it: database 0
+keys are stored verbatim, and a key in database 1..15 is stored under
+`0x02 <db as one byte> ':' <key>`. The prefix is applied to the Redis-visible
+name *before* any storage prefix (`table_key_`, the `0x01` collection
+namespaces, the TTL metadata), which is why every type, TTL, WATCH, lock-stripe
+and DUMP/RESTORE mechanism works per database without knowing databases exist.
+
+So: a new command's keys go through `validate_user_key`, all of them, whether
+they end up in `cmd.keys` or in `cmd.values` — destinations, sources, the key
+lists of the blocking pops. The function returns the storage-facing key rather
+than `()` so a site that drops it does not compile, and the unit test
+`every_user_key_call_site_keeps_the_prefixed_key` asserts the shape and the
+count of the call sites, so adding one makes it fail until you have looked at
+it. Anything that is not a key — channels, patterns, script names, MONITOR's
+own argument list — is left alone; Pub/Sub is global in Redis regardless of
+database, and `cmd.args` deliberately keeps the raw bytes the client sent.
+
+The reverse applies to replies: anything that returns a key *name* has to strip
+the prefix with `strip_db_key(current_db(), ...)`. That is KEYS, SCAN,
+RANDOMKEY and the key element of BLPOP/BRPOP/BLMPOP/LMPOP/BZPOPMIN/BZPOPMAX/
+BZMPOP/ZMPOP today.
+
+The database reaches both ends through the `CURRENT_DB` thread-local, set from
+`ClientState::db` by `process_buffered_frames` before each frame is parsed and
+by `service_client` before a blocked or deferred command resumes. A worker owns
+one client's frame at a time, so parsing, execution and the reply all see the
+same value.
 
 ## Build and test on ag2
 

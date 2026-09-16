@@ -184,7 +184,53 @@ typedef enum {
     TXN_OP_HFIELD_EXPIRE = 83,
     TXN_OP_HFIELD_TTL = 84,
     TXN_OP_HFIELD_PERSIST = 85,
+    // MOVE key db. The two keys are two logical-database spellings of the same
+    // Redis-visible name (see "Logical databases" below), so this is a copy of
+    // the whole object followed by deletion of the source, in one transaction.
+    // key = the source key, already carrying the connection's database prefix;
+    // value = packed [destination key], already carrying the target database's
+    // prefix. int_value is 1 when the object moved and 0 when the source does
+    // not exist or the destination name is already taken. It touches a second
+    // key, so it is in redis_op_uses_only_primary_lock_key and adds the packed
+    // destination in redis_request_lock_stripes.
+    TXN_OP_MOVE = 86,
 } TxnOpCode;
+
+/**
+ * Logical databases (Redis SELECT / MOVE / COPY ... DB).
+ *
+ * Database 0 keys are stored under exactly the bytes the client sent, so the
+ * on-disk layout of every keyspace that existed before logical databases is
+ * unchanged. A key in database 1..15 is stored under
+ *
+ *     0x02 <db as one byte> ':' <key>
+ *
+ * where the prefix is applied to the Redis-visible key before any storage
+ * prefix ("table_key_", the hidden 0x01 collection namespaces, the "\x01TTL:"
+ * metadata) is added. Every type, TTL, WATCH, lock-stripe and DUMP/RESTORE
+ * mechanism therefore works per database without knowing databases exist. Rust
+ * rejects a user key whose first byte is 0x02 exactly as it rejects 0x01, so
+ * database 0 cannot spell a database-n key.
+ *
+ * Two ops have to know about the layout, and both learn it from the prefix
+ * bytes in val_ptr rather than a flag (all 32 flag bits are taken):
+ *
+ *   TXN_OP_SCAN (KEYS, SCAN, DBSIZE, RANDOMKEY): the val payload is the
+ *     user-key prefix to walk. A prefix whose first byte is 0x02 selects one
+ *     logical database and the scan returns its keys verbatim (Rust strips the
+ *     three prefix bytes before replying). Any other prefix, including the
+ *     empty one, walks database 0, and the scan then skips every key whose
+ *     first byte is 0x02 so database 0 never sees another database's keys.
+ *
+ *   TXN_OP_FLUSHDB: the val payload names what to clear.
+ *       empty              FLUSHALL: every key in the table, as before.
+ *       0x02               FLUSHDB on database 0: every key that does not
+ *                          belong to databases 1..15.
+ *       0x02 <db> ':'      FLUSHDB on database <db>: only that database.
+ *     The one-byte 0x02 sentinel is not a legal database prefix (those are
+ *     always three bytes), which is what makes "database 0" distinguishable
+ *     from "everything".
+ */
 
 /**
  * HyperLogLog result convention: when an HLL op fails because one of its keys
@@ -259,7 +305,8 @@ typedef enum {
  *
  * For TXN_OP_SCAN:
  *   - key_ptr/key_len carries the decoded cursor user key, or empty for cursor 0
- *   - val_ptr/val_len carries the literal scan prefix derived from MATCH
+ *   - val_ptr/val_len carries the literal scan prefix derived from MATCH, with
+ *     the selected database's prefix in front of it (see "Logical databases")
  *   - expire_at_ms carries the COUNT work hint
  *   - TXN_FLAG_SCAN_COUNT_ONLY returns DBSIZE in int_value instead of key bytes
  *

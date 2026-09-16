@@ -771,6 +771,7 @@ static bool redis_op_uses_only_primary_lock_key(const TxnOperation& op) {
     switch (op.op) {
         case TXN_OP_RENAME:
         case TXN_OP_COPY:
+        case TXN_OP_MOVE:
         case TXN_OP_SMOVE:
         case TXN_OP_LMOVE:
         case TXN_OP_SORT:
@@ -820,6 +821,7 @@ static std::vector<size_t> redis_request_lock_stripes(const TxnRequest* request)
                     add_lock_key(op.val_ptr, op.val_len);
                 }
                 break;
+            case TXN_OP_MOVE:
             case TXN_OP_SMOVE:
             case TXN_OP_LMOVE:
             case TXN_OP_SORT:
@@ -876,6 +878,7 @@ static void redis_cache_invalidate_committed_writes(const TxnRequest* request) {
                     redis_cache_invalidate(op.val_ptr, op.val_len);
                 }
                 break;
+            case TXN_OP_MOVE:
             case TXN_OP_SMOVE:
             case TXN_OP_LMOVE:
             case TXN_OP_SORT:
@@ -936,7 +939,94 @@ void cleanup_thread_info() {
     tl_initialized = false;
 }
 
-static bool execute_flushdb_chunked(size_t chunk_size = 1024) {
+// ===== Logical databases =====
+//
+// See the "Logical databases" comment in include/transaction_ffi.h. Database 0
+// keys are stored verbatim; a key in database 1..15 carries the three-byte
+// prefix 0x02 <db> ':' in front of the Redis-visible name, before any storage
+// prefix is added. Everything below only has to answer one question: which
+// database does this stored key belong to?
+
+static constexpr unsigned char kRedisDbMarker = 0x02;
+
+// Database of a Redis-visible key.
+static int redis_user_key_db_index(const char* data, size_t len) {
+    if (len >= 3 && static_cast<unsigned char>(data[0]) == kRedisDbMarker && data[2] == ':') {
+        return static_cast<unsigned char>(data[1]);
+    }
+    return 0;
+}
+
+// Database of a key as it sits in storage. Anything this cannot place counts
+// as database 0, so a FLUSHDB on database 0 still clears everything a
+// single-database server would have cleared.
+//
+// Two layouts reach storage, from the make_* lambdas in execute_transaction:
+//   "table_key_" <key>                a string value (the only prefixed one)
+//   "\x01TTL:" <key>                  key expiry metadata
+//   "\x01<tag>:" <len:8> <key> …      every collection namespace: set, hash,
+//                                     list and zset members, scores and metas
+// Only "\x01TTL:" lacks the eight-byte little-endian logical-key length, so a
+// new collection namespace needs no change here as long as it keeps that
+// shape. In every layout the logical key is what carries the database prefix,
+// which is the whole point of prefixing the Redis-visible name rather than the
+// storage name.
+static int redis_storage_key_db_index(const char* data, size_t len) {
+    constexpr std::string_view kStoragePrefix = "table_key_";
+    std::string_view key(data, len);
+    if (key.size() >= kStoragePrefix.size()
+        && key.substr(0, kStoragePrefix.size()) == kStoragePrefix) {
+        key.remove_prefix(kStoragePrefix.size());
+    }
+    if (key.empty()) {
+        return 0;
+    }
+    if (static_cast<unsigned char>(key[0]) != 0x01) {
+        return redis_user_key_db_index(key.data(), key.size());
+    }
+    const size_t colon = key.find(':');
+    if (colon == std::string_view::npos) {
+        return 0;
+    }
+    size_t offset = colon + 1;
+    if (key.substr(0, colon + 1) != std::string_view("\x01TTL:", 5)) {
+        offset += 8;
+    }
+    if (offset >= key.size()) {
+        return 0;
+    }
+    return redis_user_key_db_index(key.data() + offset, key.size() - offset);
+}
+
+// The logical key of one entry of a per-transaction staging buffer: the set
+// buffers hold the key itself, the map buffers hold it in `first`.
+static inline const std::string& redis_staged_entry_key(const std::string& entry) {
+    return entry;
+}
+
+template <typename T>
+static inline const std::string& redis_staged_entry_key(
+    const std::pair<const std::string, T>& entry) {
+    return entry.first;
+}
+
+// The FLUSHDB/FLUSHALL payload described in transaction_ffi.h, decoded to a
+// database filter: -1 clears every database, 0..15 clears just that one.
+static int redis_flush_db_filter(const void* val_ptr, size_t val_len) {
+    if (val_ptr == nullptr || val_len == 0) {
+        return -1;
+    }
+    const char* data = static_cast<const char*>(val_ptr);
+    if (static_cast<unsigned char>(data[0]) != kRedisDbMarker) {
+        return -1;
+    }
+    if (val_len == 1) {
+        return 0;
+    }
+    return static_cast<unsigned char>(data[1]);
+}
+
+static bool execute_flushdb_chunked(int db_filter, size_t chunk_size = 1024) {
     ensure_thread_info();
     if (g_mako_db == nullptr || g_table == nullptr) {
         return false;
@@ -944,10 +1034,13 @@ static bool execute_flushdb_chunked(size_t chunk_size = 1024) {
 
     class FlushChunkScanCallback : public oi_scan_callback {
     public:
-        FlushChunkScanCallback(std::vector<std::string>& keys, size_t limit)
-            : keys_(keys), limit_(limit) {}
+        FlushChunkScanCallback(std::vector<std::string>& keys, size_t limit, int db_filter)
+            : keys_(keys), limit_(limit), db_filter_(db_filter) {}
 
         bool invoke(const char* keyp, size_t keylen, const std::string&) override {
+            if (db_filter_ >= 0 && redis_storage_key_db_index(keyp, keylen) != db_filter_) {
+                return true;
+            }
             keys_.emplace_back(keyp, keylen);
             return keys_.size() < limit_;
         }
@@ -955,6 +1048,7 @@ static bool execute_flushdb_chunked(size_t chunk_size = 1024) {
     private:
         std::vector<std::string>& keys_;
         size_t limit_;
+        int db_filter_;
     };
 
     for (;;) {
@@ -967,7 +1061,7 @@ static bool execute_flushdb_chunked(size_t chunk_size = 1024) {
         void* txn = g_mako_db->BeginTransaction();
 
         try {
-            FlushChunkScanCallback callback(keys_to_delete, chunk_size);
+            FlushChunkScanCallback callback(keys_to_delete, chunk_size, db_filter);
             tx_scan(g_table, txn, std::string(), nullptr, callback, tl_arena);
 
             if (keys_to_delete.empty()) {
@@ -1254,7 +1348,8 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
     }
 
     if (request->num_ops == 1 && request->ops != nullptr && request->ops[0].op == TXN_OP_FLUSHDB) {
-        const bool ok = execute_flushdb_chunked();
+        const bool ok = execute_flushdb_chunked(
+            redis_flush_db_filter(request->ops[0].val_ptr, request->ops[0].val_len));
         response->transaction_success = ok;
         response->results[0].success = ok;
         response->results[0].value_present = ok;
@@ -1886,7 +1981,13 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
 
                 last_storage_key_ = storage_key;
                 std::string user_key = storage_key.substr(kStoragePrefix.size());
-                if (!user_key.empty() && static_cast<unsigned char>(user_key[0]) == 0x01) {
+                // This chunked path only ever answers DBSIZE for database 0
+                // (its caller requires an empty scan prefix), so a key that
+                // belongs to another logical database is not counted, exactly
+                // as the general TXN_OP_SCAN path skips it.
+                if (!user_key.empty()
+                    && (static_cast<unsigned char>(user_key[0]) == 0x01
+                        || static_cast<unsigned char>(user_key[0]) == kRedisDbMarker)) {
                     return ++seen_ < limit_;
                 }
 
@@ -4673,8 +4774,28 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                 result.success = true;
                 result.value_present = true;
                 result.int_value = rename_nx ? 1 : 0;
-            } else if (op.op == TXN_OP_COPY) {
-                std::string destination(reinterpret_cast<const char*>(op.val_ptr), op.val_len);
+            } else if (op.op == TXN_OP_COPY || op.op == TXN_OP_MOVE) {
+                // MOVE is COPY without REPLACE plus deletion of the source, in
+                // one transaction: the two keys are the same Redis-visible name
+                // under two logical-database prefixes, so every type, the TTL
+                // and the hash field expirations travel exactly as they do for
+                // COPY. COPY carries its destination raw in val_ptr; MOVE
+                // carries it as a one-item packed list, because it needs the
+                // packed form for redis_request_lock_stripes.
+                const bool is_move = op.op == TXN_OP_MOVE;
+                std::string destination;
+                if (is_move) {
+                    std::vector<std::string> move_args;
+                    if (!unpack_bytes_list(op.val_ptr, op.val_len, move_args)
+                        || move_args.empty()) {
+                        result.success = false;
+                        all_success = false;
+                        continue;
+                    }
+                    destination = move_args[0];
+                } else {
+                    destination.assign(reinterpret_cast<const char*>(op.val_ptr), op.val_len);
+                }
                 std::string source_storage_key = "table_key_" + user_key;
                 std::string destination_storage_key = "table_key_" + destination;
                 mako::Status s = expire_logical_key_if_needed(txn, user_key, source_storage_key);
@@ -4714,7 +4835,7 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                     result.int_value = 0;
                     continue;
                 }
-                const bool replace = op.expire_at_ms == 1;
+                const bool replace = !is_move && op.expire_at_ms == 1;
                 if (user_key == destination) {
                     result.success = true;
                     result.value_present = true;
@@ -4874,6 +4995,11 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                 }
                 if (s.ok() && source_ttl_exists) {
                     s = write_ttl_meta(txn, destination, source_expire_at_ms);
+                }
+                if (s.ok() && is_move) {
+                    // The object is now under the destination name, so the
+                    // source name goes away in the same transaction.
+                    s = delete_logical_key_for_copy(user_key);
                 }
                 if (!s.ok()) {
                     result.success = false;
@@ -7695,22 +7821,30 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                     all_success = false;
                 }
             } else if (op.op == TXN_OP_FLUSHDB) {
+                // -1 for FLUSHALL, otherwise the one logical database FLUSHDB
+                // was issued on; see redis_flush_db_filter.
+                const int flush_db_filter = redis_flush_db_filter(op.val_ptr, op.val_len);
                 std::vector<std::string> keys_to_delete;
                 class FlushScanCallback : public oi_scan_callback {
                 public:
-                    explicit FlushScanCallback(std::vector<std::string>& keys)
-                        : keys_(keys) {}
+                    FlushScanCallback(std::vector<std::string>& keys, int db_filter)
+                        : keys_(keys), db_filter_(db_filter) {}
 
                     bool invoke(const char* keyp, size_t keylen, const std::string&) override {
+                        if (db_filter_ >= 0
+                            && redis_storage_key_db_index(keyp, keylen) != db_filter_) {
+                            return true;
+                        }
                         keys_.emplace_back(keyp, keylen);
                         return true;
                     }
 
                 private:
                     std::vector<std::string>& keys_;
+                    int db_filter_;
                 };
 
-                FlushScanCallback callback(keys_to_delete);
+                FlushScanCallback callback(keys_to_delete, flush_db_filter);
                 tx_scan(g_table, txn, std::string(), nullptr, callback, tl_arena);
                 mako::Status s = mako::Status::OK();
                 for (const auto& storage_key : keys_to_delete) {
@@ -7724,17 +7858,40 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                     // transaction created is still only in the write buffer,
                     // so drop the buffer as well: FLUSHDB empties the keyspace,
                     // including whatever this transaction was about to add.
-                    pending_writes.clear();
-                    batch_ttls.clear();
-                    staged_sets.clear();
-                    staged_sets_loaded.clear();
-                    dirty_sets.clear();
-                    staged_lists.clear();
-                    staged_lists_loaded.clear();
-                    dirty_lists.clear();
-                    staged_zsets.clear();
-                    staged_zsets_loaded.clear();
-                    dirty_zsets.clear();
+                    // A database-scoped flush drops only the staged entries
+                    // that belong to that database, so a MULTI that writes to
+                    // two databases and flushes one keeps the other's writes.
+                    auto drop_staged_user_keys = [&](auto& container) {
+                        for (auto it = container.begin(); it != container.end();) {
+                            const std::string& staged_key = redis_staged_entry_key(*it);
+                            if (flush_db_filter < 0
+                                || redis_user_key_db_index(staged_key.data(), staged_key.size())
+                                    == flush_db_filter) {
+                                it = container.erase(it);
+                            } else {
+                                ++it;
+                            }
+                        }
+                    };
+                    for (auto it = pending_writes.begin(); it != pending_writes.end();) {
+                        if (flush_db_filter < 0
+                            || redis_storage_key_db_index(it->first.data(), it->first.size())
+                                == flush_db_filter) {
+                            it = pending_writes.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                    drop_staged_user_keys(batch_ttls);
+                    drop_staged_user_keys(staged_sets);
+                    drop_staged_user_keys(staged_sets_loaded);
+                    drop_staged_user_keys(dirty_sets);
+                    drop_staged_user_keys(staged_lists);
+                    drop_staged_user_keys(staged_lists_loaded);
+                    drop_staged_user_keys(dirty_lists);
+                    drop_staged_user_keys(staged_zsets);
+                    drop_staged_user_keys(staged_zsets_loaded);
+                    drop_staged_user_keys(dirty_zsets);
                     result.success = true;
                     result.value_present = true;
                 } else {
@@ -7749,6 +7906,12 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                 if (op.val_ptr != nullptr && op.val_len > 0) {
                     user_prefix.assign(reinterpret_cast<const char*>(op.val_ptr), op.val_len);
                 }
+                // A prefix that starts with the 0x02 marker names one logical
+                // database, so its keys are what the scan is for; any other
+                // prefix walks database 0 and skips them.
+                const bool db_scoped =
+                    !user_prefix.empty()
+                    && static_cast<unsigned char>(user_prefix[0]) == kRedisDbMarker;
 
                 const std::string storage_prefix = "table_key_" + user_prefix;
                 std::string scan_start;
@@ -7770,6 +7933,7 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                 public:
                     RedisScanCallback(
                         bool count_only,
+                        bool db_scoped,
                         size_t limit,
                         std::vector<std::string>& keys,
                         std::vector<std::string>& expired_user_keys,
@@ -7779,6 +7943,7 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                         int64_t& visible_count,
                         const std::function<bool(const std::string&)>& is_expired)
                         : count_only_(count_only),
+                          db_scoped_(db_scoped),
                           limit_(limit),
                           keys_(keys),
                           expired_user_keys_(expired_user_keys),
@@ -7797,6 +7962,13 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
 
                         std::string user_key = storage_key.substr(kStoragePrefix.size());
                         if (!user_key.empty() && static_cast<unsigned char>(user_key[0]) == 0x01) {
+                            return true;
+                        }
+                        // Logical databases: a scan whose prefix does not name
+                        // a database walks database 0, and database 0 never
+                        // sees the 0x02 namespace the other databases live in.
+                        if (!db_scoped_ && !user_key.empty()
+                            && static_cast<unsigned char>(user_key[0]) == kRedisDbMarker) {
                             return true;
                         }
                         if (!count_only_ && keys_.size() >= limit_) {
@@ -7822,6 +7994,7 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
 
                 private:
                     bool count_only_;
+                    bool db_scoped_;
                     size_t limit_;
                     std::vector<std::string>& keys_;
                     std::vector<std::string>& expired_user_keys_;
@@ -7845,6 +8018,7 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
 
                 RedisScanCallback callback(
                     count_only,
+                    db_scoped,
                     limit,
                     keys,
                     expired_user_keys,

@@ -406,6 +406,314 @@ def check_monitor(host, port, c):
     worker.sock.close()
 
 
+def check_logical_databases(host, port):
+    """SELECT, MOVE, COPY ... DB and per-database keyspace scoping.
+
+    Every block opens its own connection so the selected database is explicit
+    and nothing later in the file inherits a database other than 0.
+    """
+    def fresh(db=0):
+        conn = Resp(host, port)
+        if db:
+            conn.cmd("SELECT", str(db))
+        return conn
+
+    c0 = fresh()
+    c0.cmd("FLUSHALL")
+
+    # ----- SELECT and the basic separation -----
+    check("CONFIG GET databases reports 16", c0.cmd("CONFIG", "GET", "databases"),
+          [b"databases", b"16"])
+    check("SELECT 0", c0.cmd("SELECT", "0"), "OK")
+    check("SELECT 15", c0.cmd("SELECT", "15"), "OK")
+    check("SELECT 16 is out of range", c0.cmd("SELECT", "16"),
+          pred=lambda got: is_err(got, "ERR DB index is out of range"))
+    check("SELECT -1 is out of range", c0.cmd("SELECT", "-1"),
+          pred=lambda got: is_err(got, "ERR DB index is out of range"))
+    check("SELECT of a non-number is an integer error", c0.cmd("SELECT", "abc"),
+          pred=lambda got: is_err(got, "ERR value is not an integer"))
+    c0.cmd("SELECT", "0")
+
+    c1 = fresh(1)
+    check("SET in database 1", c1.cmd("SET", "dbk", "v1"), "OK")
+    check("database 0 does not see it", c0.cmd("GET", "dbk"), None)
+    check("SET the same name in database 0", c0.cmd("SET", "dbk", "v0"), "OK")
+    check("database 1 still has its own value", c1.cmd("GET", "dbk"), b"v1")
+    check("database 0 has its own value", c0.cmd("GET", "dbk"), b"v0")
+    check("EXISTS is per database", [c0.cmd("EXISTS", "dbk"), c1.cmd("EXISTS", "dbk")], [1, 1])
+    check("TYPE is per database", c1.cmd("TYPE", "dbk"), "string")
+    c1.cmd("EXPIRE", "dbk", "100")
+    check("TTL is per database", [c1.cmd("TTL", "dbk"), c0.cmd("TTL", "dbk")], [100, -1])
+    c1.cmd("PERSIST", "dbk")
+
+    # ----- KEYS, SCAN, DBSIZE, RANDOMKEY are scoped and report raw names -----
+    check("DBSIZE counts only database 0", c0.cmd("DBSIZE"), 1)
+    check("DBSIZE counts only database 1", c1.cmd("DBSIZE"), 1)
+    c1.cmd("SET", "only1", "x")
+    check("KEYS in database 1 lists its own names unprefixed",
+          sorted(c1.cmd("KEYS", "*")), [b"dbk", b"only1"])
+    check("KEYS in database 0 does not see database 1", c0.cmd("KEYS", "*"), [b"dbk"])
+    check("KEYS MATCH still means what the client wrote",
+          c1.cmd("KEYS", "only*"), [b"only1"])
+    check("SCAN in database 1 lists its own names",
+          sorted(c1.cmd("SCAN", "0")[1]), [b"dbk", b"only1"])
+    check("SCAN in database 0 does not see database 1", c0.cmd("SCAN", "0")[1], [b"dbk"])
+    check("SCAN MATCH is applied to the unprefixed name",
+          c1.cmd("SCAN", "0", "MATCH", "only*")[1], [b"only1"])
+    check("RANDOMKEY in database 0 never returns a database 1 key",
+          [c0.cmd("RANDOMKEY") for _ in range(20)],
+          pred=lambda got: all(value == b"dbk" for value in got))
+    check("RANDOMKEY in database 1 never returns a database 0 key",
+          [c1.cmd("RANDOMKEY") for _ in range(20)],
+          pred=lambda got: all(value in (b"dbk", b"only1") for value in got))
+    c1.cmd("DEL", "only1")
+
+    # ----- every type works in database 1 and is invisible from database 0 -----
+    c1.cmd("SADD", "t:set", "a", "b")
+    c1.cmd("RPUSH", "t:list", "x", "y")
+    c1.cmd("HSET", "t:hash", "f", "v")
+    c1.cmd("ZADD", "t:zset", "1", "m")
+    c1.cmd("PFADD", "t:hll", "a", "b", "c")
+    c1.cmd("GEOADD", "t:geo", "13.361389", "38.115556", "Palermo")
+    c1.cmd("BITFIELD", "t:bf", "SET", "u8", "0", "255")
+    check("SMEMBERS in database 1", sorted(c1.cmd("SMEMBERS", "t:set")), [b"a", b"b"])
+    check("LRANGE in database 1", c1.cmd("LRANGE", "t:list", "0", "-1"), [b"x", b"y"])
+    check("HGETALL in database 1", c1.cmd("HGETALL", "t:hash"), [b"f", b"v"])
+    check("ZRANGE in database 1", c1.cmd("ZRANGE", "t:zset", "0", "-1"), [b"m"])
+    check("PFCOUNT in database 1", c1.cmd("PFCOUNT", "t:hll"), 3)
+    check("GEOPOS in database 1", c1.cmd("GEOPOS", "t:geo", "Palermo"),
+          pred=lambda got: got and got[0] and abs(float(got[0][0]) - 13.361389) < 1e-4)
+    check("BITFIELD in database 1", c1.cmd("BITFIELD", "t:bf", "GET", "u8", "0"), [255])
+    check("database 0 sees none of the typed keys in database 1",
+          [c0.cmd("SCARD", "t:set"), c0.cmd("LLEN", "t:list"), c0.cmd("HLEN", "t:hash"),
+           c0.cmd("ZCARD", "t:zset"), c0.cmd("PFCOUNT", "t:hll"),
+           c0.cmd("EXISTS", "t:geo"), c0.cmd("EXISTS", "t:bf")],
+          [0, 0, 0, 0, 0, 0, 0])
+
+    # ----- FLUSHDB is per database, FLUSHALL clears everything -----
+    c0.cmd("SET", "f0", "v")
+    c0.cmd("SADD", "f0set", "m")
+    check("FLUSHDB in database 1", c1.cmd("FLUSHDB"), "OK")
+    check("database 1 is empty afterwards",
+          [c1.cmd("DBSIZE"), c1.cmd("SCARD", "t:set"), c1.cmd("LLEN", "t:list"),
+           c1.cmd("HLEN", "t:hash"), c1.cmd("ZCARD", "t:zset")], [0, 0, 0, 0, 0])
+    check("database 0 is untouched by a FLUSHDB in database 1",
+          [c0.cmd("GET", "f0"), c0.cmd("SCARD", "f0set"), c0.cmd("GET", "dbk")],
+          [b"v", 1, b"v0"])
+    c1.cmd("SET", "f1", "v")
+    c1.cmd("SADD", "f1set", "m")
+    check("FLUSHDB in database 0", c0.cmd("FLUSHDB"), "OK")
+    check("database 0 is empty afterwards", c0.cmd("DBSIZE"), 0)
+    check("database 1 is untouched by a FLUSHDB in database 0",
+          [c1.cmd("GET", "f1"), c1.cmd("SCARD", "f1set")], [b"v", 1])
+    check("FLUSHALL", c0.cmd("FLUSHALL"), "OK")
+    check("FLUSHALL cleared database 1 too",
+          [c1.cmd("DBSIZE"), c1.cmd("SCARD", "f1set")], [0, 0])
+
+    # ----- MOVE -----
+    c0.cmd("SET", "mv:str", "value")
+    c0.cmd("EXPIRE", "mv:str", "100")
+    c0.cmd("HSET", "mv:hash", "f", "v")
+    c0.cmd("SADD", "mv:set", "a", "b")
+    c0.cmd("ZADD", "mv:zset", "1.5", "m")
+    c0.cmd("RPUSH", "mv:list", "x", "y")
+    for name in ("mv:str", "mv:hash", "mv:set", "mv:zset", "mv:list"):
+        check("MOVE %s to database 1" % name, c0.cmd("MOVE", name, "1"), 1)
+    check("the moved keys are gone from database 0",
+          [c0.cmd("EXISTS", name) for name in
+           ("mv:str", "mv:hash", "mv:set", "mv:zset", "mv:list")], [0, 0, 0, 0, 0])
+    check("the moved string arrived with its value", c1.cmd("GET", "mv:str"), b"value")
+    check("the moved string kept its type", c1.cmd("TYPE", "mv:str"), "string")
+    check("the moved string kept its TTL", c1.cmd("TTL", "mv:str"),
+          pred=lambda got: 90 < got <= 100)
+    check("the moved hash arrived", c1.cmd("HGETALL", "mv:hash"), [b"f", b"v"])
+    check("the moved set arrived", sorted(c1.cmd("SMEMBERS", "mv:set")), [b"a", b"b"])
+    check("the moved zset arrived with its score",
+          c1.cmd("ZRANGE", "mv:zset", "0", "-1", "WITHSCORES"), [b"m", b"1.5"])
+    check("the moved list arrived in order",
+          c1.cmd("LRANGE", "mv:list", "0", "-1"), [b"x", b"y"])
+    check("the moved types are right in database 1",
+          [c1.cmd("TYPE", "mv:hash"), c1.cmd("TYPE", "mv:set"),
+           c1.cmd("TYPE", "mv:zset"), c1.cmd("TYPE", "mv:list")],
+          ["hash", "set", "zset", "list"])
+
+    c0.cmd("SET", "mv:taken", "from0")
+    c1.cmd("SET", "mv:taken", "from1")
+    check("MOVE onto an existing destination returns 0", c0.cmd("MOVE", "mv:taken", "1"), 0)
+    check("the source is untouched after a refused MOVE", c0.cmd("GET", "mv:taken"), b"from0")
+    check("the destination is untouched after a refused MOVE",
+          c1.cmd("GET", "mv:taken"), b"from1")
+    check("MOVE of a missing key returns 0", c0.cmd("MOVE", "mv:missing", "1"), 0)
+    check("MOVE to the current database is an error", c0.cmd("MOVE", "mv:taken", "0"),
+          pred=lambda got: is_err(got, "ERR source and destination objects are the same"))
+    check("MOVE to a database out of range", c0.cmd("MOVE", "mv:taken", "16"),
+          pred=lambda got: is_err(got, "ERR DB index is out of range"))
+    check("MOVE to a negative database", c0.cmd("MOVE", "mv:taken", "-1"),
+          pred=lambda got: is_err(got, "ERR DB index is out of range"))
+    check("MOVE arity", c0.cmd("MOVE", "mv:taken"),
+          pred=lambda got: is_err(got, "ERR wrong number of arguments"))
+
+    # ----- COPY ... DB -----
+    c2 = fresh(2)
+    c0.cmd("SET", "cp:src", "payload")
+    check("COPY into database 2", c0.cmd("COPY", "cp:src", "cp:dst", "DB", "2"), 1)
+    check("the copy is not in database 0", c0.cmd("EXISTS", "cp:dst"), 0)
+    check("the copy is not in database 1", c1.cmd("EXISTS", "cp:dst"), 0)
+    check("the copy is in database 2", c2.cmd("GET", "cp:dst"), b"payload")
+    check("the source stayed in database 0", c0.cmd("GET", "cp:src"), b"payload")
+    check("COPY onto an existing name in database 2 returns 0",
+          c0.cmd("COPY", "cp:src", "cp:dst", "DB", "2"), 0)
+    c0.cmd("SET", "cp:src", "second")
+    check("COPY ... DB ... REPLACE overwrites",
+          c0.cmd("COPY", "cp:src", "cp:dst", "DB", "2", "REPLACE"), 1)
+    check("the destination holds the new value", c2.cmd("GET", "cp:dst"), b"second")
+    check("COPY onto itself in the same database is refused",
+          c0.cmd("COPY", "cp:src", "cp:src", "DB", "0"),
+          pred=lambda got: is_err(got, "ERR source and destination objects are the same"))
+    check("COPY ... DB out of range", c0.cmd("COPY", "cp:src", "cp:dst", "DB", "16"),
+          pred=lambda got: is_err(got, "ERR DB index is out of range"))
+
+    # ----- the reserved first byte -----
+    check("SET of a key starting with 0x02 is refused", c0.cmd("SET", b"\x02bad", "v"),
+          pred=lambda got: is_err(got, "ERR invalid key: reserved internal prefix"))
+    check("GET of a key starting with 0x02 is refused", c0.cmd("GET", b"\x02bad"),
+          pred=lambda got: is_err(got, "ERR invalid key: reserved internal prefix"))
+    check("a key starting with 0x01 is still refused", c0.cmd("SET", b"\x01bad", "v"),
+          pred=lambda got: is_err(got, "ERR invalid key: reserved internal prefix"))
+
+    # ----- multi-key commands stay inside one database -----
+    c1.cmd("FLUSHDB")
+    c1.cmd("SET", "mk:rename", "v")
+    check("RENAME within database 1", c1.cmd("RENAME", "mk:rename", "mk:renamed"), "OK")
+    check("the renamed key is in database 1", c1.cmd("GET", "mk:renamed"), b"v")
+    check("the renamed key is not in database 0", c0.cmd("EXISTS", "mk:renamed"), 0)
+    c1.cmd("RPUSH", "mk:sort", "3", "1", "2")
+    check("SORT STORE within database 1",
+          c1.cmd("SORT", "mk:sort", "STORE", "mk:sorted"), 3)
+    check("the sorted copy is in database 1",
+          c1.cmd("LRANGE", "mk:sorted", "0", "-1"), [b"1", b"2", b"3"])
+    check("the sorted copy is not in database 0", c0.cmd("EXISTS", "mk:sorted"), 0)
+    c1.cmd("SADD", "mk:sa", "x")
+    c1.cmd("SADD", "mk:sb", "y")
+    check("SUNIONSTORE within database 1",
+          c1.cmd("SUNIONSTORE", "mk:sdst", "mk:sa", "mk:sb"), 2)
+    check("the union is in database 1", sorted(c1.cmd("SMEMBERS", "mk:sdst")), [b"x", b"y"])
+    check("the union is not in database 0", c0.cmd("EXISTS", "mk:sdst"), 0)
+
+    # ----- MULTI/EXEC and WATCH inside a database -----
+    check("MULTI in database 1", c1.cmd("MULTI"), "OK")
+    check("queued SET", c1.cmd("SET", "mk:txn", "1"), "QUEUED")
+    check("queued INCR", c1.cmd("INCR", "mk:txn"), "QUEUED")
+    check("EXEC in database 1", c1.cmd("EXEC"), ["OK", 2])
+    check("the transaction wrote into database 1", c1.cmd("GET", "mk:txn"), b"2")
+    check("the transaction did not write into database 0", c0.cmd("EXISTS", "mk:txn"), 0)
+
+    watcher = fresh(1)
+    writer0 = fresh(0)
+    writer1 = fresh(1)
+    watcher.cmd("SET", "wk", "start")
+    check("WATCH in database 1", watcher.cmd("WATCH", "wk"), "OK")
+    writer0.cmd("SET", "wk", "written in database 0")
+    watcher.cmd("MULTI")
+    watcher.cmd("GET", "wk")
+    check("a write to the same name in database 0 does not break the watch",
+          watcher.cmd("EXEC"), [b"start"])
+    check("WATCH in database 1 again", watcher.cmd("WATCH", "wk"), "OK")
+    writer1.cmd("SET", "wk", "written in database 1")
+    watcher.cmd("MULTI")
+    watcher.cmd("GET", "wk")
+    check("a write in database 1 does break the watch", watcher.cmd("EXEC"), None)
+
+    # ----- blocking pops return the unprefixed key name -----
+    popper = fresh(1)
+    pusher = fresh(1)
+    popper.cmd("DEL", "bl")
+    pusher.send("RPUSH", "bl", "val")
+    pusher.read()
+    check("BLPOP in database 1 returns the raw key name",
+          popper.cmd("BLPOP", "bl", "2"), [b"bl", b"val"])
+    pusher.cmd("RPUSH", "bl2", "q")
+    check("LMPOP in database 1 returns the raw key name",
+          popper.cmd("LMPOP", "1", "bl2", "LEFT"), [b"bl2", [b"q"]])
+    pusher.cmd("ZADD", "bz", "1", "m")
+    check("BZPOPMIN in database 1 returns the raw key name",
+          popper.cmd("BZPOPMIN", "bz", "2"), [b"bz", b"m", b"1"])
+    pusher.cmd("ZADD", "bz2", "1", "m")
+    check("ZMPOP in database 1 returns the raw key name",
+          popper.cmd("ZMPOP", "1", "bz2", "MIN"), [b"bz2", [[b"m", b"1"]]])
+
+    # A blocking pop that actually parks and is woken from another connection
+    # still comes back with the raw name: it resumes on whichever worker picks
+    # the client up, so the database has to travel with the connection.
+    popper.cmd("DEL", "bl3")
+    parked = fresh(1)
+    parked.send("BLPOP", "bl3", "5")
+    time.sleep(0.3)
+    pusher.cmd("RPUSH", "bl3", "late")
+    check("a parked BLPOP in database 1 wakes with the raw key name",
+          parked.read(), [b"bl3", b"late"])
+
+    # ----- MONITOR reports the issuing connection's database and the raw key -----
+    watch_mon = Resp(host, port)
+    check("MONITOR for the database check", watch_mon.cmd("MONITOR"), "OK")
+    watch_mon.read_pushed(0.3)
+    worker_mon = fresh(1)
+    worker_mon.cmd("SET", "mon:db1", "v")
+    mon_lines = [line for line in watch_mon.read_pushed() if MONITOR_LINE.match(line)]
+    bodies = [MONITOR_LINE.match(line) for line in mon_lines]
+    check("MONITOR reports SELECT on the database the client was in",
+          [(m.group(3), m.group(5)) for m in bodies if m.group(5).startswith('"SELECT"')],
+          [("0", '"SELECT" "1"')])
+    check("MONITOR reports the command in database 1 with the raw key",
+          [(m.group(3), m.group(5)) for m in bodies if m.group(5).startswith('"SET"')],
+          [("1", '"SET" "mon:db1" "v"')])
+    watch_mon.cmd("RESET")
+    watch_mon.sock.close()
+    worker_mon.sock.close()
+
+    # ----- INFO keyspace -----
+    info = c0.cmd("INFO", "keyspace")
+    if isinstance(info, bytes):
+        info = info.decode()
+    info = info.replace("\r\n", "\n")
+    check("INFO keyspace reports db0", info,
+          pred=lambda got: re.search(r"^db0:keys=\d+,expires=0,avg_ttl=0$", got,
+                                     re.M) is not None)
+    if os.environ.get("MAKO_REDIS_INFO_ALL_DBS") == "1":
+        # Only a server started with MAKO_REDIS_INFO_ALL_DBS=1 scans the other
+        # fifteen databases; the default reports database 0 alone.
+        c1.cmd("SET", "info:db1", "v")
+        time.sleep(2.1)  # the per-database count is cached for two seconds
+        info = c0.cmd("INFO", "keyspace")
+        if isinstance(info, bytes):
+            info = info.decode()
+        info = info.replace("\r\n", "\n")
+        check("INFO keyspace reports db1 when asked for every database", info,
+              pred=lambda got: re.search(r"^db1:keys=[1-9]\d*,", got, re.M) is not None)
+        c1.cmd("DEL", "info:db1")
+    else:
+        check("INFO keyspace reports no other database by default", info,
+              pred=lambda got: re.search(r"^db[1-9]", got, re.M) is None)
+
+    # ----- RESET returns the connection to database 0 -----
+    resetter = fresh(3)
+    resetter.cmd("SET", "reset:k", "in3")
+    check("RESET from database 3", resetter.cmd("RESET"), "RESET")
+    check("the connection is back on database 0 after RESET",
+          resetter.cmd("EXISTS", "reset:k"), 0)
+    c4 = fresh(4)
+    check("CLIENT LIST reports the selected database", c4.cmd("CLIENT", "LIST"),
+          pred=lambda got: isinstance(got, bytes) and b"db=4" in got)
+    c4.sock.close()
+    resetter.sock.close()
+
+    # Leave the keyspace as the rest of the file expects: one database, empty.
+    c0.cmd("FLUSHALL")
+    for conn in (c1, c2, watcher, writer0, writer1, popper, pusher, parked):
+        conn.sock.close()
+    c0.sock.close()
+
+
 def main():
     host, port = sys.argv[1], int(sys.argv[2])
     c = Resp(host, port)
@@ -1837,6 +2145,9 @@ def main():
 
     # ----- MONITOR -----
     check_monitor(host, port, c)
+
+    # ----- Logical databases: SELECT, MOVE, COPY ... DB -----
+    check_logical_databases(host, port)
 
     c.cmd("SET", "t1", "v")
     c.cmd("SADD", "s1", "a")

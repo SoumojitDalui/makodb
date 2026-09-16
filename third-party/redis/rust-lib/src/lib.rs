@@ -46,6 +46,19 @@ static WORKER_BLPOP_CALLS: [WorkerCounter; MAX_REDIS_WORKERS] =
 
 thread_local! {
     static REDIS_WORKER_ID: Cell<usize> = const { Cell::new(MAX_REDIS_WORKERS) };
+    /// The logical database (SELECT) of the connection this worker thread is
+    /// serving right now.
+    ///
+    /// One worker owns one client for the whole of a frame, from
+    /// `process_buffered_frames` through `parse_resp3`, execution and the
+    /// reply, so a thread-local carries the selected database to
+    /// `validate_user_key` (which turns a Redis-visible key into its
+    /// storage-facing name) and to `write_command_result` (which turns the key
+    /// names in a reply back) without threading a database argument through
+    /// every one of the ninety-seven parse arms that handle a key. See
+    /// `set_current_db` for the paths that keep it in step with
+    /// `ClientState::db`, which is the authoritative copy.
+    static CURRENT_DB: Cell<u8> = const { Cell::new(0) };
 }
 static SCAN_CURSORS: OnceLock<Mutex<HashMap<usize, Bytes>>> = OnceLock::new();
 static PUBSUB_REGISTRY: OnceLock<Mutex<PubSubRegistry>> = OnceLock::new();
@@ -144,6 +157,7 @@ const TXN_OP_ZSET_ALGEBRA: u32 = 74;
 const TXN_OP_ZMPOP: u32 = 75;
 const TXN_OP_ZRANDMEMBER: u32 = 76;
 const TXN_OP_COPY: u32 = 77;
+const TXN_OP_MOVE: u32 = 86;
 const TXN_OP_BITOP: u32 = 78;
 const TXN_OP_HLL_ADD: u32 = 79;
 const TXN_OP_HLL_COUNT: u32 = 80;
@@ -609,6 +623,9 @@ enum OpCode {
     // MONITOR. Local like the three above: it changes only this connection's
     // membership in the monitor registry.
     Monitor = 199,
+    // MOVE key db. A storage op: one executor op copies the object to the
+    // destination database's spelling of the name and deletes the source.
+    Move = 200,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -1222,7 +1239,7 @@ fn feed_monitors(client_state: &ClientState, argv: &[Bytes]) {
     if targets.is_empty() {
         return;
     }
-    let line = format_monitor_line(0, &client_state.peer_addr, argv);
+    let line = format_monitor_line(client_state.db as u32, &client_state.peer_addr, argv);
     for target in &targets {
         enqueue_pubsub_reply(target, &line);
     }
@@ -1286,6 +1303,9 @@ struct ClientState {
     /// The peer address recorded when the connection was accepted, printed in
     /// every monitor line this client causes.
     peer_addr: String,
+    /// The logical database this connection selected, 0..15. This is the
+    /// authoritative copy; `CURRENT_DB` is the worker thread's view of it.
+    db: u8,
 }
 
 impl ClientState {
@@ -1312,12 +1332,15 @@ impl ClientState {
             worker_wake,
             monitoring: false,
             peer_addr: String::from("127.0.0.1:0"),
+            db: 0,
         }
     }
 
     fn reset(&mut self) {
         self.protocol_version = 2;
         self.name = None;
+        // RESET puts the connection back on database 0, as Redis does.
+        self.db = 0;
         self.close_after_reply = false;
         self.blocked = false;
         self.subscribed_channels.clear();
@@ -1397,6 +1420,8 @@ fn parse_opcode(name: &[u8]) -> Option<OpCode> {
         Some(OpCode::Restore)
     } else if ascii_eq_ci(name, b"COPY") {
         Some(OpCode::Copy)
+    } else if ascii_eq_ci(name, b"MOVE") {
+        Some(OpCode::Move)
     } else if ascii_eq_ci(name, b"SCRIPT") {
         Some(OpCode::Script)
     } else if ascii_eq_ci(name, b"EVAL") {
@@ -1799,12 +1824,118 @@ fn part_to_bytes(part: &BytesFrame) -> Result<Bytes, ParseError> {
     }
 }
 
-fn validate_user_key(key: &Bytes) -> Result<(), ParseError> {
-    if key.first() == Some(&0x01) {
-        Err(ParseError::Error("invalid key: reserved internal prefix"))
-    } else {
-        Ok(())
+/// Validates one Redis-visible key and returns the name it is stored under.
+///
+/// This is the single place the logical-database prefix is applied, and every
+/// key that enters the system passes through it, in `cmd.keys` and in
+/// `cmd.values` alike: destinations, sources and the key lists of the blocking
+/// pops. It returns the storage-facing key rather than `()` precisely so that a
+/// call site which forgets to take the result does not compile, because a
+/// forgotten site would let one database read or overwrite another's data.
+///
+/// Callers hand it the raw bytes the client sent; `cmd.args` keeps those raw
+/// bytes, which is what MONITOR and CLUSTER KEYSLOT want.
+fn validate_user_key(key: &Bytes) -> Result<Bytes, ParseError> {
+    match key.first() {
+        // 0x01 is the executor's hidden collection and TTL namespace; 0x02 is
+        // the logical-database namespace this function writes. Redis accepts
+        // any bytes in a key, so both reservations are divergences.
+        Some(&0x01) | Some(&DB_KEY_MARKER) => {
+            Err(ParseError::Error("invalid key: reserved internal prefix"))
+        }
+        _ => Ok(db_key(current_db(), key)),
     }
+}
+
+/// Number of logical databases, as Redis's `databases` config reports it.
+const REDIS_DATABASE_COUNT: i64 = 16;
+
+/// First byte of the hidden prefix that places a key in a logical database.
+/// A key in database `n` (1..15) is stored under `0x02 <n> ':' <key>`;
+/// database 0 keys are stored under exactly the bytes the client sent, so
+/// nothing about the existing keyspace layout moves.
+const DB_KEY_MARKER: u8 = 0x02;
+
+/// The logical database this worker thread is currently acting for.
+#[inline]
+fn current_db() -> u8 {
+    CURRENT_DB.with(|db| db.get())
+}
+
+/// Point this worker thread at a connection's logical database. Called on every
+/// path that starts work for a client: `process_buffered_frames` before it
+/// parses a frame, `service_client` before a blocked or deferred command
+/// resumes, and the SELECT and RESET handlers when the selection changes.
+#[inline]
+fn set_current_db(db: u8) {
+    CURRENT_DB.with(|cell| cell.set(db));
+}
+
+/// Storage-facing name of a Redis-visible key in database `db`.
+///
+/// Database 0 is the identity, and a `Bytes` clone is a refcount bump, so the
+/// database-0 paths every benchmark measures allocate nothing here.
+#[inline]
+fn db_key(db: u8, key: &Bytes) -> Bytes {
+    if db == 0 {
+        return key.clone();
+    }
+    let mut buf = Vec::with_capacity(key.len() + 3);
+    buf.extend_from_slice(&[DB_KEY_MARKER, db, b':']);
+    buf.extend_from_slice(key);
+    Bytes::from(buf)
+}
+
+/// The Redis-visible name of a key that came back from storage, for the replies
+/// that return key names: KEYS, SCAN, RANDOMKEY and the key element of
+/// BLPOP/BRPOP/BLMPOP/LMPOP/BZPOPMIN/BZPOPMAX/BZMPOP/ZMPOP.
+#[inline]
+fn strip_db_key(db: u8, key: &[u8]) -> &[u8] {
+    if db == 0 {
+        return key;
+    }
+    if key.len() >= 3 && key[0] == DB_KEY_MARKER && key[1] == db && key[2] == b':' {
+        &key[3..]
+    } else {
+        key
+    }
+}
+
+/// The scan prefix that selects one logical database, empty for database 0.
+/// It is what KEYS/SCAN/DBSIZE/RANDOMKEY put in front of the literal MATCH
+/// prefix, and what FLUSHDB sends on its own; see the "Logical databases"
+/// comment in `include/transaction_ffi.h` for how the executor reads it.
+fn db_scan_prefix(db: u8) -> Bytes {
+    if db == 0 {
+        Bytes::new()
+    } else {
+        Bytes::from(vec![DB_KEY_MARKER, db, b':'])
+    }
+}
+
+/// The FLUSHDB payload: a one-byte 0x02 sentinel for database 0 (clear
+/// everything that is not in another database) and the three-byte prefix for
+/// the rest. FLUSHALL sends nothing and clears every database.
+fn db_flush_prefix(db: u8) -> Bytes {
+    if db == 0 {
+        Bytes::from_static(&[DB_KEY_MARKER])
+    } else {
+        db_scan_prefix(db)
+    }
+}
+
+/// Parse a SELECT / MOVE / COPY database index with Redis's two error texts.
+fn parse_db_index(arg: &[u8]) -> Result<u8, ParseError> {
+    let Ok(text) = std::str::from_utf8(arg) else {
+        return Err(ParseError::Error("value is not an integer or out of range"));
+    };
+    let Ok(index) = text.parse::<i64>() else {
+        return Err(ParseError::Error("value is not an integer or out of range"));
+    };
+    if !(0..REDIS_DATABASE_COUNT).contains(&index) {
+        return Err(ParseError::Error("DB index is out of range"));
+    }
+    Ok(index as u8)
 }
 
 fn invalid_expire_error(command: &'static str) -> ParseError {
@@ -2307,7 +2438,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("get"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             Ok(Command::new(op, vec![key], None, Vec::new()))
         }
         OpCode::Touch => {
@@ -2317,7 +2448,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             let mut keys = Vec::with_capacity(parts.len() - 1);
             for part in parts.iter().skip(1) {
                 let key = part_to_bytes(part)?;
-                validate_user_key(&key)?;
+                let key = validate_user_key(&key)?;
                 keys.push(key);
             }
             Ok(Command::new(
@@ -2332,7 +2463,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("bitcount"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let mut values = Vec::new();
             if parts.len() >= 4 {
                 let start = part_to_bytes(&parts[2])?;
@@ -2363,7 +2494,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("bitpos"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let bit = part_to_bytes(&parts[2])?;
             if bit.as_ref() != b"0" && bit.as_ref() != b"1" {
                 return Err(ParseError::Error("The bit argument must be 1 or 0."));
@@ -2396,7 +2527,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("bitfield_ro"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let mut values = Vec::new();
             let mut index = 2usize;
             while index < parts.len() {
@@ -2431,7 +2562,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("bitfield"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             // Every Redis-facing check happens here so the executor only ever
             // sees a well-formed payload: groups of four items
             // [kind, encoding, offset, value] as documented on TXN_OP_BITFIELD.
@@ -2533,12 +2664,12 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 ));
             }
             let destination = part_to_bytes(&parts[2])?;
-            validate_user_key(&destination)?;
+            let destination = validate_user_key(&destination)?;
             let mut values = Vec::with_capacity(parts.len() - 2);
             values.push(operation);
             for part in parts.iter().skip(3) {
                 let key = part_to_bytes(part)?;
-                validate_user_key(&key)?;
+                let key = validate_user_key(&key)?;
                 values.push(key);
             }
             let mut cmd = Command::new(
@@ -2555,7 +2686,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("pfadd"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let mut values = Vec::with_capacity(parts.len() - 2);
             for part in parts.iter().skip(2) {
                 values.push(part_to_bytes(part)?);
@@ -2576,7 +2707,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             let mut keys = Vec::with_capacity(parts.len() - 1);
             for part in parts.iter().skip(1) {
                 let key = part_to_bytes(part)?;
-                validate_user_key(&key)?;
+                let key = validate_user_key(&key)?;
                 keys.push(key);
             }
             // The op payload repeats every key, including keys[0], so the C++
@@ -2596,11 +2727,11 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("pfmerge"));
             }
             let destination = part_to_bytes(&parts[1])?;
-            validate_user_key(&destination)?;
+            let destination = validate_user_key(&destination)?;
             let mut values = Vec::with_capacity(parts.len() - 2);
             for part in parts.iter().skip(2) {
                 let key = part_to_bytes(part)?;
-                validate_user_key(&key)?;
+                let key = validate_user_key(&key)?;
                 values.push(key);
             }
             let mut cmd = Command::new(
@@ -2619,7 +2750,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("geoadd"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let mut flags = 0u32;
             let mut index = 2usize;
             while index < parts.len() {
@@ -2687,7 +2818,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 }));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let mut values = Vec::with_capacity(parts.len() - 2);
             for part in parts.iter().skip(2) {
                 values.push(part_to_bytes(part)?);
@@ -2709,7 +2840,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(ParseError::Error("syntax error"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let unit = if parts.len() == 5 {
                 part_to_bytes(&parts[4])?
             } else {
@@ -2757,7 +2888,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("object"));
             }
             let key = part_to_bytes(&parts[2])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             Ok(Command::new(
                 op,
                 vec![key],
@@ -2772,7 +2903,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             let mut keys = Vec::with_capacity(parts.len() - 1);
             for part in parts.iter().skip(1) {
                 let key = part_to_bytes(part)?;
-                validate_user_key(&key)?;
+                let key = validate_user_key(&key)?;
                 keys.push(key);
             }
             Ok(Command::new(
@@ -2793,7 +2924,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             let mut keys = Vec::with_capacity(parts.len() - 1);
             for part in parts.iter().skip(1) {
                 let key = part_to_bytes(part)?;
-                validate_user_key(&key)?;
+                let key = validate_user_key(&key)?;
                 keys.push(key);
             }
             Ok(Command::new(
@@ -2813,8 +2944,8 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             }
             let source = part_to_bytes(&parts[1])?;
             let destination = part_to_bytes(&parts[2])?;
-            validate_user_key(&source)?;
-            validate_user_key(&destination)?;
+            let source = validate_user_key(&source)?;
+            let destination = validate_user_key(&destination)?;
             let mut cmd = Command::new(
                 op,
                 vec![source],
@@ -2836,7 +2967,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 }));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let mut alpha = false;
             let mut desc = false;
             let mut store = Bytes::new();
@@ -2871,8 +3002,9 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                     if op == OpCode::SortRo || index + 1 >= parts.len() {
                         return Err(ParseError::Protocol("syntax error"));
                     }
-                    store = part_to_bytes(&parts[index + 1])?;
-                    validate_user_key(&store)?;
+                    // Assigned, not shadowed: `store` is declared before the
+                    // option loop, so the prefixed name has to land there.
+                    store = validate_user_key(&part_to_bytes(&parts[index + 1])?)?;
                     index += 2;
                 } else {
                     return Err(ParseError::Protocol("syntax error"));
@@ -2898,7 +3030,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("set"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let val = part_to_bytes(&parts[2])?;
             let mut cmd = Command::new(op, vec![key], Some(val), Vec::new());
             let mut index = 3;
@@ -2956,7 +3088,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 }));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let ttl = part_to_bytes(&parts[2])?;
             let val = part_to_bytes(&parts[3])?;
             let mut cmd = Command::new(
@@ -2988,7 +3120,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             let mut values = Vec::with_capacity((parts.len() - 1) / 2);
             for pair in parts[1..].chunks_exact(2) {
                 let key = part_to_bytes(&pair[0])?;
-                validate_user_key(&key)?;
+                let key = validate_user_key(&key)?;
                 let value = part_to_bytes(&pair[1])?;
                 if let Some(index) = keys
                     .iter()
@@ -3027,7 +3159,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 }));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let mut val = part_to_bytes(&parts[2])?;
             if op == OpCode::DecrBy {
                 // DECRBY runs as INCRBY with the amount negated, so the amount
@@ -3068,7 +3200,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 }));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let mut cmd = Command::new(
                 op,
                 vec![key],
@@ -3092,7 +3224,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 }));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let offset_arg = part_to_bytes(&parts[2])?;
             let offset = parse_i64_error_arg(
                 offset_arg.as_ref(),
@@ -3126,7 +3258,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("setrange"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let offset_arg = part_to_bytes(&parts[2])?;
             let offset = parse_i64_error_arg(offset_arg.as_ref(), "offset is out of range")?;
             if offset < 0 {
@@ -3151,7 +3283,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("getrange"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let start = part_to_bytes(&parts[2])?;
             let end = part_to_bytes(&parts[3])?;
             parse_i64_arg(start.as_ref())?;
@@ -3171,8 +3303,8 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             }
             let key1 = part_to_bytes(&parts[1])?;
             let key2 = part_to_bytes(&parts[2])?;
-            validate_user_key(&key1)?;
-            validate_user_key(&key2)?;
+            let key1 = validate_user_key(&key1)?;
+            let key2 = validate_user_key(&key2)?;
             let mut index = 3usize;
             let mut saw_len = false;
             let mut saw_idx = false;
@@ -3223,7 +3355,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("dump"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             Ok(Command::new(
                 op,
                 vec![key],
@@ -3236,7 +3368,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("restore"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             parse_i64_arg(part_to_bytes(&parts[2])?.as_ref())?;
             let payload = part_to_bytes(&parts[3])?;
             let ttl_ms = parse_i64_arg(part_to_bytes(&parts[2])?.as_ref())?;
@@ -3315,10 +3447,12 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             if parts.len() < 3 {
                 return Err(wrong_arity("copy"));
             }
-            let source = part_to_bytes(&parts[1])?;
-            let destination = part_to_bytes(&parts[2])?;
-            validate_user_key(&source)?;
-            validate_user_key(&destination)?;
+            let raw_source = part_to_bytes(&parts[1])?;
+            let raw_destination = part_to_bytes(&parts[2])?;
+            let source = validate_user_key(&raw_source)?;
+            // Validated here so `COPY k \x02x` is rejected whatever DB says;
+            // the name is re-prefixed below once DB has been read.
+            let mut destination = validate_user_key(&raw_destination)?;
             let mut replace = false;
             let mut index = 3usize;
             while index < parts.len() {
@@ -3333,10 +3467,13 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                     if index + 1 >= parts.len() {
                         return Err(ParseError::Protocol("syntax error"));
                     }
-                    parse_i64_error_arg(
-                        part_to_bytes(&parts[index + 1])?.as_ref(),
-                        "value is not an integer or out of range",
-                    )?;
+                    let target = parse_db_index(part_to_bytes(&parts[index + 1])?.as_ref())?;
+                    if target == current_db() && raw_source == raw_destination {
+                        return Err(ParseError::Error(
+                            "source and destination objects are the same",
+                        ));
+                    }
+                    destination = db_key(target, &raw_destination);
                     index += 2;
                 } else {
                     return Err(ParseError::Protocol("syntax error"));
@@ -3352,6 +3489,30 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             cmd.expire_at_ms = if replace { 1 } else { 0 };
             Ok(cmd)
         }
+        OpCode::Move => {
+            if parts.len() != 3 {
+                return Err(wrong_arity("move"));
+            }
+            let raw_key = part_to_bytes(&parts[1])?;
+            let source = validate_user_key(&raw_key)?;
+            let target = parse_db_index(part_to_bytes(&parts[2])?.as_ref())?;
+            if target == current_db() {
+                return Err(ParseError::Error(
+                    "source and destination objects are the same",
+                ));
+            }
+            let mut cmd = Command::new(
+                op,
+                vec![source],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            // The destination is the same Redis-visible name spelled for the
+            // target database. It travels in `values` so the executor's lock
+            // stripes pick it up through add_packed_lock_keys, like SMOVE's.
+            cmd.values = vec![db_key(target, &raw_key)];
+            Ok(cmd)
+        }
         OpCode::BLPop | OpCode::BRPop => {
             if parts.len() < 3 {
                 return Err(wrong_arity(if op == OpCode::BLPop {
@@ -3365,7 +3526,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             let mut keys = Vec::with_capacity(parts.len() - 2);
             for part in parts.iter().skip(1).take(parts.len() - 2) {
                 let key = part_to_bytes(part)?;
-                validate_user_key(&key)?;
+                let key = validate_user_key(&key)?;
                 keys.push(key);
             }
             let mut cmd = Command::new(
@@ -3406,7 +3567,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             let mut keys = Vec::with_capacity(numkeys);
             for part in parts.iter().skip(first_key_index).take(numkeys) {
                 let key = part_to_bytes(part)?;
-                validate_user_key(&key)?;
+                let key = validate_user_key(&key)?;
                 keys.push(key);
             }
             let direction = part_to_bytes(&parts[first_key_index + numkeys])?;
@@ -3464,7 +3625,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 }));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let ttl = part_to_bytes(&parts[2])?;
             let mut cmd = Command::new(
                 op,
@@ -3505,7 +3666,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("getex"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let mut cmd = Command::new(
                 op,
                 vec![key],
@@ -3542,7 +3703,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("getdel"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             Ok(Command::new(
                 op,
                 vec![key],
@@ -3562,7 +3723,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 }));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             Ok(Command::new(
                 op,
                 vec![key],
@@ -3582,6 +3743,12 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
             );
             cmd.scan_prefix = literal_prefix(cmd.val.as_ref().unwrap().as_ref());
+            // The selected database's prefix goes in front of the literal
+            // MATCH prefix, which is what scopes the walk; for database 0 it
+            // is the identity and the executor skips the 0x02 namespace on its
+            // own. The pattern is matched against the stripped name in the
+            // reply, so it keeps meaning what the client wrote.
+            cmd.scan_prefix = db_key(current_db(), &cmd.scan_prefix);
             cmd.scan_count = 1_000_000;
             Ok(cmd)
         }
@@ -3633,25 +3800,34 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             if !cmd.scan_type_matches {
                 cmd.scan_prefix = Bytes::from_static(b"\x01");
             }
+            // As in KEYS. A TYPE that is not "string" still matches nothing:
+            // no key in any database may start with 0x01.
+            cmd.scan_prefix = db_key(current_db(), &cmd.scan_prefix);
             Ok(cmd)
         }
         OpCode::DbSize => {
             if parts.len() != 1 {
                 return Err(wrong_arity("dbsize"));
             }
-            Ok(Command::new(
+            let mut cmd = Command::new(
                 op,
                 Vec::new(),
                 None,
                 command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
-            ))
+            );
+            // Counts one database, through the same scan prefix KEYS uses. An
+            // empty prefix is database 0, which keeps the executor's chunked
+            // count-only fast path (it requires an empty prefix) exactly where
+            // it was.
+            cmd.scan_prefix = db_scan_prefix(current_db());
+            Ok(cmd)
         }
         OpCode::Type => {
             if parts.len() != 2 {
                 return Err(wrong_arity("type"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             Ok(Command::new(
                 op,
                 vec![key],
@@ -3668,7 +3844,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 }));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let mut values = Vec::with_capacity(parts.len() - 2);
             for part in parts.iter().skip(2) {
                 values.push(part_to_bytes(part)?);
@@ -3694,7 +3870,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 }));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let mut cmd = Command::new(
                 op,
                 vec![key],
@@ -3715,7 +3891,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 }));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let increment = part_to_bytes(&parts[3])?;
             if op == OpCode::HIncrBy {
                 parse_i64_error_arg(
@@ -3743,7 +3919,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 }));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let mut values = Vec::with_capacity(parts.len() - 2);
             for part in parts.iter().skip(2) {
                 values.push(part_to_bytes(part)?);
@@ -3768,7 +3944,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 }));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             Ok(Command::new(
                 op,
                 vec![key],
@@ -3781,7 +3957,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("hrandfield"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let mut cmd = Command::new(
                 op,
                 vec![key],
@@ -3817,7 +3993,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity(name));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let ttl = part_to_bytes(&parts[2])?;
             // Redis reads at most one condition here, between the time and
             // FIELDS. A second one is reported as incompatible when it cannot
@@ -3883,7 +4059,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity(name));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             if !ascii_eq_ci(part_to_bytes(&parts[2])?.as_ref(), b"FIELDS") {
                 return Err(ParseError::Error(
                     "Mandatory argument FIELDS is missing or not at the right position",
@@ -3904,7 +4080,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("hscan"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let cursor = part_to_bytes(&parts[2])?;
             let mut cmd = Command::new(
                 op,
@@ -3949,7 +4125,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 }));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let mut members = Vec::with_capacity(parts.len() - 2);
             for part in parts.iter().skip(2) {
                 members.push(part_to_bytes(part)?);
@@ -3972,7 +4148,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 }));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             Ok(Command::new(
                 op,
                 vec![key],
@@ -3985,7 +4161,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("sscan"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let cursor = part_to_bytes(&parts[2])?;
             let mut cmd = Command::new(
                 op,
@@ -4023,7 +4199,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("sismember"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let member = part_to_bytes(&parts[2])?;
             Ok(Command::new(
                 op,
@@ -4037,7 +4213,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("smismember"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let mut values = Vec::with_capacity(parts.len() - 2);
             for part in parts.iter().skip(2) {
                 values.push(part_to_bytes(part)?);
@@ -4057,8 +4233,8 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             }
             let source = part_to_bytes(&parts[1])?;
             let destination = part_to_bytes(&parts[2])?;
-            validate_user_key(&source)?;
-            validate_user_key(&destination)?;
+            let source = validate_user_key(&source)?;
+            let destination = validate_user_key(&destination)?;
             let member = part_to_bytes(&parts[3])?;
             let mut cmd = Command::new(
                 op,
@@ -4078,7 +4254,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 }));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let mut cmd = Command::new(
                 op,
                 vec![key],
@@ -4110,7 +4286,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             let mut keys = Vec::with_capacity(parts.len() - 1);
             for part in parts.iter().skip(1) {
                 let key = part_to_bytes(part)?;
-                validate_user_key(&key)?;
+                let key = validate_user_key(&key)?;
                 keys.push(key);
             }
             Ok(Command::new(
@@ -4140,7 +4316,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             let mut keys = Vec::with_capacity(num_keys);
             for part in parts.iter().skip(2).take(num_keys) {
                 let key = part_to_bytes(part)?;
-                validate_user_key(&key)?;
+                let key = validate_user_key(&key)?;
                 keys.push(key);
             }
             let mut cmd = Command::new(
@@ -4179,12 +4355,12 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 }));
             }
             let destination = part_to_bytes(&parts[1])?;
-            validate_user_key(&destination)?;
+            let destination = validate_user_key(&destination)?;
             let mut keys = Vec::with_capacity(parts.len() - 1);
             keys.push(destination);
             for part in parts.iter().skip(2) {
                 let key = part_to_bytes(part)?;
-                validate_user_key(&key)?;
+                let key = validate_user_key(&key)?;
                 keys.push(key);
             }
             Ok(Command::new(
@@ -4205,7 +4381,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 }));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let mut values = Vec::with_capacity(parts.len() - 2);
             for part in parts.iter().skip(2) {
                 values.push(part_to_bytes(part)?);
@@ -4228,7 +4404,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 }));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let mut cmd = Command::new(
                 op,
                 vec![key],
@@ -4250,7 +4426,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("llen"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             Ok(Command::new(
                 op,
                 vec![key],
@@ -4263,7 +4439,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("lindex"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let index = part_to_bytes(&parts[2])?;
             let mut cmd = Command::new(
                 op,
@@ -4283,7 +4459,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 }));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let start = part_to_bytes(&parts[2])?;
             let stop = part_to_bytes(&parts[3])?;
             parse_i64_arg(start.as_ref())?;
@@ -4306,7 +4482,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 }));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let number = part_to_bytes(&parts[2])?;
             parse_i64_arg(number.as_ref())?;
             let value = part_to_bytes(&parts[3])?;
@@ -4324,7 +4500,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("linsert"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let position = part_to_bytes(&parts[2])?;
             let before = if ascii_eq_ci(position.as_ref(), b"BEFORE") {
                 true
@@ -4358,8 +4534,8 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             }
             let source = part_to_bytes(&parts[1])?;
             let destination = part_to_bytes(&parts[2])?;
-            validate_user_key(&source)?;
-            validate_user_key(&destination)?;
+            let source = validate_user_key(&source)?;
+            let destination = validate_user_key(&destination)?;
             let source_left = parse_list_side(part_to_bytes(&parts[3])?.as_ref())?;
             let dest_left = parse_list_side(part_to_bytes(&parts[4])?.as_ref())?;
             let timeout_ms = if op == OpCode::BLMove {
@@ -4394,8 +4570,8 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             }
             let source = part_to_bytes(&parts[1])?;
             let destination = part_to_bytes(&parts[2])?;
-            validate_user_key(&source)?;
-            validate_user_key(&destination)?;
+            let source = validate_user_key(&source)?;
+            let destination = validate_user_key(&destination)?;
             let timeout_ms = if op == OpCode::BRPopLPush {
                 parse_blocking_timeout_ms(part_to_bytes(&parts[3])?.as_ref())?
             } else {
@@ -4417,7 +4593,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("lpos"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let element = part_to_bytes(&parts[2])?;
             let mut cmd = Command::new(
                 op,
@@ -4474,7 +4650,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("zadd"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let mut flags = 0u32;
             let mut index = 2usize;
             while index < parts.len() {
@@ -4535,7 +4711,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("zincrby"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let increment = part_to_bytes(&parts[2])?;
             parse_zadd_score_arg(increment.as_ref())?;
             let member = part_to_bytes(&parts[3])?;
@@ -4560,7 +4736,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 }));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let member = part_to_bytes(&parts[2])?;
             let mut cmd = Command::new(
                 op,
@@ -4582,7 +4758,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("zmscore"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let mut members = Vec::with_capacity(parts.len() - 2);
             for part in parts.iter().skip(2) {
                 members.push(part_to_bytes(part)?);
@@ -4601,7 +4777,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("zrem"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let mut members = Vec::with_capacity(parts.len() - 2);
             for part in parts.iter().skip(2) {
                 members.push(part_to_bytes(part)?);
@@ -4620,7 +4796,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("zcard"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             Ok(Command::new(
                 op,
                 vec![key],
@@ -4646,7 +4822,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 }));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let first = part_to_bytes(&parts[2])?;
             let second = part_to_bytes(&parts[3])?;
             let mut flags = 0u32;
@@ -4736,7 +4912,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("zlexcount"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let min = part_to_bytes(&parts[2])?;
             let max = part_to_bytes(&parts[3])?;
             parse_zlex_bound_arg(min.as_ref())?;
@@ -4761,7 +4937,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 }));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let min = part_to_bytes(&parts[2])?;
             let max = part_to_bytes(&parts[3])?;
             let mode = match op {
@@ -4798,8 +4974,8 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             }
             let destination = part_to_bytes(&parts[1])?;
             let source = part_to_bytes(&parts[2])?;
-            validate_user_key(&destination)?;
-            validate_user_key(&source)?;
+            let destination = validate_user_key(&destination)?;
+            let source = validate_user_key(&source)?;
             let first = part_to_bytes(&parts[3])?;
             let second = part_to_bytes(&parts[4])?;
             let mut flags = 0u32;
@@ -4888,7 +5064,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             }
             let destination = if store {
                 let dst = part_to_bytes(&parts[1])?;
-                validate_user_key(&dst)?;
+                let dst = validate_user_key(&dst)?;
                 dst
             } else {
                 Bytes::new()
@@ -4936,7 +5112,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             let mut sources = Vec::with_capacity(numkeys);
             for part in parts.iter().skip(first_key).take(numkeys) {
                 let key = part_to_bytes(part)?;
-                validate_user_key(&key)?;
+                let key = validate_user_key(&key)?;
                 sources.push(key);
             }
             let mut weights: Vec<Bytes> = (0..numkeys).map(|_| Bytes::from_static(b"1")).collect();
@@ -5044,7 +5220,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("zcount"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let min = part_to_bytes(&parts[2])?;
             let max = part_to_bytes(&parts[3])?;
             parse_zrange_bound_arg(min.as_ref())?;
@@ -5067,7 +5243,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 }));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let mut cmd = Command::new(
                 op,
                 vec![key],
@@ -5116,7 +5292,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             let mut keys = Vec::with_capacity(numkeys);
             for part in parts.iter().skip(first_key).take(numkeys) {
                 let key = part_to_bytes(part)?;
-                validate_user_key(&key)?;
+                let key = validate_user_key(&key)?;
                 keys.push(key);
             }
             let direction = part_to_bytes(&parts[first_key + numkeys])?;
@@ -5166,7 +5342,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("zrandmember"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let mut cmd = Command::new(
                 op,
                 vec![key],
@@ -5209,7 +5385,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             let mut keys = Vec::with_capacity(parts.len() - 2);
             for part in parts.iter().skip(1).take(parts.len() - 2) {
                 let key = part_to_bytes(part)?;
-                validate_user_key(&key)?;
+                let key = validate_user_key(&key)?;
                 keys.push(key);
             }
             let mut cmd = Command::new(
@@ -5230,7 +5406,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 return Err(wrong_arity("zscan"));
             }
             let key = part_to_bytes(&parts[1])?;
-            validate_user_key(&key)?;
+            let key = validate_user_key(&key)?;
             let cursor = part_to_bytes(&parts[2])?;
             let mut cmd = Command::new(
                 op,
@@ -5391,12 +5567,21 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 None,
                 command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
             );
+            // RANDOMKEY walks one database and FLUSHDB clears one; both carry
+            // it in the scan prefix (DBSIZE does the same in its own arm).
+            // FLUSHALL sends nothing, which is what tells the executor to
+            // clear every database.
+            if op == OpCode::RandomKey {
+                cmd.scan_prefix = db_scan_prefix(current_db());
+            } else if op == OpCode::FlushDb {
+                cmd.scan_prefix = db_flush_prefix(current_db());
+            }
             if op == OpCode::Memory
                 && cmd.args.len() >= 2
                 && ascii_eq_ci(cmd.args[0].as_ref(), b"USAGE")
             {
                 let key = cmd.args[1].clone();
-                validate_user_key(&key)?;
+                let key = validate_user_key(&key)?;
                 cmd.keys = vec![key];
             }
             Ok(cmd)
@@ -6577,6 +6762,25 @@ fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)
                     group_id: 0,
                 });
             }
+            OpCode::Move => {
+                let Some(source) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                let payload = pack_bytes_list(&cmd.values);
+                payloads.push(payload);
+                let payload = payloads.last().unwrap();
+                ops.push(TxnOperation {
+                    op: TXN_OP_MOVE,
+                    key_ptr: source.as_ptr(),
+                    key_len: source.len(),
+                    val_ptr: payload.as_ptr(),
+                    val_len: payload.len(),
+                    flags: 0,
+                    expire_at_ms: -1,
+                    group_id: 0,
+                });
+            }
             OpCode::Sort | OpCode::SortRo => {
                 let Some(key) = cmd.keys.first() else {
                     spans.push((start, 0));
@@ -7038,8 +7242,8 @@ fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)
                     op: TXN_OP_SCAN,
                     key_ptr: std::ptr::null(),
                     key_len: 0,
-                    val_ptr: std::ptr::null(),
-                    val_len: 0,
+                    val_ptr: cmd.scan_prefix.as_ptr(),
+                    val_len: cmd.scan_prefix.len(),
                     flags: 0,
                     expire_at_ms: 1_000_000,
                     group_id: 0,
@@ -7050,8 +7254,8 @@ fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)
                     op: TXN_OP_SCAN,
                     key_ptr: std::ptr::null(),
                     key_len: 0,
-                    val_ptr: std::ptr::null(),
-                    val_len: 0,
+                    val_ptr: cmd.scan_prefix.as_ptr(),
+                    val_len: cmd.scan_prefix.len(),
                     flags: TXN_FLAG_SCAN_COUNT_ONLY,
                     expire_at_ms: -1,
                     group_id: 0,
@@ -7062,8 +7266,8 @@ fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)
                     op: TXN_OP_FLUSHDB,
                     key_ptr: std::ptr::null(),
                     key_len: 0,
-                    val_ptr: std::ptr::null(),
-                    val_len: 0,
+                    val_ptr: cmd.scan_prefix.as_ptr(),
+                    val_len: cmd.scan_prefix.len(),
                     flags: 0,
                     expire_at_ms: -1,
                     group_id: 0,
@@ -8087,6 +8291,7 @@ fn command_needs_retry(cmd: &Command) -> bool {
             | OpCode::Dump
             | OpCode::Restore
             | OpCode::Copy
+            | OpCode::Move
             | OpCode::Touch
             | OpCode::SortRo
             | OpCode::BitCount
@@ -9833,7 +10038,7 @@ fn write_command_result<W: Write>(
                 write_err(writer, "operation failed")?;
             }
         }
-        OpCode::Copy => {
+        OpCode::Copy | OpCode::Move => {
             if first.success {
                 write_integer(writer, first.int_value)?;
             } else {
@@ -9971,6 +10176,13 @@ fn write_command_result<W: Write>(
         OpCode::Keys => {
             let pattern = cmd.val.as_ref().map(|v| v.as_ref()).unwrap_or(b"*");
             if let Some((_, keys)) = scan_result_from_response(first) {
+                // The client asked about its own database, so it gets the
+                // names it would have sent, without the database prefix.
+                let db = current_db();
+                let keys: Vec<Vec<u8>> = keys
+                    .into_iter()
+                    .map(|key| strip_db_key(db, &key).to_vec())
+                    .collect();
                 write_keys_array(writer, keys, pattern)?;
             } else {
                 write_err(writer, "operation failed")?;
@@ -9979,8 +10191,13 @@ fn write_command_result<W: Write>(
         OpCode::Scan => {
             let pattern = cmd.val.as_ref().map(|v| v.as_ref()).unwrap_or(b"*");
             if let Some((cursor, keys)) = scan_result_from_response(first) {
+                // Stripped before MATCH runs, so the pattern means what the
+                // client wrote. The cursor stays in its storage-facing form,
+                // because it is opaque and goes straight back to the executor.
+                let db = current_db();
                 let matched: Vec<Vec<u8>> = keys
                     .into_iter()
+                    .map(|key| strip_db_key(db, &key).to_vec())
                     .filter(|key| glob_matches(pattern, key))
                     .collect();
                 write_array_header(writer, 2)?;
@@ -9999,7 +10216,7 @@ fn write_command_result<W: Write>(
                     write_null(writer, protocol_version)?;
                 } else {
                     let index = RANDOMKEY_COUNTER.fetch_add(1, Ordering::Relaxed) % keys.len();
-                    write_bulk(writer, &keys[index])?;
+                    write_bulk(writer, strip_db_key(current_db(), &keys[index]))?;
                 }
             } else {
                 write_err(writer, "operation failed")?;
@@ -10409,14 +10626,15 @@ fn write_command_result<W: Write>(
                         write_err(writer, "operation failed")?;
                     } else if cmd.op == OpCode::BLMPop || cmd.op == OpCode::LMPop {
                         write_array_header(writer, 2)?;
-                        write_bulk(writer, &items[0])?;
+                        // items[0] names the list that was popped.
+                        write_bulk(writer, strip_db_key(current_db(), &items[0]))?;
                         write_array_header(writer, items.len() - 1)?;
                         for item in items.iter().skip(1) {
                             write_bulk(writer, item)?;
                         }
                     } else {
                         write_array_header(writer, 2)?;
-                        write_bulk(writer, &items[0])?;
+                        write_bulk(writer, strip_db_key(current_db(), &items[0]))?;
                         write_bulk(writer, &items[1])?;
                     }
                 } else {
@@ -10652,7 +10870,7 @@ fn write_command_result<W: Write>(
                         write_err(writer, "operation failed")?;
                     } else {
                         write_array_header(writer, 2)?;
-                        write_bulk(writer, &items[0])?;
+                        write_bulk(writer, strip_db_key(current_db(), &items[0]))?;
                         write_array_header(writer, (items.len() - 1) / 2)?;
                         for pair in items[1..].chunks_exact(2) {
                             write_array_header(writer, 2)?;
@@ -10730,7 +10948,7 @@ fn write_command_result<W: Write>(
                         write_err(writer, "operation failed")?;
                     } else {
                         write_array_header(writer, 3)?;
-                        write_bulk(writer, &items[0])?;
+                        write_bulk(writer, strip_db_key(current_db(), &items[0]))?;
                         write_bulk(writer, &items[1])?;
                         if protocol_version >= 3 {
                             write_double_text(writer, &items[2])?;
@@ -11188,6 +11406,7 @@ fn is_dirty_command(op: OpCode) -> bool {
             | OpCode::Rename
             | OpCode::RenameNx
             | OpCode::Copy
+            | OpCode::Move
             | OpCode::Sort
             | OpCode::BitOp
             | OpCode::BitField
@@ -11337,6 +11556,7 @@ fn bump_modified_key_versions(cmd: &Command) {
         OpCode::Rename
         | OpCode::RenameNx
         | OpCode::Copy
+        | OpCode::Move
         | OpCode::Sort
         | OpCode::SMove
         | OpCode::SInterStore
@@ -11726,7 +11946,10 @@ fn parse_raw_mako_string_command(buf: &[u8]) -> RawMakoParse<'_> {
         }) else {
             return RawMakoParse::Incomplete;
         };
-        if key.first() == Some(&0x01) {
+        // Both reserved first bytes fall back to the general parser, which is
+        // the one place that turns them into the reserved-prefix error: 0x01
+        // is the executor's hidden namespace, 0x02 the logical-database one.
+        if matches!(key.first(), Some(&0x01) | Some(&DB_KEY_MARKER)) {
             return RawMakoParse::NotFast;
         }
         return RawMakoParse::Complete {
@@ -11741,7 +11964,10 @@ fn parse_raw_mako_string_command(buf: &[u8]) -> RawMakoParse<'_> {
         }) else {
             return RawMakoParse::Incomplete;
         };
-        if key.first() == Some(&0x01) {
+        // Both reserved first bytes fall back to the general parser, which is
+        // the one place that turns them into the reserved-prefix error: 0x01
+        // is the executor's hidden namespace, 0x02 the logical-database one.
+        if matches!(key.first(), Some(&0x01) | Some(&DB_KEY_MARKER)) {
             return RawMakoParse::NotFast;
         }
         let Some((value, consumed)) = (match read_resp_bulk(buf, next_offset) {
@@ -11778,6 +12004,12 @@ fn can_use_raw_mako_fast_path(client: &ClientConn) -> bool {
     // changes.
     MONITOR_COUNT.load(Ordering::Relaxed) == 0
         && redis_backend() == RedisBackend::Mako
+        // The shortcut sends the key straight to storage without building a
+        // Command, so it never applies a database prefix: a connection that
+        // selected database 1..15 has to go through the general parser. One
+        // field load from a struct the surrounding code already touches,
+        // mirroring the monitor gate above.
+        && client.client_state.db == 0
         && !client.txn_state.in_multi
         && !client.client_state.in_subscriber_mode()
         && client.pending_command.is_none()
@@ -11850,6 +12082,13 @@ fn process_buffered_frames(
                 } else {
                     None
                 };
+                // The parse arms turn Redis-visible keys into storage-facing
+                // names, and they read the database from the worker thread.
+                // A worker serves one client's frame at a time, so setting it
+                // here, once per frame, covers parsing, execution and the
+                // reply. The raw GET/SET shortcut above never reads it: it
+                // only runs for a client that is on database 0.
+                set_current_db(client.client_state.db);
                 match parse_resp3(frame) {
                     Ok(cmd) => {
                         // Redis reports a command before running it, and only
@@ -11898,6 +12137,10 @@ fn process_buffered_frames(
 fn service_client(client: &mut ClientConn) -> std::io::Result<ClientEvent> {
     let mut made_progress = false;
     let mut wake_blocked = false;
+    // A blocked or deferred command resumes on whichever worker picks the
+    // client up next, and its reply still has to strip that connection's
+    // database prefix from the key names it returns.
+    set_current_db(client.client_state.db);
 
     if drain_pubsub_queue(client) {
         made_progress = true;
@@ -12223,8 +12466,8 @@ fn handle_client_command<W: Write>(
             .unwrap_or_default();
         let flags = if client_state.blocked { "b" } else { "N" };
         let line = format!(
-            "id={} name={} flags={} db=0\r\n",
-            client_state.id, name, flags
+            "id={} name={} flags={} db={}\r\n",
+            client_state.id, name, flags, client_state.db
         );
         write_bulk(writer, line.as_bytes())
     } else {
@@ -12847,7 +13090,7 @@ fn parse_geo_search(parts: &[BytesFrame]) -> Result<Command, ParseError> {
     }
 
     let key = part_to_bytes(&parts[1])?;
-    validate_user_key(&key)?;
+    let key = validate_user_key(&key)?;
 
     let mut spec = GeoSearchSpec {
         center_lon: 0.0,
@@ -13890,24 +14133,40 @@ fn handle_object_local<W: Write>(_cmd: &Command, writer: &mut W) -> std::io::Res
 
 // ===== INFO keyspace =====
 
-static KEYSPACE_COUNT_CACHE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
-static KEYSPACE_COUNT_AT_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static KEYSPACE_COUNT_CACHE: [std::sync::atomic::AtomicI64; REDIS_DATABASE_COUNT as usize] =
+    [const { std::sync::atomic::AtomicI64::new(-1) }; REDIS_DATABASE_COUNT as usize];
+static KEYSPACE_COUNT_AT_MS: [std::sync::atomic::AtomicI64; REDIS_DATABASE_COUNT as usize] =
+    [const { std::sync::atomic::AtomicI64::new(0) }; REDIS_DATABASE_COUNT as usize];
+static INFO_ALL_DBS: OnceLock<bool> = OnceLock::new();
 
-/// Count visible keys the same way DBSIZE does, cached for two seconds so
-/// frequent INFO scrapes do not each walk the keyspace.
-fn keyspace_key_count() -> Option<i64> {
+/// Whether INFO keyspace should scan databases 1..15 as well as database 0.
+/// Off by default: each database costs its own keyspace scan.
+fn info_all_dbs() -> bool {
+    *INFO_ALL_DBS.get_or_init(|| env::var("MAKO_REDIS_INFO_ALL_DBS").as_deref() == Ok("1"))
+}
+
+/// Count the visible keys of one logical database the way DBSIZE does, cached
+/// for two seconds per database so frequent INFO scrapes do not each walk the
+/// keyspace.
+fn keyspace_key_count(db: u8) -> Option<i64> {
+    let slot = db as usize;
+    if slot >= KEYSPACE_COUNT_CACHE.len() {
+        return None;
+    }
     let now = unix_time_ms();
-    let cached = KEYSPACE_COUNT_CACHE.load(Ordering::Relaxed);
-    let cached_at = KEYSPACE_COUNT_AT_MS.load(Ordering::Relaxed);
+    let cached = KEYSPACE_COUNT_CACHE[slot].load(Ordering::Relaxed);
+    let cached_at = KEYSPACE_COUNT_AT_MS[slot].load(Ordering::Relaxed);
     if cached >= 0 && now.saturating_sub(cached_at) < 2000 {
         return Some(cached);
     }
+    // Kept alive for the whole call: the executor reads these bytes.
+    let prefix = db_scan_prefix(db);
     let ops = [TxnOperation {
         op: TXN_OP_SCAN,
         key_ptr: std::ptr::null(),
         key_len: 0,
-        val_ptr: std::ptr::null(),
-        val_len: 0,
+        val_ptr: prefix.as_ptr(),
+        val_len: prefix.len(),
         flags: TXN_FLAG_SCAN_COUNT_ONLY,
         expire_at_ms: -1,
         group_id: 0,
@@ -13954,16 +14213,34 @@ fn keyspace_key_count() -> Option<i64> {
         count
     };
     if let Some(count) = count {
-        KEYSPACE_COUNT_CACHE.store(count, Ordering::Relaxed);
-        KEYSPACE_COUNT_AT_MS.store(now, Ordering::Relaxed);
+        KEYSPACE_COUNT_CACHE[slot].store(count, Ordering::Relaxed);
+        KEYSPACE_COUNT_AT_MS[slot].store(now, Ordering::Relaxed);
     }
     count
 }
 
 fn append_keyspace_info(out: &mut String) {
     out.push_str("# Keyspace\r\n");
-    if let Some(count) = keyspace_key_count() {
-        out.push_str("db0:keys=");
+    // Database 0 is always reported, from the cached count it has always used.
+    // Counting the other fifteen means fifteen more keyspace scans per INFO, so
+    // they are reported only when MAKO_REDIS_INFO_ALL_DBS=1 asks for them, and
+    // then only when they hold a key, which is what Redis does for every
+    // database. Recorded in known_divergences.txt.
+    let last = if info_all_dbs() {
+        REDIS_DATABASE_COUNT as u8 - 1
+    } else {
+        0
+    };
+    for db in 0..=last {
+        let Some(count) = keyspace_key_count(db) else {
+            continue;
+        };
+        if db != 0 && count == 0 {
+            continue;
+        }
+        out.push_str("db");
+        out.push_str(&db.to_string());
+        out.push_str(":keys=");
         out.push_str(&count.to_string());
         out.push_str(",expires=0,avg_ttl=0\r\n");
     }
@@ -13995,7 +14272,7 @@ fn config_value(name: &[u8]) -> Option<(&'static [u8], &'static [u8])> {
     } else if ascii_eq_ci(name, b"appendonly") {
         Some((b"appendonly", b"no"))
     } else if ascii_eq_ci(name, b"databases") {
-        Some((b"databases", b"1"))
+        Some((b"databases", b"16"))
     } else if ascii_eq_ci(name, b"maxmemory-policy") {
         Some((b"maxmemory-policy", b"noeviction"))
     } else if ascii_eq_ci(name, b"timeout") {
@@ -14409,6 +14686,7 @@ fn handle_command<W: Write>(
             // RESET and QUIT both leave monitor mode, as in Redis.
             unregister_all_client_feeds(client_state);
             client_state.reset();
+            set_current_db(client_state.db);
             write_simple_string(writer, "RESET")?;
         }
         OpCode::Quit => {
@@ -14417,10 +14695,18 @@ fn handle_command<W: Write>(
             write_simple_ok(writer)?;
         }
         OpCode::Select => {
-            if cmd.args.len() == 1 && cmd.args[0].as_ref() == b"0" {
-                write_simple_ok(writer)?;
-            } else {
-                write_err(writer, "DB index is out of range")?;
+            // Redis queues SELECT inside MULTI and applies it at EXEC; this
+            // adapter applies it immediately, because the database has to be
+            // known while each queued command is parsed (that is where keys
+            // acquire their prefix). Recorded in known_divergences.txt.
+            match cmd.args.first().map(|arg| parse_db_index(arg.as_ref())) {
+                Some(Ok(db)) => {
+                    client_state.db = db;
+                    set_current_db(db);
+                    write_simple_ok(writer)?;
+                }
+                Some(Err(err)) => write_parse_error(writer, err)?,
+                None => write_err(writer, "DB index is out of range")?,
             }
         }
         OpCode::Auth => {
@@ -14434,7 +14720,18 @@ fn handle_command<W: Write>(
             if txn_state.in_multi {
                 write_err(writer, "WATCH inside MULTI is not allowed")?;
             } else {
-                txn_state.watch_keys(&cmd.args);
+                // WATCH takes its keys from the raw argument list, not from
+                // `cmd.keys`, so this is the one key path that does not run
+                // through `validate_user_key`. Key versions are bumped under
+                // the storage-facing name, so the watch has to use it too, or
+                // a write in database 1 would invalidate a watch in database 0
+                // on the same name.
+                let watched: Vec<Bytes> = cmd
+                    .args
+                    .iter()
+                    .map(|key| db_key(client_state.db, key))
+                    .collect();
+                txn_state.watch_keys(&watched);
                 write_simple_ok(writer)?;
             }
         }
@@ -14672,6 +14969,7 @@ fn handle_command<W: Write>(
         | OpCode::Dump
         | OpCode::Restore
         | OpCode::Copy
+        | OpCode::Move
         | OpCode::Incr
         | OpCode::IncrBy
         | OpCode::Decr
@@ -16890,4 +17188,353 @@ $6\r\nFIELDS\r\n$1\r\n1\r\n$2\r\nf1\r\n"
             );
         }
     }
+
+    // ===== Logical databases (SELECT, MOVE, COPY ... DB) =====
+
+    /// Parse one RESP command exactly as a worker would, in `db`.
+    fn parse_in_db(db: u8, args: &[&[u8]]) -> Result<Command, ParseError> {
+        let mut frame = format!("*{}\r\n", args.len()).into_bytes();
+        for arg in args {
+            frame.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
+            frame.extend_from_slice(arg);
+            frame.extend_from_slice(b"\r\n");
+        }
+        let mut resp3 = Resp3Handler::new(1024);
+        resp3.read_bytes(&frame);
+        let decoded = resp3.next_frame().unwrap().unwrap();
+        set_current_db(db);
+        let parsed = parse_resp3(decoded);
+        set_current_db(0);
+        parsed
+    }
+
+    /// A SCAN/KEYS reply payload, in the executor's wire shape.
+    fn scan_payload(cursor: Option<&[u8]>, keys: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let cursor = cursor.unwrap_or(b"");
+        out.extend_from_slice(&(cursor.len() as u64).to_le_bytes());
+        out.extend_from_slice(cursor);
+        out.extend_from_slice(&(keys.len() as u64).to_le_bytes());
+        for key in keys {
+            out.extend_from_slice(&(key.len() as u64).to_le_bytes());
+            out.extend_from_slice(key);
+        }
+        out
+    }
+
+    /// The parsed command, or a panic naming the error. `Command` and
+    /// `ParseError` are deliberately not `Debug`, so `unwrap` is not available.
+    fn parsed(db: u8, args: &[&[u8]]) -> Command {
+        match parse_in_db(db, args) {
+            Ok(cmd) => cmd,
+            Err(err) => panic!("expected a command, got {}", parse_error_text(err)),
+        }
+    }
+
+    /// The RESP error text a refused parse produces.
+    fn parse_refusal(db: u8, args: &[&[u8]]) -> String {
+        match parse_in_db(db, args) {
+            Ok(_) => panic!("expected a parse error"),
+            Err(err) => parse_error_text(err),
+        }
+    }
+
+    fn parse_error_text(err: ParseError) -> String {
+        let mut out = Vec::new();
+        write_parse_error(&mut out, err).unwrap();
+        String::from_utf8_lossy(&out).trim_end().to_string()
+    }
+
+    /// Every Redis-visible key has to acquire the logical-database prefix, and
+    /// the validator is the one place that applies it, so a call site that
+    /// drops the key it returns silently gives one database another's data.
+    /// The signature catches a site that ignores the result in most shapes;
+    /// this catches the rest, and the count makes a newly added key path fail
+    /// until someone has looked at it.
+    #[test]
+    fn every_user_key_call_site_keeps_the_prefixed_key() {
+        let needle = format!("{}(", "validate_user_key");
+        let definition = format!("fn {}", needle);
+        // The four sites that cannot simply shadow their own name: SORT's
+        // STORE destination is declared before the option loop, and COPY and
+        // MOVE keep the raw name so they can re-spell it for another database.
+        let rebinding: &[(&str, &str)] = &[
+            ("store", "part_to_bytes(&parts[index + 1])?"),
+            ("source", "raw_source"),
+            ("mut destination", "raw_destination"),
+            ("source", "raw_key"),
+        ];
+        let mut sites = 0;
+        for line in include_str!("lib.rs").lines() {
+            let line = line.trim();
+            if !line.contains(&needle) || line.starts_with(&definition) {
+                continue;
+            }
+            // Skip this test's own text.
+            if line.starts_with("//") || line.starts_with("let needle") {
+                continue;
+            }
+            sites += 1;
+            let bind = format!(" = {}&", needle);
+            let Some((left, right)) = line.split_once(&bind) else {
+                panic!("key call site does not bind the key it returns: {line}");
+            };
+            let bound = left.strip_prefix("let ").unwrap_or(left).trim();
+            let argument = right.strip_suffix(")?;").unwrap_or(right);
+            assert!(
+                bound == argument || rebinding.contains(&(bound, argument)),
+                "key call site binds {bound} but reads {argument}: {line}"
+            );
+        }
+        assert_eq!(
+            sites, 98,
+            "the number of Redis-visible key call sites changed; audit the new one"
+        );
+    }
+
+    #[test]
+    fn database_zero_keys_are_stored_under_exactly_the_bytes_the_client_sent() {
+        let cmd = parsed(0, &[b"SET", b"key", b"value"]);
+        assert_eq!(cmd.keys, vec![Bytes::from_static(b"key")]);
+        let cmd = parsed(1, &[b"SET", b"key", b"value"]);
+        assert_eq!(cmd.keys, vec![Bytes::from_static(b"\x02\x01:key")]);
+        let cmd = parsed(15, &[b"GET", b"key"]);
+        assert_eq!(cmd.keys, vec![Bytes::from_static(b"\x02\x0f:key")]);
+        // The commands that keep a raw argument list keep what the client
+        // sent, unprefixed; that list is what MONITOR and CLUSTER KEYSLOT read.
+        let cmd = parsed(9, &[b"EXISTS", b"key"]);
+        assert_eq!(cmd.keys, vec![Bytes::from_static(b"\x02\x09:key")]);
+        assert_eq!(cmd.args, vec![Bytes::from_static(b"key")]);
+    }
+
+    #[test]
+    fn the_prefix_helper_round_trips_and_leaves_database_zero_alone() {
+        let key = Bytes::from_static(b"k");
+        assert_eq!(db_key(0, &key), key);
+        assert_eq!(db_key(3, &key).as_ref(), b"\x02\x03:k");
+        assert_eq!(strip_db_key(0, b"k"), b"k");
+        assert_eq!(strip_db_key(3, b"\x02\x03:k"), b"k");
+        // A name that does not carry this database's prefix is returned whole,
+        // so a reply can never lose bytes it did not add.
+        assert_eq!(strip_db_key(3, b"\x02\x04:k"), b"\x02\x04:k");
+        assert_eq!(strip_db_key(3, b"k"), b"k");
+        assert!(db_scan_prefix(0).is_empty());
+        assert_eq!(db_scan_prefix(7).as_ref(), b"\x02\x07:");
+        // FLUSHDB tells database 0 apart from "every database" with a one-byte
+        // sentinel; see the executor's redis_flush_db_filter.
+        assert_eq!(db_flush_prefix(0).as_ref(), b"\x02");
+        assert_eq!(db_flush_prefix(7).as_ref(), b"\x02\x07:");
+    }
+
+    #[test]
+    fn both_reserved_first_bytes_are_refused_in_every_database() {
+        for db in [0u8, 1, 15] {
+            for first in [0x01u8, 0x02] {
+                let key = [first, b'x'];
+                assert_eq!(
+                    parse_refusal(db, &[b"SET", &key, b"v"]),
+                    "-ERR invalid key: reserved internal prefix"
+                );
+            }
+        }
+        // The raw GET/SET shortcut has to refuse them too, by falling through
+        // to the general parser that produces the error.
+        for first in [0x01u8, 0x02] {
+            let frame = format!(
+                "*3\r\n$3\r\nSET\r\n$2\r\n{}x\r\n$1\r\nv\r\n",
+                first as char
+            );
+            assert!(matches!(
+                parse_raw_mako_string_command(frame.as_bytes()),
+                RawMakoParse::NotFast
+            ));
+        }
+    }
+
+    #[test]
+    fn select_moves_the_connection_and_reset_brings_it_back() {
+        let mut txn_state = TransactionState::new();
+        let mut client_state = ClientState::new();
+        assert_eq!(client_state.db, 0);
+        for (index, expected) in [("0", "+OK"), ("15", "+OK")] {
+            let out = run(command(OpCode::Select, &[index.as_bytes()]), &mut txn_state, &mut client_state);
+            assert!(String::from_utf8_lossy(&out).starts_with(expected));
+        }
+        assert_eq!(client_state.db, 15);
+        assert_eq!(current_db(), 15);
+        for index in ["16", "-1", "99"] {
+            let out = run(command(OpCode::Select, &[index.as_bytes()]), &mut txn_state, &mut client_state);
+            assert_eq!(out, b"-ERR DB index is out of range\r\n");
+        }
+        let out = run(command(OpCode::Select, &[b"abc"]), &mut txn_state, &mut client_state);
+        assert_eq!(out, b"-ERR value is not an integer or out of range\r\n");
+        assert_eq!(client_state.db, 15, "a refused SELECT leaves the connection where it was");
+        let out = run(command(OpCode::Reset, &[]), &mut txn_state, &mut client_state);
+        assert_eq!(out, b"+RESET\r\n");
+        assert_eq!(client_state.db, 0);
+        assert_eq!(current_db(), 0);
+    }
+
+    #[test]
+    fn move_builds_one_op_carrying_the_destination_database_spelling() {
+        let cmd = parsed(0, &[b"MOVE", b"k", b"3"]);
+        assert!(cmd.op == OpCode::Move);
+        assert_eq!(cmd.keys, vec![Bytes::from_static(b"k")]);
+        assert_eq!(cmd.values, vec![Bytes::from_static(b"\x02\x03:k")]);
+        // From database 2 the source carries its own prefix.
+        let cmd = parsed(2, &[b"MOVE", b"k", b"3"]);
+        assert_eq!(cmd.keys, vec![Bytes::from_static(b"\x02\x02:k")]);
+        assert_eq!(cmd.values, vec![Bytes::from_static(b"\x02\x03:k")]);
+
+        let (ops, spans, _payloads) = build_txn_ops(std::slice::from_ref(&cmd));
+        assert_eq!(spans, vec![(0, 1)]);
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, TXN_OP_MOVE);
+        let packed = unsafe { std::slice::from_raw_parts(ops[0].val_ptr, ops[0].val_len) };
+        assert_eq!(packed, pack_bytes_list(&cmd.values).as_ref());
+
+        assert!(is_dirty_command(OpCode::Move));
+        assert!(command_needs_retry(&cmd));
+
+        assert_eq!(
+            parse_refusal(0, &[b"MOVE", b"k", b"0"]),
+            "-ERR source and destination objects are the same"
+        );
+        assert_eq!(
+            parse_refusal(0, &[b"MOVE", b"k", b"16"]),
+            "-ERR DB index is out of range"
+        );
+        assert_eq!(
+            parse_refusal(0, &[b"MOVE", b"k"]),
+            "-ERR wrong number of arguments for 'move' command"
+        );
+    }
+
+    #[test]
+    fn copy_db_option_spells_the_destination_for_that_database() {
+        let cmd = parsed(0, &[b"COPY", b"a", b"b"]);
+        assert_eq!(cmd.values, vec![Bytes::from_static(b"b")]);
+        assert_eq!(cmd.expire_at_ms, 0);
+        let cmd = parsed(0, &[b"COPY", b"a", b"b", b"DB", b"2", b"REPLACE"]);
+        assert_eq!(cmd.keys, vec![Bytes::from_static(b"a")]);
+        assert_eq!(cmd.values, vec![Bytes::from_static(b"\x02\x02:b")]);
+        assert_eq!(cmd.expire_at_ms, 1);
+        // Same name, same database: Redis refuses it.
+        assert_eq!(
+            parse_refusal(1, &[b"COPY", b"a", b"a", b"DB", b"1"]),
+            "-ERR source and destination objects are the same"
+        );
+        assert_eq!(
+            parse_refusal(0, &[b"COPY", b"a", b"b", b"DB", b"16"]),
+            "-ERR DB index is out of range"
+        );
+    }
+
+    #[test]
+    fn keyspace_commands_carry_the_database_they_walk() {
+        for (args, db, expected) in [
+            (&[b"KEYS".as_ref(), b"user:*".as_ref()][..], 0u8, &b"user:"[..]),
+            (&[b"KEYS".as_ref(), b"user:*".as_ref()][..], 5, b"\x02\x05:user:"),
+            (&[b"DBSIZE".as_ref()][..], 0, b""),
+            (&[b"DBSIZE".as_ref()][..], 5, b"\x02\x05:"),
+            (&[b"RANDOMKEY".as_ref()][..], 0, b""),
+            (&[b"RANDOMKEY".as_ref()][..], 5, b"\x02\x05:"),
+            (&[b"SCAN".as_ref(), b"0".as_ref()][..], 0, b""),
+            (&[b"SCAN".as_ref(), b"0".as_ref()][..], 5, b"\x02\x05:"),
+            // FLUSHDB on database 0 sends the sentinel, so the executor can
+            // tell it apart from FLUSHALL, which sends nothing.
+            (&[b"FLUSHDB".as_ref()][..], 0, b"\x02"),
+            (&[b"FLUSHDB".as_ref()][..], 5, b"\x02\x05:"),
+            (&[b"FLUSHALL".as_ref()][..], 0, b""),
+            (&[b"FLUSHALL".as_ref()][..], 5, b""),
+        ] {
+            let cmd = parsed(db, args);
+            assert_eq!(
+                cmd.scan_prefix.as_ref(),
+                expected,
+                "{:?} in database {db}",
+                String::from_utf8_lossy(args[0])
+            );
+        }
+    }
+
+    #[test]
+    fn keys_and_scan_replies_return_names_without_the_database_prefix() {
+        let cmd = parsed(2, &[b"KEYS", b"*"]);
+        let payload = scan_payload(None, &[b"\x02\x02:alpha", b"\x02\x02:beta"]);
+        let mut results = vec![TxnOpResult {
+            success: true,
+            value_present: true,
+            data_ptr: payload.as_ptr() as *mut u8,
+            data_len: payload.len(),
+            int_value: 0,
+        }];
+        let response = TxnResponse {
+            transaction_success: true,
+            num_results: results.len(),
+            results: results.as_mut_ptr(),
+        };
+        let mut out = Vec::new();
+        set_current_db(2);
+        write_command_result(&cmd, Some(&response), (0, 1), 2, &mut out).unwrap();
+        set_current_db(0);
+        assert_eq!(out, b"*2\r\n$5\r\nalpha\r\n$4\r\nbeta\r\n");
+
+        // MATCH is applied to the name the client would have written.
+        let cmd = parsed(2, &[b"SCAN", b"0", b"MATCH", b"al*"]);
+        let mut out = Vec::new();
+        set_current_db(2);
+        write_command_result(&cmd, Some(&response), (0, 1), 2, &mut out).unwrap();
+        set_current_db(0);
+        assert_eq!(out, b"*2\r\n$1\r\n0\r\n*1\r\n$5\r\nalpha\r\n");
+    }
+
+    #[test]
+    fn blocking_pop_replies_return_the_key_name_without_the_prefix() {
+        let cmd = parsed(4, &[b"BLPOP", b"jobs", b"0"]);
+        assert_eq!(cmd.keys, vec![Bytes::from_static(b"\x02\x04:jobs")]);
+        let payload = pack_bytes_list(&[
+            Bytes::from_static(b"\x02\x04:jobs"),
+            Bytes::from_static(b"payload"),
+        ]);
+        let mut results = vec![TxnOpResult {
+            success: true,
+            value_present: true,
+            data_ptr: payload.as_ptr() as *mut u8,
+            data_len: payload.len(),
+            int_value: 0,
+        }];
+        let response = TxnResponse {
+            transaction_success: true,
+            num_results: results.len(),
+            results: results.as_mut_ptr(),
+        };
+        let mut out = Vec::new();
+        set_current_db(4);
+        write_command_result(&cmd, Some(&response), (0, 1), 2, &mut out).unwrap();
+        set_current_db(0);
+        assert_eq!(out, b"*2\r\n$4\r\njobs\r\n$7\r\npayload\r\n");
+    }
+
+    #[test]
+    fn watch_in_a_database_watches_that_database_s_name() {
+        let mut txn_state = TransactionState::new();
+        let mut client_state = ClientState::new();
+        run(command(OpCode::Select, &[b"6"]), &mut txn_state, &mut client_state);
+        run(command(OpCode::Watch, &[b"k"]), &mut txn_state, &mut client_state);
+        assert!(txn_state
+            .watched_versions
+            .contains_key(&Bytes::from_static(b"\x02\x06:k")));
+        assert!(!txn_state
+            .watched_versions
+            .contains_key(&Bytes::from_static(b"k")));
+        run(command(OpCode::Reset, &[]), &mut txn_state, &mut client_state);
+    }
+
+    #[test]
+    fn config_get_databases_reports_sixteen() {
+        let out = run_raw(b"*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$9\r\ndatabases\r\n");
+        assert_eq!(out, b"*2\r\n$9\r\ndatabases\r\n$2\r\n16\r\n");
+    }
+
 }
