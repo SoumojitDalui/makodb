@@ -564,6 +564,134 @@ static int64_t hll_estimate(const uint8_t* registers) {
     return static_cast<int64_t>(std::llround(estimate));
 }
 
+// ---------------------------------------------------------------------------
+// BITFIELD support (TXN_OP_BITFIELD)
+//
+// Bits are numbered big-endian inside the string: bit 0 is the most
+// significant bit of byte 0. Reads past the end of the string read zeros; the
+// caller grows the string before any write, exactly like Redis. The overflow
+// helpers are ports of checkSignedBitfieldOverflow/checkUnsignedBitfieldOverflow
+// from Redis bitops.c, with the increment limits computed in unsigned
+// arithmetic so the wraparound Redis relies on stays defined.
+// ---------------------------------------------------------------------------
+enum BitFieldOverflowType {
+    kBitFieldWrap = 0,
+    kBitFieldSat = 1,
+    kBitFieldFail = 2,
+};
+
+static uint64_t bitfield_get_unsigned(const std::string& value, uint64_t offset, uint32_t bits) {
+    uint64_t result = 0;
+    for (uint32_t i = 0; i < bits; ++i) {
+        const uint64_t bit_index = offset + i;
+        const size_t byte_index = static_cast<size_t>(bit_index >> 3);
+        uint64_t bit = 0;
+        if (byte_index < value.size()) {
+            bit = (static_cast<uint8_t>(value[byte_index]) >> (7 - (bit_index & 7))) & 1;
+        }
+        result = (result << 1) | bit;
+    }
+    return result;
+}
+
+static int64_t bitfield_get_signed(const std::string& value, uint64_t offset, uint32_t bits) {
+    uint64_t raw = bitfield_get_unsigned(value, offset, bits);
+    if (bits < 64 && (raw & (static_cast<uint64_t>(1) << (bits - 1))) != 0) {
+        raw |= ~static_cast<uint64_t>(0) << bits;  // sign-extend
+    }
+    return static_cast<int64_t>(raw);
+}
+
+// The string must already be long enough; bits beyond its end are dropped.
+static void bitfield_set_bits(std::string& value, uint64_t offset, uint32_t bits, uint64_t raw) {
+    for (uint32_t i = 0; i < bits; ++i) {
+        const uint64_t bit = (raw >> (bits - 1 - i)) & 1;
+        const uint64_t bit_index = offset + i;
+        const size_t byte_index = static_cast<size_t>(bit_index >> 3);
+        if (byte_index >= value.size()) {
+            break;
+        }
+        const uint8_t mask = static_cast<uint8_t>(1u << (7 - (bit_index & 7)));
+        uint8_t byte = static_cast<uint8_t>(value[byte_index]);
+        if (bit != 0) {
+            byte |= mask;
+        } else {
+            byte &= static_cast<uint8_t>(~mask);
+        }
+        value[byte_index] = static_cast<char>(byte);
+    }
+}
+
+// Returns 0 when value+incr fits in the signed field, 1 on positive overflow
+// and -1 on negative overflow. On overflow `limit` receives the WRAP or SAT
+// replacement; it is untouched for FAIL.
+static int bitfield_signed_overflow(
+    int64_t value, int64_t incr, uint32_t bits, int owtype, int64_t& limit) {
+    const int64_t max = (bits == 64)
+                            ? INT64_MAX
+                            : ((static_cast<int64_t>(1) << (bits - 1)) - 1);
+    const int64_t min = (-max) - 1;
+    const int64_t maxincr =
+        static_cast<int64_t>(static_cast<uint64_t>(max) - static_cast<uint64_t>(value));
+    const int64_t minincr =
+        static_cast<int64_t>(static_cast<uint64_t>(min) - static_cast<uint64_t>(value));
+
+    int direction = 0;
+    if (value > max || (bits != 64 && incr > maxincr)
+        || (value >= 0 && incr > 0 && incr > maxincr)) {
+        direction = 1;
+    } else if (value < min || (bits != 64 && incr < minincr)
+               || (value < 0 && incr < 0 && incr < minincr)) {
+        direction = -1;
+    } else {
+        return 0;
+    }
+
+    if (owtype == kBitFieldWrap) {
+        const uint64_t msb = static_cast<uint64_t>(1) << (bits - 1);
+        uint64_t wrapped = static_cast<uint64_t>(value) + static_cast<uint64_t>(incr);
+        if (bits < 64) {
+            const uint64_t mask = ~static_cast<uint64_t>(0) << bits;
+            if ((wrapped & msb) != 0) {
+                wrapped |= mask;
+            } else {
+                wrapped &= ~mask;
+            }
+        }
+        limit = static_cast<int64_t>(wrapped);
+    } else if (owtype == kBitFieldSat) {
+        limit = (direction > 0) ? max : min;
+    }
+    return direction;
+}
+
+static int bitfield_unsigned_overflow(
+    uint64_t value, int64_t incr, uint32_t bits, int owtype, uint64_t& limit) {
+    // u64 is not a legal BITFIELD encoding, so bits is always below 64 here.
+    const uint64_t max = (bits == 64)
+                             ? ~static_cast<uint64_t>(0)
+                             : ((static_cast<uint64_t>(1) << bits) - 1);
+    const int64_t maxincr = static_cast<int64_t>(max - value);
+    const int64_t minincr = static_cast<int64_t>(-static_cast<int64_t>(value));
+
+    int direction = 0;
+    if (value > max || (incr > 0 && incr > maxincr)) {
+        direction = 1;
+    } else if (incr < 0 && incr < minincr) {
+        direction = -1;
+    } else {
+        return 0;
+    }
+
+    if (owtype == kBitFieldWrap) {
+        const uint64_t mask = (bits == 64) ? 0 : (~static_cast<uint64_t>(0) << bits);
+        limit = (value + static_cast<uint64_t>(incr)) & ~mask;
+    } else if (owtype == kBitFieldSat) {
+        limit = (direction > 0) ? max : 0;
+    }
+    return direction;
+}
+
 static bool redis_op_is_read_only(const TxnOperation& op) {
     switch (op.op) {
         case TXN_OP_GET:
@@ -4677,6 +4805,198 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                 result.success = true;
                 result.value_present = true;
                 result.int_value = 0;
+            } else if (op.op == TXN_OP_BITFIELD) {
+                // BITFIELD with at least one SET or INCRBY. The whole
+                // subcommand list runs here so the read-modify-write stays
+                // inside one Mako transaction. Payload layout: groups of four
+                // items [kind, encoding, offset, value]; see TXN_OP_BITFIELD in
+                // transaction_ffi.h. Rust has already validated every field.
+                std::vector<std::string> items;
+                if (!unpack_bytes_list(op.val_ptr, op.val_len, items) || (items.size() % 4) != 0) {
+                    all_success = false;
+                    continue;
+                }
+                struct BitFieldSub {
+                    int kind;  // 0 = GET, 1 = SET, 2 = INCRBY
+                    bool sign;
+                    uint32_t bits;
+                    uint64_t offset;
+                    int64_t value;
+                    int owtype;
+                };
+                std::vector<BitFieldSub> subs;
+                subs.reserve(items.size() / 4);
+                bool payload_ok = true;
+                int owtype = kBitFieldWrap;
+                uint64_t highest_write_bit = 0;
+                bool has_write = false;
+                for (size_t i = 0; i + 3 < items.size(); i += 4) {
+                    const std::string& kind_text = items[i];
+                    if (kind_text == "OVERFLOW") {
+                        if (items[i + 1] == "WRAP") {
+                            owtype = kBitFieldWrap;
+                        } else if (items[i + 1] == "SAT") {
+                            owtype = kBitFieldSat;
+                        } else if (items[i + 1] == "FAIL") {
+                            owtype = kBitFieldFail;
+                        } else {
+                            payload_ok = false;
+                            break;
+                        }
+                        continue;
+                    }
+                    BitFieldSub sub{};
+                    if (kind_text == "GET") {
+                        sub.kind = 0;
+                    } else if (kind_text == "SET") {
+                        sub.kind = 1;
+                    } else if (kind_text == "INCRBY") {
+                        sub.kind = 2;
+                    } else {
+                        payload_ok = false;
+                        break;
+                    }
+                    const std::string& encoding = items[i + 1];
+                    if (encoding.size() < 2 || (encoding[0] != 'i' && encoding[0] != 'u')) {
+                        payload_ok = false;
+                        break;
+                    }
+                    sub.sign = encoding[0] == 'i';
+                    int64_t bits = 0;
+                    if (!parse_int64(encoding.substr(1), bits) || bits < 1
+                        || bits > (sub.sign ? 64 : 63)) {
+                        payload_ok = false;
+                        break;
+                    }
+                    sub.bits = static_cast<uint32_t>(bits);
+                    int64_t offset = 0;
+                    if (!parse_int64(items[i + 2], offset) || offset < 0) {
+                        payload_ok = false;
+                        break;
+                    }
+                    sub.offset = static_cast<uint64_t>(offset);
+                    sub.value = 0;
+                    if (sub.kind != 0) {
+                        if (!parse_int64(items[i + 3], sub.value)) {
+                            payload_ok = false;
+                            break;
+                        }
+                        has_write = true;
+                        const uint64_t last_bit = sub.offset + sub.bits - 1;
+                        if (last_bit > highest_write_bit) {
+                            highest_write_bit = last_bit;
+                        }
+                    }
+                    sub.owtype = owtype;
+                    subs.push_back(sub);
+                }
+                if (!payload_ok) {
+                    all_success = false;
+                    continue;
+                }
+                bool allowed = false;
+                mako::Status s = string_key_allowed(txn, user_key, tl_key_buf, result, allowed);
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                if (!allowed) {
+                    continue;  // string_key_allowed already flagged WRONGTYPE
+                }
+                std::string current;
+                bool exists = false;
+                s = read_current(txn, user_key, tl_key_buf, current, exists);
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                // Redis creates or zero-extends the string up front to cover the
+                // farthest bit any write touches, even when every write then
+                // fails its overflow check.
+                bool dirty = false;
+                if (has_write) {
+                    const size_t needed = static_cast<size_t>(highest_write_bit >> 3) + 1;
+                    if (!exists) {
+                        current.assign(needed, '\0');
+                        dirty = true;
+                    } else if (current.size() < needed) {
+                        current.resize(needed, '\0');
+                        dirty = true;
+                    }
+                }
+                std::vector<std::string> replies;
+                replies.reserve(subs.size());
+                for (const BitFieldSub& sub : subs) {
+                    if (sub.kind == 0) {
+                        const int64_t value =
+                            sub.sign ? bitfield_get_signed(current, sub.offset, sub.bits)
+                                     : static_cast<int64_t>(
+                                           bitfield_get_unsigned(current, sub.offset, sub.bits));
+                        replies.push_back(std::to_string(value));
+                        continue;
+                    }
+                    const bool is_incr = sub.kind == 2;
+                    const int64_t incr = is_incr ? sub.value : 0;
+                    if (sub.sign) {
+                        const int64_t oldval = bitfield_get_signed(current, sub.offset, sub.bits);
+                        const int64_t checked = is_incr ? oldval : sub.value;
+                        int64_t wrapped = 0;
+                        const int overflow = bitfield_signed_overflow(
+                            checked, incr, sub.bits, sub.owtype, wrapped);
+                        int64_t newval =
+                            is_incr ? static_cast<int64_t>(static_cast<uint64_t>(oldval)
+                                                           + static_cast<uint64_t>(incr))
+                                    : sub.value;
+                        if (overflow != 0) {
+                            newval = wrapped;
+                        }
+                        if (overflow != 0 && sub.owtype == kBitFieldFail) {
+                            replies.emplace_back();  // nil: this subcommand writes nothing
+                            continue;
+                        }
+                        replies.push_back(std::to_string(is_incr ? newval : oldval));
+                        bitfield_set_bits(
+                            current, sub.offset, sub.bits, static_cast<uint64_t>(newval));
+                        dirty = true;
+                    } else {
+                        const uint64_t oldval = bitfield_get_unsigned(current, sub.offset, sub.bits);
+                        const uint64_t checked = is_incr ? oldval : static_cast<uint64_t>(sub.value);
+                        uint64_t wrapped = 0;
+                        const int overflow = bitfield_unsigned_overflow(
+                            checked, incr, sub.bits, sub.owtype, wrapped);
+                        uint64_t newval = is_incr ? (oldval + static_cast<uint64_t>(incr))
+                                                  : static_cast<uint64_t>(sub.value);
+                        if (overflow != 0) {
+                            newval = wrapped;
+                        }
+                        if (overflow != 0 && sub.owtype == kBitFieldFail) {
+                            replies.emplace_back();  // nil: this subcommand writes nothing
+                            continue;
+                        }
+                        replies.push_back(
+                            std::to_string(static_cast<int64_t>(is_incr ? newval : oldval)));
+                        bitfield_set_bits(current, sub.offset, sub.bits, newval);
+                        dirty = true;
+                    }
+                }
+                if (dirty) {
+                    // The value stays a plain string and any TTL the key already
+                    // carried is left alone, exactly like SETBIT.
+                    s = put_raw(txn, tl_key_buf, current);
+                    if (!s.ok()) {
+                        result.success = false;
+                        all_success = false;
+                        continue;
+                    }
+                    batch_exists[tl_key_buf] = true;
+                    batch_values[tl_key_buf] = current;
+                }
+                result.success = true;
+                result.int_value = static_cast<int64_t>(replies.size());
+                if (!copy_result_value(result, pack_bytes_list(replies))) {
+                    all_success = false;
+                    continue;
+                }
             } else if (op.op == TXN_OP_RESTORE_LIST) {
                 std::vector<std::string> values;
                 if (!unpack_bytes_list(op.val_ptr, op.val_len, values)) {

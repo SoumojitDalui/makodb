@@ -240,6 +240,87 @@ def main():
     check("BITFIELD_RO bad type", c.cmd("BITFIELD_RO", "bf", "GET", "u64", "0"), pred=lambda g: is_err(g, "ERR"))
     check("BITFIELD_RO rejects SET", c.cmd("BITFIELD_RO", "bf", "SET", "u8", "0", "1"), pred=lambda g: is_err(g, "ERR"))
 
+    # BITFIELD (phase 3 package 2). Examples from the Redis documentation.
+    check("BITFIELD doc example", c.cmd("BITFIELD", "bfw-doc", "INCRBY", "i5", "100", "1", "GET", "u4", "0"), [1, 0])
+
+    # The documented overflow walk: WRAP on the first field, SAT on the second.
+    for want in ([1, 1], [2, 2], [3, 3], [0, 3]):
+        check("BITFIELD overflow walk %r" % want,
+              c.cmd("BITFIELD", "bfw-ovf", "incrby", "u2", "100", "1", "OVERFLOW", "SAT", "incrby", "u2", "102", "1"),
+              want)
+    check("BITFIELD OVERFLOW FAIL returns nil", c.cmd("BITFIELD", "bfw-ovf", "OVERFLOW", "FAIL", "incrby", "u2", "102", "1"), [None])
+    check("BITFIELD OVERFLOW FAIL wrote nothing", c.cmd("BITFIELD_RO", "bfw-ovf", "GET", "u2", "102"), [3])
+
+    # SET replies with the previous value, GET with the current one.
+    check("BITFIELD SET on a new key", c.cmd("BITFIELD", "bfw-set", "SET", "u8", "0", "255"), [0])
+    check("BITFIELD SET returns the old value", c.cmd("BITFIELD", "bfw-set", "SET", "u8", "0", "1"), [255])
+    check("BITFIELD GET after SET", c.cmd("BITFIELD", "bfw-set", "GET", "u8", "0"), [1])
+    check("BITFIELD SET creates the key", c.cmd("EXISTS", "bfw-set"), 1)
+    check("BITFIELD SET sizes the string", c.cmd("STRLEN", "bfw-set"), 1)
+
+    # Signed wraparound, saturation and failure on the same value.
+    check("BITFIELD SET i8 127", c.cmd("BITFIELD", "bfw-wrap", "SET", "i8", "0", "127"), [0])
+    check("BITFIELD INCRBY wraps", c.cmd("BITFIELD", "bfw-wrap", "INCRBY", "i8", "0", "1"), [-128])
+    check("BITFIELD SET i8 127 again", c.cmd("BITFIELD", "bfw-sat", "SET", "i8", "0", "127"), [0])
+    check("BITFIELD INCRBY saturates", c.cmd("BITFIELD", "bfw-sat", "OVERFLOW", "SAT", "INCRBY", "i8", "0", "1"), [127])
+    check("BITFIELD SAT left the value at the max", c.cmd("BITFIELD", "bfw-sat", "GET", "i8", "0"), [127])
+    check("BITFIELD SET i8 127 once more", c.cmd("BITFIELD", "bfw-fail", "SET", "i8", "0", "127"), [0])
+    check("BITFIELD INCRBY fails", c.cmd("BITFIELD", "bfw-fail", "OVERFLOW", "FAIL", "INCRBY", "i8", "0", "1"), [None])
+    check("BITFIELD FAIL left the value alone", c.cmd("BITFIELD", "bfw-fail", "GET", "i8", "0"), [127])
+    # SAT clamps a SET whose value does not fit the type, FAIL refuses it.
+    check("BITFIELD SAT clamps a SET", c.cmd("BITFIELD", "bfw-satset", "OVERFLOW", "SAT", "SET", "u2", "0", "9", "GET", "u2", "0"), [0, 3])
+    check("BITFIELD WRAP wraps a SET", c.cmd("BITFIELD", "bfw-wrapset", "SET", "u2", "0", "9", "GET", "u2", "0"), [0, 1])
+
+    # "#" offsets address the n-th field of the given width.
+    check("BITFIELD # offset", c.cmd("BITFIELD", "bfw-hash", "SET", "u8", "#1", "7", "GET", "u8", "#1"), [0, 7])
+    check("BITFIELD # offset is bit 8", c.cmd("BITFIELD", "bfw-hash", "GET", "u8", "8"), [7])
+
+    # OVERFLOW applies to the subcommands after it and produces no reply item.
+    check("BITFIELD mixed ordering", c.cmd("BITFIELD", "bfw-mix", "SET", "u8", "0", "250", "OVERFLOW", "SAT", "INCRBY", "u8", "0", "10", "GET", "u8", "0"), [0, 255, 255])
+
+    # An all-GET BITFIELD is read-only and matches BITFIELD_RO; no key is made.
+    check("BITFIELD all GET", c.cmd("BITFIELD", "bf", "GET", "u8", "0", "GET", "u8", "8"), [1, 2])
+    check("BITFIELD all GET matches BITFIELD_RO", c.cmd("BITFIELD_RO", "bf", "GET", "u8", "0", "GET", "u8", "8"), [1, 2])
+    check("BITFIELD all GET on a missing key", c.cmd("BITFIELD", "bfw-missing", "GET", "u8", "0"), [0])
+    check("BITFIELD all GET created nothing", c.cmd("EXISTS", "bfw-missing"), 0)
+    check("BITFIELD with no subcommands", c.cmd("BITFIELD", "bfw-missing"), [])
+
+    # i64 round-trips a large negative value.
+    check("BITFIELD SET i64 min", c.cmd("BITFIELD", "bfw-i64", "SET", "i64", "0", "-9223372036854775808"), [0])
+    check("BITFIELD GET i64 min", c.cmd("BITFIELD", "bfw-i64", "GET", "i64", "0"), [-9223372036854775808])
+
+    # Like Redis, a BITFIELD holding any write grows (or creates) the string up
+    # front, even when every write then fails its overflow check.
+    check("BITFIELD FAIL still creates the key", c.cmd("BITFIELD", "bfw-fresh", "OVERFLOW", "FAIL", "SET", "u8", "0", "300"), [None])
+    check("BITFIELD FAIL created an empty byte", c.cmd("GET", "bfw-fresh"), b"\x00")
+
+    # Errors, verbatim from Redis.
+    check("BITFIELD bad type", c.cmd("BITFIELD", "bfw-err", "SET", "u64", "0", "1"),
+          pred=lambda g: is_err(g, "ERR Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is."))
+    check("BITFIELD bad offset", c.cmd("BITFIELD", "bfw-err", "SET", "u8", "-1", "1"),
+          pred=lambda g: is_err(g, "ERR bit offset is not an integer or out of range"))
+    check("BITFIELD bad overflow", c.cmd("BITFIELD", "bfw-err", "OVERFLOW", "BOGUS", "GET", "u8", "0"),
+          pred=lambda g: is_err(g, "ERR Invalid OVERFLOW type specified"))
+    check("BITFIELD bad value", c.cmd("BITFIELD", "bfw-err", "SET", "u8", "0", "nope"),
+          pred=lambda g: is_err(g, "ERR value is not an integer or out of range"))
+    check("BITFIELD bad increment", c.cmd("BITFIELD", "bfw-err", "INCRBY", "u8", "0", "1.5"),
+          pred=lambda g: is_err(g, "ERR value is not an integer or out of range"))
+    check("BITFIELD unknown subcommand", c.cmd("BITFIELD", "bfw-err", "DEL", "u8", "0"),
+          pred=lambda g: is_err(g, "ERR syntax error"))
+    check("BITFIELD arity", c.cmd("BITFIELD"), pred=lambda g: is_err(g, "ERR wrong number"))
+    check("BITFIELD errors write nothing", c.cmd("EXISTS", "bfw-err"), 0)
+    check("BITFIELD wrongtype", c.cmd("BITFIELD", "bc-list", "SET", "u8", "0", "1"),
+          pred=lambda g: is_err(g, "WRONGTYPE"))
+    check("BITFIELD wrongtype read-only", c.cmd("BITFIELD", "bc-list", "GET", "u8", "0"),
+          pred=lambda g: is_err(g, "WRONGTYPE"))
+
+    # A write keeps the TTL the key already had, like SETBIT.
+    c.cmd("SET", "bfw-ttl", "abc")
+    c.cmd("EXPIRE", "bfw-ttl", "100")
+    check("BITFIELD SET on a key with a TTL", c.cmd("BITFIELD", "bfw-ttl", "SET", "u8", "0", "65"), [97])
+    check("BITFIELD kept the TTL", c.cmd("TTL", "bfw-ttl"), pred=lambda g: isinstance(g, int) and 0 < g <= 100)
+    check("BITFIELD wrote the byte", c.cmd("GET", "bfw-ttl"), b"Abc")
+
     # OBJECT
     check("OBJECT ENCODING string", c.cmd("OBJECT", "ENCODING", "bc"), b"raw")
     check("OBJECT ENCODING list", c.cmd("OBJECT", "ENCODING", "sl"), b"quicklist")

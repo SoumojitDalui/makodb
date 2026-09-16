@@ -148,6 +148,7 @@ const TXN_OP_BITOP: u32 = 78;
 const TXN_OP_HLL_ADD: u32 = 79;
 const TXN_OP_HLL_COUNT: u32 = 80;
 const TXN_OP_HLL_MERGE: u32 = 81;
+const TXN_OP_BITFIELD: u32 = 82;
 
 /// Mirrors TXN_HLL_ERR_NOT_HLL in transaction_ffi.h: an HLL op reports a key
 /// holding a string that is not a valid sketch through int_value.
@@ -557,6 +558,7 @@ enum OpCode {
     PfAdd = 178,
     PfCount = 179,
     PfMerge = 180,
+    BitField = 181,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -1391,6 +1393,8 @@ fn parse_opcode(name: &[u8]) -> Option<OpCode> {
         Some(OpCode::BitPos)
     } else if ascii_eq_ci(name, b"BITFIELD_RO") {
         Some(OpCode::BitFieldRo)
+    } else if ascii_eq_ci(name, b"BITFIELD") {
+        Some(OpCode::BitField)
     } else if ascii_eq_ci(name, b"BITOP") {
         Some(OpCode::BitOp)
     } else if ascii_eq_ci(name, b"PFADD") {
@@ -2009,6 +2013,94 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
             );
             cmd.values = values;
+            Ok(cmd)
+        }
+        OpCode::BitField => {
+            if parts.len() < 2 {
+                return Err(wrong_arity("bitfield"));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            // Every Redis-facing check happens here so the executor only ever
+            // sees a well-formed payload: groups of four items
+            // [kind, encoding, offset, value] as documented on TXN_OP_BITFIELD.
+            let mut groups: Vec<Bytes> = Vec::new();
+            // Encoding/offset pairs for the read-only path, used when every
+            // subcommand is a GET.
+            let mut reads: Vec<Bytes> = Vec::new();
+            let mut writes = false;
+            let mut index = 2usize;
+            while index < parts.len() {
+                let name = part_to_bytes(&parts[index])?;
+                // Redis checks the argument count per subcommand and reports a
+                // plain syntax error when it is short.
+                let remaining = parts.len() - index - 1;
+                if ascii_eq_ci(name.as_ref(), b"OVERFLOW") && remaining >= 1 {
+                    let requested = part_to_bytes(&parts[index + 1])?;
+                    let mode: &'static [u8] = if ascii_eq_ci(requested.as_ref(), b"WRAP") {
+                        b"WRAP"
+                    } else if ascii_eq_ci(requested.as_ref(), b"SAT") {
+                        b"SAT"
+                    } else if ascii_eq_ci(requested.as_ref(), b"FAIL") {
+                        b"FAIL"
+                    } else {
+                        return Err(ParseError::Error("Invalid OVERFLOW type specified"));
+                    };
+                    groups.push(Bytes::from_static(b"OVERFLOW"));
+                    groups.push(Bytes::from_static(mode));
+                    groups.push(Bytes::new());
+                    groups.push(Bytes::new());
+                    index += 2;
+                    continue;
+                }
+                let (kind, takes_value): (&'static [u8], bool) =
+                    if ascii_eq_ci(name.as_ref(), b"GET") && remaining >= 2 {
+                        (b"GET", false)
+                    } else if ascii_eq_ci(name.as_ref(), b"SET") && remaining >= 3 {
+                        (b"SET", true)
+                    } else if ascii_eq_ci(name.as_ref(), b"INCRBY") && remaining >= 3 {
+                        (b"INCRBY", true)
+                    } else {
+                        return Err(ParseError::Error("syntax error"));
+                    };
+                let encoding = part_to_bytes(&parts[index + 1])?;
+                let offset = part_to_bytes(&parts[index + 2])?;
+                let (signed, bits) = parse_bitfield_encoding(encoding.as_ref())?;
+                let absolute = parse_bitfield_offset(offset.as_ref(), bits)?;
+                let value = if takes_value {
+                    writes = true;
+                    let raw = part_to_bytes(&parts[index + 3])?;
+                    let parsed = parse_i64_error_arg(
+                        raw.as_ref(),
+                        "value is not an integer or out of range",
+                    )?;
+                    Bytes::from(parsed.to_string())
+                } else {
+                    reads.push(encoding.clone());
+                    reads.push(offset);
+                    Bytes::new()
+                };
+                groups.push(Bytes::from_static(kind));
+                groups.push(Bytes::from(format!(
+                    "{}{}",
+                    if signed { 'i' } else { 'u' },
+                    bits
+                )));
+                groups.push(Bytes::from(absolute.to_string()));
+                groups.push(value);
+                index += if takes_value { 4 } else { 3 };
+            }
+            let args = command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?;
+            if !writes {
+                // Redis treats a BITFIELD whose subcommands are all GET (and a
+                // BITFIELD with no subcommands) as a read-only command, so run
+                // it through the existing BITFIELD_RO path instead of a write op.
+                let mut cmd = Command::new(OpCode::BitFieldRo, vec![key], None, args);
+                cmd.values = reads;
+                return Ok(cmd);
+            }
+            let mut cmd = Command::new(op, vec![key], None, args);
+            cmd.values = groups;
             Ok(cmd)
         }
         OpCode::BitOp => {
@@ -6379,6 +6471,27 @@ fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)
                     group_id: 0,
                 });
             }
+            OpCode::BitField => {
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                // One op for the whole subcommand list: the read-modify-write
+                // has to be atomic inside the Mako transaction.
+                let payload = pack_bytes_list(&cmd.values);
+                payloads.push(payload);
+                let payload = payloads.last().unwrap();
+                ops.push(TxnOperation {
+                    op: TXN_OP_BITFIELD,
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr: payload.as_ptr(),
+                    val_len: payload.len(),
+                    flags: 0,
+                    expire_at_ms: -1,
+                    group_id: 0,
+                });
+            }
             OpCode::PfAdd | OpCode::PfCount | OpCode::PfMerge => {
                 let Some(key) = cmd.keys.first() else {
                     spans.push((start, 0));
@@ -7226,6 +7339,7 @@ fn command_needs_retry(cmd: &Command) -> bool {
             | OpCode::BitCount
             | OpCode::BitPos
             | OpCode::BitFieldRo
+            | OpCode::BitField
             | OpCode::BitOp
             | OpCode::PfAdd
             | OpCode::PfCount
@@ -8499,6 +8613,23 @@ fn write_command_result<W: Write>(
                 write_array_header(writer, values.len())?;
                 for value in values {
                     write_integer(writer, value)?;
+                }
+            }
+        }
+        OpCode::BitField => {
+            if !first.success {
+                write_wrongtype(writer)?;
+            } else {
+                // One packed item per GET/SET/INCRBY in command order: the
+                // decimal result, or an empty string for the nil an
+                // OVERFLOW FAIL subcommand returns.
+                let items = parse_list_payload(result_value_bytes(first)).unwrap_or_default();
+                write_array_header(writer, items.len())?;
+                for item in items {
+                    match parse_i64_lossy(&item) {
+                        Some(value) => write_integer(writer, value)?,
+                        None => write_null(writer, protocol_version)?,
+                    }
                 }
             }
         }
@@ -9972,6 +10103,7 @@ fn is_dirty_command(op: OpCode) -> bool {
             | OpCode::Copy
             | OpCode::Sort
             | OpCode::BitOp
+            | OpCode::BitField
             | OpCode::PfAdd
             | OpCode::PfMerge
             | OpCode::Del
@@ -12100,6 +12232,7 @@ fn handle_command<W: Write>(
         | OpCode::BitCount
         | OpCode::BitPos
         | OpCode::BitFieldRo
+        | OpCode::BitField
         | OpCode::BitOp
         | OpCode::PfAdd
         | OpCode::PfCount
@@ -13324,6 +13457,122 @@ mod tests {
         assert!(command_needs_retry(&pfadd));
         assert!(command_needs_retry(&pfcount));
         assert!(command_needs_retry(&pfmerge));
+    }
+
+    #[test]
+    fn bitfield_writes_build_one_op_with_four_item_groups() {
+        // INCRBY i5 100 1 GET u4 0: one write op carrying both subcommands.
+        let cmd = parse_one(
+            b"*9\r\n$8\r\nBITFIELD\r\n$5\r\nmykey\r\n$6\r\nINCRBY\r\n$2\r\ni5\r\n\
+$3\r\n100\r\n$1\r\n1\r\n$3\r\nGET\r\n$2\r\nu4\r\n$1\r\n0\r\n",
+        );
+        assert!(cmd.op == OpCode::BitField);
+        assert_eq!(cmd.keys, vec![Bytes::from_static(b"mykey")]);
+        let (ops, spans, payloads) = build_txn_ops(std::slice::from_ref(&cmd));
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, TXN_OP_BITFIELD);
+        assert_eq!(spans, vec![(0, 1)]);
+        assert_eq!(
+            parse_list_payload(&payloads[0]).unwrap(),
+            vec![
+                b"INCRBY".to_vec(),
+                b"i5".to_vec(),
+                b"100".to_vec(),
+                b"1".to_vec(),
+                b"GET".to_vec(),
+                b"u4".to_vec(),
+                b"0".to_vec(),
+                Vec::new(),
+            ]
+        );
+
+        // OVERFLOW takes a group of its own and carries no offset or value.
+        // "#1" offsets are multiplied out by the parser.
+        let cmd = parse_one(
+            b"*8\r\n$8\r\nBITFIELD\r\n$1\r\nk\r\n$8\r\nOVERFLOW\r\n$3\r\nSat\r\n\
+$3\r\nset\r\n$2\r\nu8\r\n$2\r\n#2\r\n$3\r\n255\r\n",
+        );
+        assert_eq!(
+            parse_list_payload(&build_txn_ops(std::slice::from_ref(&cmd)).2[0]).unwrap(),
+            vec![
+                b"OVERFLOW".to_vec(),
+                b"SAT".to_vec(),
+                Vec::new(),
+                Vec::new(),
+                b"SET".to_vec(),
+                b"u8".to_vec(),
+                b"16".to_vec(),
+                b"255".to_vec(),
+            ]
+        );
+
+        // A write-carrying BITFIELD is a dirty, retryable storage command.
+        assert!(is_dirty_command(OpCode::BitField));
+        assert!(command_needs_retry(&cmd));
+    }
+
+    #[test]
+    fn bitfield_without_writes_runs_as_bitfield_ro() {
+        // Redis treats an all-GET BITFIELD as read-only; so does the adapter,
+        // which keeps it off the write path entirely.
+        let cmd = parse_one(
+            b"*10\r\n$8\r\nBITFIELD\r\n$1\r\nk\r\n$8\r\nOVERFLOW\r\n$4\r\nFAIL\r\n\
+$3\r\nGET\r\n$2\r\nu8\r\n$1\r\n0\r\n$3\r\nGET\r\n$3\r\ni16\r\n$1\r\n8\r\n",
+        );
+        assert!(cmd.op == OpCode::BitFieldRo);
+        assert!(!is_dirty_command(cmd.op));
+        assert_eq!(
+            cmd.values,
+            vec![
+                Bytes::from_static(b"u8"),
+                Bytes::from_static(b"0"),
+                Bytes::from_static(b"i16"),
+                Bytes::from_static(b"8"),
+            ]
+        );
+        let (ops, _, _) = build_txn_ops(std::slice::from_ref(&cmd));
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op, TXN_OP_GETRANGE);
+
+        // No subcommands at all is read-only too, and replies with an empty array.
+        let empty = parse_one(b"*2\r\n$8\r\nBITFIELD\r\n$1\r\nk\r\n");
+        assert!(empty.op == OpCode::BitFieldRo);
+        assert!(empty.values.is_empty());
+    }
+
+    #[test]
+    fn bitfield_rejects_malformed_subcommands() {
+        assert_eq!(
+            run_raw(b"*1\r\n$8\r\nBITFIELD\r\n"),
+            b"-ERR wrong number of arguments for 'bitfield' command\r\n"
+        );
+        assert_eq!(
+            run_raw(b"*5\r\n$8\r\nBITFIELD\r\n$1\r\nk\r\n$3\r\nGET\r\n$3\r\nu64\r\n$1\r\n0\r\n"),
+            b"-ERR Invalid bitfield type. Use something like i16 u8. \
+Note that u64 is not supported but i64 is.\r\n"
+        );
+        assert_eq!(
+            run_raw(b"*6\r\n$8\r\nBITFIELD\r\n$1\r\nk\r\n$3\r\nSET\r\n$2\r\nu8\r\n$2\r\n-1\r\n$1\r\n1\r\n"),
+            b"-ERR bit offset is not an integer or out of range\r\n"
+        );
+        assert_eq!(
+            run_raw(b"*6\r\n$8\r\nBITFIELD\r\n$1\r\nk\r\n$3\r\nSET\r\n$2\r\nu8\r\n$1\r\n0\r\n$2\r\nxy\r\n"),
+            b"-ERR value is not an integer or out of range\r\n"
+        );
+        assert_eq!(
+            run_raw(b"*4\r\n$8\r\nBITFIELD\r\n$1\r\nk\r\n$8\r\nOVERFLOW\r\n$4\r\nNOPE\r\n"),
+            b"-ERR Invalid OVERFLOW type specified\r\n"
+        );
+        // A subcommand that is neither GET/SET/INCRBY/OVERFLOW, and one whose
+        // arguments run out, are both plain syntax errors.
+        assert_eq!(
+            run_raw(b"*5\r\n$8\r\nBITFIELD\r\n$1\r\nk\r\n$3\r\nDEL\r\n$2\r\nu8\r\n$1\r\n0\r\n"),
+            b"-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            run_raw(b"*4\r\n$8\r\nBITFIELD\r\n$1\r\nk\r\n$3\r\nGET\r\n$2\r\nu8\r\n"),
+            b"-ERR syntax error\r\n"
+        );
     }
 
     #[test]

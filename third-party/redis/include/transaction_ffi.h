@@ -137,6 +137,24 @@ typedef enum {
     TXN_OP_HLL_ADD = 79,
     TXN_OP_HLL_COUNT = 80,
     TXN_OP_HLL_MERGE = 81,
+    // BITFIELD, read-modify-write form. An all-GET BITFIELD is read-only and
+    // runs through the BITFIELD_RO path in Rust, so it never reaches this op.
+    // key = the string key. value = a packed list (pack_bytes_list) holding
+    // groups of four items, one group per subcommand, in command order:
+    //   [0] kind     "GET" | "SET" | "INCRBY" | "OVERFLOW"
+    //   [1] encoding canonical "i<bits>" (1..64) or "u<bits>" (1..63) for
+    //                GET/SET/INCRBY; "WRAP" | "SAT" | "FAIL" for OVERFLOW
+    //   [2] offset   absolute bit offset in decimal, with the "#<index>" form
+    //                already multiplied out; empty string for OVERFLOW
+    //   [3] value    decimal int64 value (SET) or increment (INCRBY); empty
+    //                string for GET and OVERFLOW
+    // OVERFLOW yields no reply item and applies to the subcommands after it
+    // (WRAP until the first OVERFLOW). Rust validates every field, so a
+    // malformed payload fails the transaction instead of erroring per Redis.
+    // The result value is a packed list with one item per GET/SET/INCRBY in
+    // command order: the decimal result, or an empty string for the nil an
+    // OVERFLOW FAIL subcommand returns when it performed no write.
+    TXN_OP_BITFIELD = 82,
 } TxnOpCode;
 
 /**
