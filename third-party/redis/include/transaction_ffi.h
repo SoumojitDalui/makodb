@@ -125,6 +125,8 @@ typedef enum {
     TXN_OP_ZMPOP = 75,
     TXN_OP_ZRANDMEMBER = 76,
     TXN_OP_COPY = 77,
+    // BITOP: key = destination, value = packed [AND|OR|XOR|NOT, src...].
+    TXN_OP_BITOP = 78,
 } TxnOpCode;
 
 typedef enum {

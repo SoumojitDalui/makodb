@@ -389,3 +389,20 @@ TCL_COMPAT_FILES=unit/type/list TCL_COMPAT_FILE_TIMEOUT=120 \
 
 `TCL_COMPAT_ONLY` passes Redis's exact test-name filter to the Tcl helper; it
 does not select a file. Use `TCL_COMPAT_FILES` for file selection.
+
+## Phase 2 Command Additions
+
+The `redis-compat-phase2` branch adds the following on top of PR 72, all
+implemented in the adapter with no changes below `makoCon`:
+
+| Area | Commands |
+|---|---|
+| Bitmaps | `BITCOUNT` (BYTE/BIT ranges), `BITPOS`, `BITFIELD_RO` (GET), `BITOP` (AND/OR/XOR/NOT, atomic in one Mako transaction) |
+| Keyspace | `TOUCH`, `SORT_RO`, `SORT ... LIMIT offset count`, `OBJECT ENCODING/REFCOUNT/HELP`, approximate `MEMORY USAGE` |
+| DUMP/RESTORE | string, set, and sorted-set payloads (`MAKO_STRING_DUMP`, `MAKO_SET_DUMP`, `MAKO_ZSET_DUMP`), TTL and `ABSTTL` honored on RESTORE |
+| Pub/Sub | `SPUBLISH`, `SSUBSCRIBE`, `SUNSUBSCRIBE`, `PUBSUB SHARDCHANNELS/SHARDNUMSUB` (process-local, like classic Pub/Sub) |
+| Observability shims | `SLOWLOG`, `LATENCY`, `ACL` (single implicit `default` user), `INFO keyspace` (`db0:keys=N`, cached 2 s), `CONFIG GET` for `maxmemory-policy`, `timeout`, `maxclients`, `tcp-keepalive`, `hz`, `notify-keyspace-events`, `protected-mode`, `port` |
+
+`test_phase2_commands.py HOST PORT` exercises every addition against a live
+server with a dependency-free RESP client. Deliberate deviations are recorded
+in `known_divergences.txt`.

@@ -503,6 +503,7 @@ static bool redis_op_uses_only_primary_lock_key(const TxnOperation& op) {
         case TXN_OP_ZSET_ALGEBRA:
         case TXN_OP_BPOP:
         case TXN_OP_ZMPOP:
+        case TXN_OP_BITOP:
             return false;
         default:
             return true;
@@ -551,6 +552,7 @@ static std::vector<size_t> redis_request_lock_stripes(const TxnRequest* request)
             case TXN_OP_ZSET_ALGEBRA:
             case TXN_OP_BPOP:
             case TXN_OP_ZMPOP:
+            case TXN_OP_BITOP:
                 add_packed_lock_keys(op, SIZE_MAX);
                 break;
             default:
@@ -4142,6 +4144,14 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                 if (s.ok()) {
                     s = read_hash_cardinality(txn, user_key, hash_count);
                 }
+                int64_t set_count = 0;
+                if (s.ok()) {
+                    s = read_set_cardinality(txn, user_key, set_count);
+                }
+                int64_t zset_count = 0;
+                if (s.ok()) {
+                    s = read_zset_cardinality(txn, user_key, zset_count);
+                }
                 if (!s.ok()) {
                     result.success = false;
                     all_success = false;
@@ -4173,6 +4183,26 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                         }
                         payload = std::string("MAKO_HASH_DUMP\0", 15) + pack_bytes_list(fields);
                     }
+                } else if (set_count > 0) {
+                    std::vector<std::string> members;
+                    s = read_set_members(txn, user_key, members);
+                    if (s.ok()) {
+                        payload = std::string("MAKO_SET_DUMP\0", 14) + pack_bytes_list(members);
+                    }
+                } else if (zset_count > 0) {
+                    std::map<std::string, double> values;
+                    s = collect_zset_values(txn, user_key, values);
+                    if (s.ok()) {
+                        // Encode as [score, member, ...] so RESTORE can replay it
+                        // through the ZADD path unchanged.
+                        std::vector<std::string> fields;
+                        fields.reserve(values.size() * 2);
+                        for (const auto& [member, score] : values) {
+                            fields.push_back(format_zset_score(score));
+                            fields.push_back(member);
+                        }
+                        payload = std::string("MAKO_ZSET_DUMP\0", 15) + pack_bytes_list(fields);
+                    }
                 }
                 if (!s.ok()) {
                     result.success = false;
@@ -4184,6 +4214,112 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                 if (result.value_present && !copy_result_value(result, payload)) {
                     all_success = false;
                 }
+            } else if (op.op == TXN_OP_BITOP) {
+                // BITOP AND|OR|XOR|NOT dest src [src ...]: read every source string
+                // and write the combined bytes to dest inside the same transaction.
+                std::vector<std::string> items;
+                if (!unpack_bytes_list(op.val_ptr, op.val_len, items) || items.size() < 2) {
+                    all_success = false;
+                    continue;
+                }
+                std::string operation = items[0];
+                std::transform(operation.begin(), operation.end(), operation.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+                bool dest_allowed = false;
+                mako::Status s = string_key_allowed(txn, user_key, tl_key_buf, result, dest_allowed);
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                if (!dest_allowed) {
+                    continue;
+                }
+                std::vector<std::string> sources;
+                sources.reserve(items.size() - 1);
+                size_t max_len = 0;
+                bool sources_ok = true;
+                for (size_t i = 1; i < items.size(); ++i) {
+                    const std::string& src_key = items[i];
+                    const std::string src_storage = "table_key_" + src_key;
+                    bool src_allowed = false;
+                    s = string_key_allowed(txn, src_key, src_storage, result, src_allowed);
+                    if (!s.ok()) {
+                        all_success = false;
+                        sources_ok = false;
+                        break;
+                    }
+                    if (!src_allowed) {
+                        sources_ok = false;
+                        break;
+                    }
+                    std::string value;
+                    bool exists = false;
+                    s = read_current(txn, src_key, src_storage, value, exists);
+                    if (!s.ok()) {
+                        all_success = false;
+                        sources_ok = false;
+                        break;
+                    }
+                    if (!exists) {
+                        value.clear();
+                    }
+                    max_len = std::max(max_len, value.size());
+                    sources.push_back(std::move(value));
+                }
+                if (!sources_ok) {
+                    continue;
+                }
+                std::string combined(max_len, '\0');
+                for (size_t i = 0; i < max_len; ++i) {
+                    unsigned char acc = 0;
+                    if (operation == "NOT") {
+                        const unsigned char b =
+                            i < sources[0].size() ? static_cast<unsigned char>(sources[0][i]) : 0;
+                        acc = static_cast<unsigned char>(~b);
+                    } else {
+                        bool first_source = true;
+                        for (const auto& src : sources) {
+                            const unsigned char b =
+                                i < src.size() ? static_cast<unsigned char>(src[i]) : 0;
+                            if (first_source) {
+                                acc = b;
+                                first_source = false;
+                            } else if (operation == "AND") {
+                                acc &= b;
+                            } else if (operation == "OR") {
+                                acc |= b;
+                            } else {
+                                acc ^= b;
+                            }
+                        }
+                    }
+                    combined[i] = static_cast<char>(acc);
+                }
+                if (combined.empty()) {
+                    // Redis deletes the destination when the result is empty.
+                    s = delete_raw_if_exists(txn, tl_key_buf);
+                    if (s.ok()) {
+                        batch_exists[tl_key_buf] = false;
+                        batch_values.erase(tl_key_buf);
+                    }
+                } else {
+                    s = put_raw(txn, tl_key_buf, combined);
+                    if (s.ok()) {
+                        batch_exists[tl_key_buf] = true;
+                        batch_values[tl_key_buf] = combined;
+                    }
+                }
+                if (s.ok()) {
+                    s = clear_ttl_meta(txn, user_key);
+                }
+                if (!s.ok()) {
+                    result.success = false;
+                    all_success = false;
+                    continue;
+                }
+                result.success = true;
+                result.value_present = true;
+                result.int_value = static_cast<int64_t>(combined.size());
             } else if (op.op == TXN_OP_RESTORE_LIST) {
                 std::vector<std::string> values;
                 if (!unpack_bytes_list(op.val_ptr, op.val_len, values)) {
@@ -4266,6 +4402,23 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
                 }
                 if (desc) {
                     std::reverse(sorted.begin(), sorted.end());
+                }
+                // LIMIT offset count (Redis semantics: negative offset -> 0,
+                // negative count -> everything after the offset).
+                if (options.size() >= 5) {
+                    long long limit_offset = std::strtoll(options[3].c_str(), nullptr, 10);
+                    const long long limit_count = std::strtoll(options[4].c_str(), nullptr, 10);
+                    if (limit_offset < 0) {
+                        limit_offset = 0;
+                    }
+                    if (limit_count >= 0 || limit_offset > 0) {
+                        const size_t begin = std::min(static_cast<size_t>(limit_offset), sorted.size());
+                        size_t end = sorted.size();
+                        if (limit_count >= 0) {
+                            end = std::min(sorted.size(), begin + static_cast<size_t>(limit_count));
+                        }
+                        sorted = std::vector<std::string>(sorted.begin() + begin, sorted.begin() + end);
+                    }
                 }
 
                 if (!destination.empty()) {

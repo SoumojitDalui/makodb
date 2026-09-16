@@ -58,6 +58,9 @@ static REDIS_BACKEND: OnceLock<RedisBackend> = OnceLock::new();
 static MEMORY_STORE: OnceLock<Mutex<HashMap<Bytes, MemoryEntry>>> = OnceLock::new();
 const MAKO_HASH_DUMP_PREFIX: &[u8] = b"MAKO_HASH_DUMP\0";
 const MAKO_LIST_DUMP_PREFIX: &[u8] = b"MAKO_LIST_DUMP\0";
+const MAKO_STRING_DUMP_PREFIX: &[u8] = b"MAKO_STRING_DUMP\0";
+const MAKO_SET_DUMP_PREFIX: &[u8] = b"MAKO_SET_DUMP\0";
+const MAKO_ZSET_DUMP_PREFIX: &[u8] = b"MAKO_ZSET_DUMP\0";
 
 // ===== FFI Types (must match transaction_ffi.h) =====
 // Redis-visible keys must not use the 0x01 prefix. The C++ executor stores
@@ -141,6 +144,7 @@ const TXN_OP_ZSET_ALGEBRA: u32 = 74;
 const TXN_OP_ZMPOP: u32 = 75;
 const TXN_OP_ZRANDMEMBER: u32 = 76;
 const TXN_OP_COPY: u32 = 77;
+const TXN_OP_BITOP: u32 = 78;
 
 const ZRANGE_MODE_RANK: i64 = 0;
 const ZRANGE_MODE_SCORE: i64 = 1;
@@ -531,6 +535,18 @@ enum OpCode {
     Sort = 137,
     LMPop = 138,
     RenameNx = 140,
+    Touch = 166,
+    SortRo = 167,
+    BitCount = 168,
+    BitPos = 169,
+    BitFieldRo = 170,
+    SlowLog = 171,
+    Latency = 172,
+    Object = 173,
+    Acl = 174,
+    SSubscribe = 175,
+    SUnsubscribe = 176,
+    BitOp = 177,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -557,6 +573,8 @@ struct Command {
     scan_prefix: Bytes,
     scan_type_matches: bool,
     set_count: Option<i64>,
+    // RESTORE payload kind: 0 list, 1 hash, 2 string, 3 set, 4 zset.
+    restore_kind: u8,
 }
 
 impl Command {
@@ -577,6 +595,7 @@ impl Command {
             scan_prefix: Bytes::new(),
             scan_type_matches: true,
             set_count: None,
+            restore_kind: 0,
         }
     }
 }
@@ -885,6 +904,8 @@ struct PubSubTarget {
     client_id: usize,
     queue: PubSubQueueWeak,
     worker_wake: Option<Weak<WorkerWake>>,
+    // True when registered through SSUBSCRIBE; deliveries use "smessage".
+    sharded: bool,
 }
 
 struct PubSubRegistry {
@@ -948,6 +969,7 @@ struct ClientState {
     blocked: bool,
     subscribed_channels: HashSet<Bytes>,
     subscribed_patterns: HashSet<Bytes>,
+    subscribed_shard_channels: HashSet<Bytes>,
     pubsub_queue: PubSubQueue,
     worker_wake: Option<Weak<WorkerWake>>,
 }
@@ -971,6 +993,7 @@ impl ClientState {
             blocked: false,
             subscribed_channels: HashSet::new(),
             subscribed_patterns: HashSet::new(),
+            subscribed_shard_channels: HashSet::new(),
             pubsub_queue: Arc::new(Mutex::new(VecDeque::new())),
             worker_wake,
         }
@@ -989,7 +1012,9 @@ impl ClientState {
     }
 
     fn subscription_count(&self) -> usize {
-        self.subscribed_channels.len() + self.subscribed_patterns.len()
+        self.subscribed_channels.len()
+            + self.subscribed_patterns.len()
+            + self.subscribed_shard_channels.len()
     }
 
     fn in_subscriber_mode(&self) -> bool {
@@ -1346,6 +1371,33 @@ fn parse_opcode(name: &[u8]) -> Option<OpCode> {
         Some(OpCode::Info)
     } else if ascii_eq_ci(name, b"CONFIG") {
         Some(OpCode::Config)
+    } else if ascii_eq_ci(name, b"TOUCH") {
+        Some(OpCode::Touch)
+    } else if ascii_eq_ci(name, b"SORT_RO") {
+        Some(OpCode::SortRo)
+    } else if ascii_eq_ci(name, b"BITCOUNT") {
+        Some(OpCode::BitCount)
+    } else if ascii_eq_ci(name, b"BITPOS") {
+        Some(OpCode::BitPos)
+    } else if ascii_eq_ci(name, b"BITFIELD_RO") {
+        Some(OpCode::BitFieldRo)
+    } else if ascii_eq_ci(name, b"BITOP") {
+        Some(OpCode::BitOp)
+    } else if ascii_eq_ci(name, b"SLOWLOG") {
+        Some(OpCode::SlowLog)
+    } else if ascii_eq_ci(name, b"LATENCY") {
+        Some(OpCode::Latency)
+    } else if ascii_eq_ci(name, b"OBJECT") {
+        Some(OpCode::Object)
+    } else if ascii_eq_ci(name, b"ACL") {
+        Some(OpCode::Acl)
+    } else if ascii_eq_ci(name, b"SPUBLISH") {
+        // Single-keyspace server: sharded publish is plain publish.
+        Some(OpCode::Publish)
+    } else if ascii_eq_ci(name, b"SSUBSCRIBE") {
+        Some(OpCode::SSubscribe)
+    } else if ascii_eq_ci(name, b"SUNSUBSCRIBE") {
+        Some(OpCode::SUnsubscribe)
     } else {
         None
     }
@@ -1827,6 +1879,195 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             validate_user_key(&key)?;
             Ok(Command::new(op, vec![key], None, Vec::new()))
         }
+        OpCode::Touch => {
+            if parts.len() < 2 {
+                return Err(wrong_arity("touch"));
+            }
+            let mut keys = Vec::with_capacity(parts.len() - 1);
+            for part in parts.iter().skip(1) {
+                let key = part_to_bytes(part)?;
+                validate_user_key(&key)?;
+                keys.push(key);
+            }
+            Ok(Command::new(
+                op,
+                keys,
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            ))
+        }
+        OpCode::BitCount => {
+            if parts.len() != 2 && parts.len() != 4 && parts.len() != 5 {
+                return Err(wrong_arity("bitcount"));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            let mut values = Vec::new();
+            if parts.len() >= 4 {
+                let start = part_to_bytes(&parts[2])?;
+                let end = part_to_bytes(&parts[3])?;
+                parse_i64_error_arg(start.as_ref(), "value is not an integer or out of range")?;
+                parse_i64_error_arg(end.as_ref(), "value is not an integer or out of range")?;
+                values.push(start);
+                values.push(end);
+                if parts.len() == 5 {
+                    let unit = part_to_bytes(&parts[4])?;
+                    if !ascii_eq_ci(unit.as_ref(), b"BYTE") && !ascii_eq_ci(unit.as_ref(), b"BIT") {
+                        return Err(ParseError::Protocol("syntax error"));
+                    }
+                    values.push(unit);
+                }
+            }
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values = values;
+            Ok(cmd)
+        }
+        OpCode::BitPos => {
+            if parts.len() < 3 || parts.len() > 6 {
+                return Err(wrong_arity("bitpos"));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            let bit = part_to_bytes(&parts[2])?;
+            if bit.as_ref() != b"0" && bit.as_ref() != b"1" {
+                return Err(ParseError::Error("The bit argument must be 1 or 0."));
+            }
+            let mut values = vec![bit];
+            let numeric_end = parts.len().min(5);
+            for index in 3..numeric_end {
+                let value = part_to_bytes(&parts[index])?;
+                parse_i64_error_arg(value.as_ref(), "value is not an integer or out of range")?;
+                values.push(value);
+            }
+            if parts.len() == 6 {
+                let unit = part_to_bytes(&parts[5])?;
+                if !ascii_eq_ci(unit.as_ref(), b"BYTE") && !ascii_eq_ci(unit.as_ref(), b"BIT") {
+                    return Err(ParseError::Protocol("syntax error"));
+                }
+                values.push(unit);
+            }
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values = values;
+            Ok(cmd)
+        }
+        OpCode::BitFieldRo => {
+            if parts.len() < 2 {
+                return Err(wrong_arity("bitfield_ro"));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            validate_user_key(&key)?;
+            let mut values = Vec::new();
+            let mut index = 2usize;
+            while index < parts.len() {
+                let subcommand = part_to_bytes(&parts[index])?;
+                if !ascii_eq_ci(subcommand.as_ref(), b"GET") {
+                    return Err(ParseError::Error(
+                        "BITFIELD_RO only supports the GET subcommand",
+                    ));
+                }
+                if index + 2 >= parts.len() {
+                    return Err(ParseError::Protocol("syntax error"));
+                }
+                let encoding = part_to_bytes(&parts[index + 1])?;
+                let offset = part_to_bytes(&parts[index + 2])?;
+                let (_, bits) = parse_bitfield_encoding(encoding.as_ref())?;
+                parse_bitfield_offset(offset.as_ref(), bits)?;
+                values.push(encoding);
+                values.push(offset);
+                index += 3;
+            }
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values = values;
+            Ok(cmd)
+        }
+        OpCode::BitOp => {
+            if parts.len() < 4 {
+                return Err(wrong_arity("bitop"));
+            }
+            let operation = part_to_bytes(&parts[1])?;
+            let is_not = ascii_eq_ci(operation.as_ref(), b"NOT");
+            if !is_not
+                && !ascii_eq_ci(operation.as_ref(), b"AND")
+                && !ascii_eq_ci(operation.as_ref(), b"OR")
+                && !ascii_eq_ci(operation.as_ref(), b"XOR")
+            {
+                return Err(ParseError::Protocol("syntax error"));
+            }
+            if is_not && parts.len() != 4 {
+                return Err(ParseError::Error(
+                    "BITOP NOT must be called with a single source key.",
+                ));
+            }
+            let destination = part_to_bytes(&parts[2])?;
+            validate_user_key(&destination)?;
+            let mut values = Vec::with_capacity(parts.len() - 2);
+            values.push(operation);
+            for part in parts.iter().skip(3) {
+                let key = part_to_bytes(part)?;
+                validate_user_key(&key)?;
+                values.push(key);
+            }
+            let mut cmd = Command::new(
+                op,
+                vec![destination],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values = values;
+            Ok(cmd)
+        }
+        OpCode::Object => {
+            if parts.len() < 2 {
+                return Err(wrong_arity("object"));
+            }
+            let subcommand = part_to_bytes(&parts[1])?;
+            if ascii_eq_ci(subcommand.as_ref(), b"HELP") {
+                if parts.len() != 2 {
+                    return Err(wrong_arity("object|help"));
+                }
+                return Ok(Command::new(
+                    op,
+                    Vec::new(),
+                    None,
+                    command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+                ));
+            }
+            if !ascii_eq_ci(subcommand.as_ref(), b"ENCODING")
+                && !ascii_eq_ci(subcommand.as_ref(), b"REFCOUNT")
+                && !ascii_eq_ci(subcommand.as_ref(), b"FREQ")
+                && !ascii_eq_ci(subcommand.as_ref(), b"IDLETIME")
+            {
+                return Err(ParseError::Error(
+                    "unknown subcommand or wrong number of arguments for 'OBJECT'. Try OBJECT HELP.",
+                ));
+            }
+            if parts.len() != 3 {
+                return Err(wrong_arity("object"));
+            }
+            let key = part_to_bytes(&parts[2])?;
+            validate_user_key(&key)?;
+            Ok(Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            ))
+        }
         OpCode::MGet => {
             if parts.len() < 2 {
                 return Err(wrong_arity("mget"));
@@ -1889,15 +2130,21 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             }
             Ok(cmd)
         }
-        OpCode::Sort => {
+        OpCode::Sort | OpCode::SortRo => {
             if parts.len() < 2 {
-                return Err(wrong_arity("sort"));
+                return Err(wrong_arity(if op == OpCode::SortRo {
+                    "sort_ro"
+                } else {
+                    "sort"
+                }));
             }
             let key = part_to_bytes(&parts[1])?;
             validate_user_key(&key)?;
             let mut alpha = false;
             let mut desc = false;
             let mut store = Bytes::new();
+            let mut limit_offset: i64 = 0;
+            let mut limit_count: i64 = -1;
             let mut index = 2usize;
             while index < parts.len() {
                 let option = part_to_bytes(&parts[index])?;
@@ -1910,8 +2157,21 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 } else if ascii_eq_ci(option.as_ref(), b"DESC") {
                     desc = true;
                     index += 1;
+                } else if ascii_eq_ci(option.as_ref(), b"LIMIT") {
+                    if index + 2 >= parts.len() {
+                        return Err(ParseError::Protocol("syntax error"));
+                    }
+                    limit_offset = parse_i64_error_arg(
+                        part_to_bytes(&parts[index + 1])?.as_ref(),
+                        "value is not an integer or out of range",
+                    )?;
+                    limit_count = parse_i64_error_arg(
+                        part_to_bytes(&parts[index + 2])?.as_ref(),
+                        "value is not an integer or out of range",
+                    )?;
+                    index += 3;
                 } else if ascii_eq_ci(option.as_ref(), b"STORE") {
-                    if index + 1 >= parts.len() {
+                    if op == OpCode::SortRo || index + 1 >= parts.len() {
                         return Err(ParseError::Protocol("syntax error"));
                     }
                     store = part_to_bytes(&parts[index + 1])?;
@@ -1931,6 +2191,8 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 store,
                 Bytes::from_static(if alpha { b"1" } else { b"0" }),
                 Bytes::from_static(if desc { b"1" } else { b"0" }),
+                Bytes::from(limit_offset.to_string()),
+                Bytes::from(limit_count.to_string()),
             ];
             Ok(cmd)
         }
@@ -2276,28 +2538,41 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             validate_user_key(&key)?;
             parse_i64_arg(part_to_bytes(&parts[2])?.as_ref())?;
             let payload = part_to_bytes(&parts[3])?;
-            let is_list_payload = payload.starts_with(MAKO_LIST_DUMP_PREFIX);
-            if !is_list_payload && !payload.starts_with(MAKO_HASH_DUMP_PREFIX) {
-                return Err(ParseError::Error(
-                    "DUMP payload version or checksum are wrong",
-                ));
-            }
-            let prefix_len = if is_list_payload {
-                MAKO_LIST_DUMP_PREFIX.len()
+            let ttl_ms = parse_i64_arg(part_to_bytes(&parts[2])?.as_ref())?;
+            let (restore_kind, prefix_len) = if payload.starts_with(MAKO_LIST_DUMP_PREFIX) {
+                (0u8, MAKO_LIST_DUMP_PREFIX.len())
+            } else if payload.starts_with(MAKO_HASH_DUMP_PREFIX) {
+                (1u8, MAKO_HASH_DUMP_PREFIX.len())
+            } else if payload.starts_with(MAKO_STRING_DUMP_PREFIX) {
+                (2u8, MAKO_STRING_DUMP_PREFIX.len())
+            } else if payload.starts_with(MAKO_SET_DUMP_PREFIX) {
+                (3u8, MAKO_SET_DUMP_PREFIX.len())
+            } else if payload.starts_with(MAKO_ZSET_DUMP_PREFIX) {
+                (4u8, MAKO_ZSET_DUMP_PREFIX.len())
             } else {
-                MAKO_HASH_DUMP_PREFIX.len()
+                return Err(ParseError::Error(
+                    "DUMP payload version or checksum are wrong",
+                ));
             };
-            let fields = parse_list_payload(&payload[prefix_len..]).ok_or(ParseError::Error(
-                "DUMP payload version or checksum are wrong",
-            ))?;
-            if !is_list_payload && fields.len() % 2 != 0 {
+            let fields: Vec<Vec<u8>> = if restore_kind == 2 {
+                vec![payload[prefix_len..].to_vec()]
+            } else {
+                parse_list_payload(&payload[prefix_len..]).ok_or(ParseError::Error(
+                    "DUMP payload version or checksum are wrong",
+                ))?
+            };
+            if (restore_kind == 1 || restore_kind == 4) && fields.len() % 2 != 0 {
                 return Err(ParseError::Error(
                     "DUMP payload version or checksum are wrong",
                 ));
             }
+            let mut absttl = false;
             let mut index = 4usize;
             while index < parts.len() {
                 let arg = part_to_bytes(&parts[index])?;
+                if ascii_eq_ci(arg.as_ref(), b"ABSTTL") {
+                    absttl = true;
+                }
                 if ascii_eq_ci(arg.as_ref(), b"REPLACE")
                     || ascii_eq_ci(arg.as_ref(), b"ABSTTL")
                     || ascii_eq_ci(arg.as_ref(), b"IDLETIME")
@@ -2324,7 +2599,15 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
             );
             cmd.values = fields.into_iter().map(Bytes::from).collect();
-            cmd.scan_type_matches = !is_list_payload;
+            cmd.scan_type_matches = restore_kind == 1;
+            cmd.restore_kind = restore_kind;
+            if ttl_ms > 0 {
+                cmd.expire_at_ms = if absttl {
+                    ttl_ms
+                } else {
+                    unix_time_ms().saturating_add(ttl_ms)
+                };
+            }
             Ok(cmd)
         }
         OpCode::Copy => {
@@ -4185,12 +4468,12 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             }
             Ok(cmd)
         }
-        OpCode::Subscribe | OpCode::PSubscribe => {
+        OpCode::Subscribe | OpCode::PSubscribe | OpCode::SSubscribe => {
             if parts.len() < 2 {
-                return Err(wrong_arity(if op == OpCode::Subscribe {
-                    "subscribe"
-                } else {
-                    "psubscribe"
+                return Err(wrong_arity(match op {
+                    OpCode::Subscribe => "subscribe",
+                    OpCode::SSubscribe => "ssubscribe",
+                    _ => "psubscribe",
                 }));
             }
             Ok(Command::new(
@@ -4200,7 +4483,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
             ))
         }
-        OpCode::Unsubscribe | OpCode::PUnsubscribe => Ok(Command::new(
+        OpCode::Unsubscribe | OpCode::PUnsubscribe | OpCode::SUnsubscribe => Ok(Command::new(
             op,
             Vec::new(),
             None,
@@ -4238,6 +4521,9 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
         | OpCode::Client
         | OpCode::Command
         | OpCode::Memory
+        | OpCode::SlowLog
+        | OpCode::Latency
+        | OpCode::Acl
         | OpCode::Config
         | OpCode::Script
         | OpCode::Eval
@@ -4270,6 +4556,9 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 OpCode::Echo if parts.len() != 2 => Some("echo"),
                 OpCode::Info if parts.len() > 2 => Some("info"),
                 OpCode::Memory if parts.len() < 2 => Some("memory"),
+                OpCode::SlowLog if parts.len() < 2 => Some("slowlog"),
+                OpCode::Latency if parts.len() < 2 => Some("latency"),
+                OpCode::Acl if parts.len() < 2 => Some("acl"),
                 OpCode::Wait if parts.len() != 3 => Some("wait"),
                 OpCode::Time if parts.len() != 1 => Some("time"),
                 OpCode::Watch if parts.len() < 2 => Some("watch"),
@@ -4293,12 +4582,21 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             if let Some(command) = command {
                 return Err(wrong_arity(command));
             }
-            Ok(Command::new(
+            let mut cmd = Command::new(
                 op,
                 Vec::new(),
                 None,
                 command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
-            ))
+            );
+            if op == OpCode::Memory
+                && cmd.args.len() >= 2
+                && ascii_eq_ci(cmd.args[0].as_ref(), b"USAGE")
+            {
+                let key = cmd.args[1].clone();
+                validate_user_key(&key)?;
+                cmd.keys = vec![key];
+            }
+            Ok(cmd)
         }
     }
 }
@@ -4745,7 +5043,95 @@ fn make_pubsub_target(client_state: &ClientState) -> PubSubTarget {
         client_id: client_state.id,
         queue: Arc::downgrade(&client_state.pubsub_queue),
         worker_wake: client_state.worker_wake.clone(),
+        sharded: false,
     }
+}
+
+fn make_pubsub_shard_target(client_state: &ClientState) -> PubSubTarget {
+    PubSubTarget {
+        sharded: true,
+        ..make_pubsub_target(client_state)
+    }
+}
+
+fn register_pubsub_shard_channel(client_state: &mut ClientState, channel: &Bytes) {
+    if !client_state.subscribed_shard_channels.insert(channel.clone()) {
+        return;
+    }
+    if let Ok(mut registry) = pubsub_registry().lock() {
+        registry
+            .channels
+            .entry(channel.clone())
+            .or_default()
+            .push(make_pubsub_shard_target(client_state));
+    }
+}
+
+fn unregister_pubsub_shard_channel(client_state: &mut ClientState, channel: &Bytes) {
+    if !client_state.subscribed_shard_channels.remove(channel) {
+        return;
+    }
+    if let Ok(mut registry) = pubsub_registry().lock() {
+        let mut remove_key = false;
+        if let Some(targets) = registry.channels.get_mut(channel) {
+            targets.retain(|target| {
+                !(target.sharded && target.client_id == client_state.id)
+                    && target.queue.strong_count() > 0
+            });
+            remove_key = targets.is_empty();
+        }
+        if remove_key {
+            registry.channels.remove(channel);
+        }
+    }
+}
+
+fn encode_pubsub_shard_message(channel: &[u8], message: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_array_header(&mut out, 3).unwrap();
+    write_bulk(&mut out, b"smessage").unwrap();
+    write_bulk(&mut out, channel).unwrap();
+    write_bulk(&mut out, message).unwrap();
+    out
+}
+
+fn pubsub_shard_channel_names(pattern: Option<&[u8]>) -> Vec<Bytes> {
+    let Ok(mut registry) = pubsub_registry().lock() else {
+        return Vec::new();
+    };
+    registry.prune_dead();
+    let mut channels: Vec<Bytes> = registry
+        .channels
+        .iter()
+        .filter(|(_, targets)| targets.iter().any(|target| target.sharded))
+        .map(|(channel, _)| channel)
+        .filter(|channel| pattern.map_or(true, |pat| glob_matches(pat, channel.as_ref())))
+        .cloned()
+        .collect();
+    channels.sort();
+    channels
+}
+
+fn pubsub_shard_numsub(channels: &[Bytes]) -> Vec<(Bytes, usize)> {
+    let Ok(mut registry) = pubsub_registry().lock() else {
+        return channels
+            .iter()
+            .cloned()
+            .map(|channel| (channel, 0))
+            .collect();
+    };
+    registry.prune_dead();
+    channels
+        .iter()
+        .map(|channel| {
+            let count = registry
+                .channels
+                .get(channel)
+                .map(|targets| targets.iter().filter(|target| target.sharded).count())
+                .unwrap_or(0);
+            (channel.clone(), count)
+        })
+        .collect()
 }
 
 fn register_pubsub_channel(client_state: &mut ClientState, channel: &Bytes) {
@@ -4815,6 +5201,7 @@ fn unregister_all_pubsub_channels(client_state: &mut ClientState) {
         }
     }
     client_state.subscribed_channels.clear();
+    client_state.subscribed_shard_channels.clear();
 }
 
 fn unregister_all_pubsub_patterns(client_state: &mut ClientState) {
@@ -4835,6 +5222,11 @@ fn unregister_all_pubsub(client_state: &mut ClientState) {
     }
     for pattern in patterns {
         unregister_pubsub_pattern(client_state, &pattern);
+    }
+    let shard_channels: Vec<Bytes> =
+        client_state.subscribed_shard_channels.iter().cloned().collect();
+    for channel in shard_channels {
+        unregister_pubsub_shard_channel(client_state, &channel);
     }
     if let Ok(mut queue) = client_state.pubsub_queue.lock() {
         queue.clear();
@@ -4883,10 +5275,16 @@ fn publish_pubsub_message(channel: &Bytes, message: &Bytes) -> usize {
     };
 
     let exact_reply = encode_pubsub_message(channel.as_ref(), message.as_ref());
+    let shard_reply = encode_pubsub_shard_message(channel.as_ref(), message.as_ref());
     let mut remove_channel = false;
     if let Some(targets) = registry.channels.get_mut(channel) {
         targets.retain(|target| {
-            let delivered = enqueue_pubsub_reply(target, &exact_reply);
+            let reply = if target.sharded {
+                &shard_reply
+            } else {
+                &exact_reply
+            };
+            let delivered = enqueue_pubsub_reply(target, reply);
             if delivered {
                 deliveries += 1;
             }
@@ -5127,6 +5525,53 @@ fn handle_punsubscribe<W: Write>(
     Ok(())
 }
 
+fn handle_ssubscribe<W: Write>(
+    cmd: &Command,
+    client_state: &mut ClientState,
+    writer: &mut W,
+) -> std::io::Result<()> {
+    for channel in &cmd.args {
+        register_pubsub_shard_channel(client_state, channel);
+        write_pubsub_subscription(
+            writer,
+            b"ssubscribe",
+            Some(channel),
+            client_state.subscription_count(),
+        )?;
+    }
+    Ok(())
+}
+
+fn handle_sunsubscribe<W: Write>(
+    cmd: &Command,
+    client_state: &mut ClientState,
+    writer: &mut W,
+) -> std::io::Result<()> {
+    let channels: Vec<Bytes> = if cmd.args.is_empty() {
+        client_state.subscribed_shard_channels.iter().cloned().collect()
+    } else {
+        cmd.args.clone()
+    };
+    if channels.is_empty() {
+        return write_pubsub_subscription(
+            writer,
+            b"sunsubscribe",
+            None,
+            client_state.subscription_count(),
+        );
+    }
+    for channel in channels {
+        unregister_pubsub_shard_channel(client_state, &channel);
+        write_pubsub_subscription(
+            writer,
+            b"sunsubscribe",
+            Some(&channel),
+            client_state.subscription_count(),
+        )?;
+    }
+    Ok(())
+}
+
 fn handle_publish<W: Write>(cmd: &Command, writer: &mut W) -> std::io::Result<()> {
     let Some(channel) = cmd.keys.first() else {
         return write_integer(writer, 0);
@@ -5159,6 +5604,28 @@ fn handle_pubsub<W: Write>(cmd: &Command, writer: &mut W) -> std::io::Result<()>
     } else if ascii_eq_ci(subcommand, b"NUMSUB") {
         let channels: Vec<Bytes> = cmd.args.iter().skip(1).cloned().collect();
         let counts = pubsub_numsub(&channels);
+        write_array_header(writer, counts.len() * 2)?;
+        for (channel, count) in counts {
+            write_bulk(writer, &channel)?;
+            write_integer(writer, count as i64)?;
+        }
+    } else if ascii_eq_ci(subcommand, b"SHARDCHANNELS") {
+        if cmd.args.len() > 2 {
+            write_err(
+                writer,
+                "wrong number of arguments for 'pubsub shardchannels' command",
+            )?;
+            return Ok(());
+        }
+        let pattern = cmd.args.get(1).map(|arg| arg.as_ref());
+        let channels = pubsub_shard_channel_names(pattern);
+        write_array_header(writer, channels.len())?;
+        for channel in channels {
+            write_bulk(writer, &channel)?;
+        }
+    } else if ascii_eq_ci(subcommand, b"SHARDNUMSUB") {
+        let channels: Vec<Bytes> = cmd.args.iter().skip(1).cloned().collect();
+        let counts = pubsub_shard_numsub(&channels);
         write_array_header(writer, counts.len() * 2)?;
         for (channel, count) in counts {
             write_bulk(writer, &channel)?;
@@ -5294,7 +5761,7 @@ fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)
                     group_id: 0,
                 });
             }
-            OpCode::Sort => {
+            OpCode::Sort | OpCode::SortRo => {
                 let Some(key) = cmd.keys.first() else {
                     spans.push((start, 0));
                     continue;
@@ -5340,7 +5807,7 @@ fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)
                     });
                 }
             }
-            OpCode::Del | OpCode::Exists => {
+            OpCode::Del | OpCode::Exists | OpCode::Touch => {
                 let op = if cmd.op == OpCode::Del {
                     TXN_OP_DEL
                 } else {
@@ -5501,23 +5968,98 @@ fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)
                     spans.push((start, 0));
                     continue;
                 };
-                let payload = pack_bytes_list(&cmd.values);
-                payloads.push(payload);
-                let payload = payloads.last().unwrap();
-                ops.push(TxnOperation {
-                    op: if cmd.scan_type_matches {
-                        TXN_OP_HSET
-                    } else {
-                        TXN_OP_RESTORE_LIST
-                    },
-                    key_ptr: key.as_ptr(),
-                    key_len: key.len(),
-                    val_ptr: payload.as_ptr(),
-                    val_len: payload.len(),
-                    flags: 0,
-                    expire_at_ms: -1,
-                    group_id: 0,
-                });
+                match cmd.restore_kind {
+                    2 => {
+                        // String payload: a plain SET carries the TTL itself.
+                        let value = cmd.values.first().cloned().unwrap_or_default();
+                        payloads.push(value);
+                        let value = payloads.last().unwrap();
+                        ops.push(TxnOperation {
+                            op: TXN_OP_SET,
+                            key_ptr: key.as_ptr(),
+                            key_len: key.len(),
+                            val_ptr: value.as_ptr(),
+                            val_len: value.len(),
+                            flags: 0,
+                            expire_at_ms: cmd.expire_at_ms,
+                            group_id: 0,
+                        });
+                    }
+                    3 | 4 => {
+                        // Set/zset payload: replace whatever is at the key, then
+                        // add the members in the same transaction.
+                        ops.push(TxnOperation {
+                            op: TXN_OP_DEL,
+                            key_ptr: key.as_ptr(),
+                            key_len: key.len(),
+                            val_ptr: std::ptr::null(),
+                            val_len: 0,
+                            flags: 0,
+                            expire_at_ms: -1,
+                            group_id: 0,
+                        });
+                        let payload = pack_bytes_list(&cmd.values);
+                        payloads.push(payload);
+                        let payload = payloads.last().unwrap();
+                        ops.push(TxnOperation {
+                            op: if cmd.restore_kind == 3 {
+                                TXN_OP_SADD
+                            } else {
+                                TXN_OP_ZADD
+                            },
+                            key_ptr: key.as_ptr(),
+                            key_len: key.len(),
+                            val_ptr: payload.as_ptr(),
+                            val_len: payload.len(),
+                            flags: 0,
+                            expire_at_ms: -1,
+                            group_id: 0,
+                        });
+                        if cmd.expire_at_ms > 0 {
+                            ops.push(TxnOperation {
+                                op: TXN_OP_EXPIRE,
+                                key_ptr: key.as_ptr(),
+                                key_len: key.len(),
+                                val_ptr: std::ptr::null(),
+                                val_len: 0,
+                                flags: 0,
+                                expire_at_ms: cmd.expire_at_ms,
+                                group_id: 0,
+                            });
+                        }
+                    }
+                    _ => {
+                        let payload = pack_bytes_list(&cmd.values);
+                        payloads.push(payload);
+                        let payload = payloads.last().unwrap();
+                        ops.push(TxnOperation {
+                            op: if cmd.scan_type_matches {
+                                TXN_OP_HSET
+                            } else {
+                                TXN_OP_RESTORE_LIST
+                            },
+                            key_ptr: key.as_ptr(),
+                            key_len: key.len(),
+                            val_ptr: payload.as_ptr(),
+                            val_len: payload.len(),
+                            flags: 0,
+                            expire_at_ms: -1,
+                            group_id: 0,
+                        });
+                        if cmd.expire_at_ms > 0 {
+                            ops.push(TxnOperation {
+                                op: TXN_OP_EXPIRE,
+                                key_ptr: key.as_ptr(),
+                                key_len: key.len(),
+                                val_ptr: std::ptr::null(),
+                                val_len: 0,
+                                flags: 0,
+                                expire_at_ms: cmd.expire_at_ms,
+                                group_id: 0,
+                            });
+                        }
+                    }
+                }
             }
             OpCode::BLPop | OpCode::BRPop | OpCode::BLMPop | OpCode::LMPop => {
                 let payload = pack_bytes_list(&cmd.keys);
@@ -5704,6 +6246,79 @@ fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)
                     op: TXN_OP_FLUSHDB,
                     key_ptr: std::ptr::null(),
                     key_len: 0,
+                    val_ptr: std::ptr::null(),
+                    val_len: 0,
+                    flags: 0,
+                    expire_at_ms: -1,
+                    group_id: 0,
+                });
+            }
+            OpCode::BitCount | OpCode::BitPos | OpCode::BitFieldRo => {
+                // Read the whole string once via GETRANGE 0 -1 (which enforces the
+                // string type check); bit arithmetic happens in Rust.
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                let payload = pack_bytes_list(&[Bytes::from_static(b"0"), Bytes::from_static(b"-1")]);
+                payloads.push(payload);
+                let payload = payloads.last().unwrap();
+                ops.push(TxnOperation {
+                    op: TXN_OP_GETRANGE,
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr: payload.as_ptr(),
+                    val_len: payload.len(),
+                    flags: 0,
+                    expire_at_ms: -1,
+                    group_id: 0,
+                });
+            }
+            OpCode::BitOp => {
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                let payload = pack_bytes_list(&cmd.values);
+                payloads.push(payload);
+                let payload = payloads.last().unwrap();
+                ops.push(TxnOperation {
+                    op: TXN_OP_BITOP,
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr: payload.as_ptr(),
+                    val_len: payload.len(),
+                    flags: 0,
+                    expire_at_ms: -1,
+                    group_id: 0,
+                });
+            }
+            OpCode::Object => {
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                ops.push(TxnOperation {
+                    op: TXN_OP_TYPE,
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr: std::ptr::null(),
+                    val_len: 0,
+                    flags: 0,
+                    expire_at_ms: -1,
+                    group_id: 0,
+                });
+            }
+            OpCode::Memory => {
+                // MEMORY USAGE: size the serialized value via DUMP.
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                ops.push(TxnOperation {
+                    op: TXN_OP_DUMP,
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
                     val_ptr: std::ptr::null(),
                     val_len: 0,
                     flags: 0,
@@ -6496,6 +7111,14 @@ fn command_needs_retry(cmd: &Command) -> bool {
             | OpCode::Dump
             | OpCode::Restore
             | OpCode::Copy
+            | OpCode::Touch
+            | OpCode::SortRo
+            | OpCode::BitCount
+            | OpCode::BitPos
+            | OpCode::BitFieldRo
+            | OpCode::BitOp
+            | OpCode::Object
+            | OpCode::Memory
             | OpCode::BLPop
             | OpCode::BRPop
             | OpCode::BLMPop
@@ -7734,6 +8357,90 @@ fn write_command_result<W: Write>(
                 }
             }
         }
+        OpCode::BitCount => {
+            if !first.success {
+                write_wrongtype(writer)?;
+            } else {
+                match bitcount_in_range(result_value_bytes(first), &cmd.values) {
+                    Ok(count) => write_integer(writer, count)?,
+                    Err(message) => write_err(writer, message)?,
+                }
+            }
+        }
+        OpCode::BitPos => {
+            if !first.success {
+                write_wrongtype(writer)?;
+            } else {
+                match bitpos_in_range(result_value_bytes(first), first.value_present, &cmd.values)
+                {
+                    Ok(position) => write_integer(writer, position)?,
+                    Err(message) => write_err(writer, message)?,
+                }
+            }
+        }
+        OpCode::BitFieldRo => {
+            if !first.success {
+                write_wrongtype(writer)?;
+            } else {
+                let values = bitfield_ro_values(result_value_bytes(first), &cmd.values);
+                write_array_header(writer, values.len())?;
+                for value in values {
+                    write_integer(writer, value)?;
+                }
+            }
+        }
+        OpCode::BitOp => {
+            if first.success {
+                write_integer(writer, first.int_value)?;
+            } else {
+                write_wrongtype(writer)?;
+            }
+        }
+        OpCode::Object => {
+            if !first.success {
+                write_err(writer, "operation failed")?;
+            } else {
+                let subcommand = cmd.args.first().map(|arg| arg.as_ref()).unwrap_or(b"");
+                if !(1..=5).contains(&first.int_value) {
+                    write_null(writer, protocol_version)?;
+                } else if ascii_eq_ci(subcommand, b"ENCODING") {
+                    // Mako has no Redis object encodings; report the canonical
+                    // large-object encoding for each type.
+                    let encoding = match first.int_value {
+                        1 => "raw",
+                        2 => "hashtable",
+                        3 => "quicklist",
+                        4 => "skiplist",
+                        _ => "hashtable",
+                    };
+                    write_bulk(writer, encoding.as_bytes())?;
+                } else if ascii_eq_ci(subcommand, b"REFCOUNT") {
+                    write_integer(writer, 1)?;
+                } else if ascii_eq_ci(subcommand, b"FREQ") {
+                    write_err(
+                        writer,
+                        "An LFU maxmemory policy is not selected, access frequency not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust.",
+                    )?;
+                } else {
+                    write_err(
+                        writer,
+                        "OBJECT IDLETIME is not supported: Mako does not track key access time",
+                    )?;
+                }
+            }
+        }
+        OpCode::Memory => {
+            if !first.success {
+                write_err(writer, "operation failed")?;
+            } else if first.value_present {
+                // Approximation: key bytes + serialized value bytes + fixed
+                // per-key overhead, in the spirit of Redis's own estimate.
+                let key_len = cmd.keys.first().map(|key| key.len()).unwrap_or(0) as i64;
+                write_integer(writer, key_len + first.data_len as i64 + 56)?;
+            } else {
+                write_null(writer, protocol_version)?;
+            }
+        }
         OpCode::Lcs => {
             write_lcs_result(cmd, response, span, writer)?;
         }
@@ -7847,7 +8554,7 @@ fn write_command_result<W: Write>(
                 write_err(writer, "operation failed")?;
             }
         }
-        OpCode::Sort => {
+        OpCode::Sort | OpCode::SortRo => {
             let store = cmd.values.first().map(|v| !v.is_empty()).unwrap_or(false);
             if !first.success {
                 write_wrongtype(writer)?;
@@ -8021,7 +8728,7 @@ fn write_command_result<W: Write>(
                 write_err(writer, "operation failed")?;
             }
         }
-        OpCode::Del | OpCode::Exists => {
+        OpCode::Del | OpCode::Exists | OpCode::Touch => {
             let mut count = 0i64;
             for index in start..start + len {
                 let result = unsafe { &*response.results.add(index) };
@@ -9133,6 +9840,7 @@ fn is_dirty_command(op: OpCode) -> bool {
             | OpCode::RenameNx
             | OpCode::Copy
             | OpCode::Sort
+            | OpCode::BitOp
             | OpCode::Del
             | OpCode::FlushDb
             | OpCode::FlushAll
@@ -10145,6 +10853,484 @@ fn handle_command_command<W: Write>(cmd: &Command, writer: &mut W) -> std::io::R
     }
 }
 
+// ===== Bitmap helpers (computed in Rust over a GET result) =====
+
+fn result_value_bytes(result: &TxnOpResult) -> &[u8] {
+    if result.value_present && result.data_len > 0 && !result.data_ptr.is_null() {
+        unsafe { std::slice::from_raw_parts(result.data_ptr, result.data_len) }
+    } else {
+        &[]
+    }
+}
+
+fn parse_i64_lossy(value: &[u8]) -> Option<i64> {
+    std::str::from_utf8(value).ok()?.parse().ok()
+}
+
+const BITFIELD_TYPE_ERROR: &str =
+    "Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is.";
+
+fn parse_bitfield_encoding(encoding: &[u8]) -> Result<(bool, u32), ParseError> {
+    if encoding.len() < 2 {
+        return Err(ParseError::Error(BITFIELD_TYPE_ERROR));
+    }
+    let signed = match encoding[0] {
+        b'i' => true,
+        b'u' => false,
+        _ => return Err(ParseError::Error(BITFIELD_TYPE_ERROR)),
+    };
+    let bits: u32 = std::str::from_utf8(&encoding[1..])
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .ok_or(ParseError::Error(BITFIELD_TYPE_ERROR))?;
+    if bits == 0 || (signed && bits > 64) || (!signed && bits > 63) {
+        return Err(ParseError::Error(BITFIELD_TYPE_ERROR));
+    }
+    Ok((signed, bits))
+}
+
+fn parse_bitfield_offset(offset: &[u8], bits: u32) -> Result<u64, ParseError> {
+    const ERR: &str = "bit offset is not an integer or out of range";
+    let (text, multiply) = match offset.first() {
+        Some(b'#') => (&offset[1..], true),
+        _ => (offset, false),
+    };
+    let value: i64 = std::str::from_utf8(text)
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .ok_or(ParseError::Error(ERR))?;
+    if value < 0 {
+        return Err(ParseError::Error(ERR));
+    }
+    let value = value as u64;
+    let result = if multiply {
+        value.checked_mul(bits as u64).ok_or(ParseError::Error(ERR))?
+    } else {
+        value
+    };
+    // Redis caps strings at 512 MiB, i.e. 2^32 bits.
+    if result.saturating_add(bits as u64) > (1u64 << 32) {
+        return Err(ParseError::Error(ERR));
+    }
+    Ok(result)
+}
+
+/// Normalize a Redis inclusive [start, end] range over `len_units` items,
+/// honoring negative indexes. Returns None for an empty range.
+fn bit_range_bounds(len_units: i64, start: i64, end: i64) -> Option<(usize, usize)> {
+    if len_units <= 0 {
+        return None;
+    }
+    let mut start = if start < 0 { start + len_units } else { start };
+    let mut end = if end < 0 { end + len_units } else { end };
+    if start < 0 {
+        start = 0;
+    }
+    if end < 0 {
+        end = 0;
+    }
+    if end >= len_units {
+        end = len_units - 1;
+    }
+    if start > end {
+        return None;
+    }
+    Some((start as usize, end as usize))
+}
+
+fn count_bits_in_bit_range(data: &[u8], start_bit: usize, end_bit: usize) -> i64 {
+    let mut count = 0i64;
+    for bit in start_bit..=end_bit {
+        let byte = data[bit / 8];
+        if byte & (0x80u8 >> (bit % 8)) != 0 {
+            count += 1;
+        }
+    }
+    count
+}
+
+fn bitcount_in_range(data: &[u8], values: &[Bytes]) -> Result<i64, &'static str> {
+    if values.len() < 2 {
+        return Ok(data.iter().map(|byte| byte.count_ones() as i64).sum());
+    }
+    const ERR: &str = "value is not an integer or out of range";
+    let start = parse_i64_lossy(&values[0]).ok_or(ERR)?;
+    let end = parse_i64_lossy(&values[1]).ok_or(ERR)?;
+    let bit_unit = values
+        .get(2)
+        .map(|unit| ascii_eq_ci(unit.as_ref(), b"BIT"))
+        .unwrap_or(false);
+    if bit_unit {
+        let Some((first, last)) = bit_range_bounds(data.len() as i64 * 8, start, end) else {
+            return Ok(0);
+        };
+        Ok(count_bits_in_bit_range(data, first, last))
+    } else {
+        let Some((first, last)) = bit_range_bounds(data.len() as i64, start, end) else {
+            return Ok(0);
+        };
+        Ok(data[first..=last]
+            .iter()
+            .map(|byte| byte.count_ones() as i64)
+            .sum())
+    }
+}
+
+fn bitpos_in_range(data: &[u8], exists: bool, values: &[Bytes]) -> Result<i64, &'static str> {
+    const ERR: &str = "value is not an integer or out of range";
+    let want_set = values.first().map(|bit| bit.as_ref() == b"1").unwrap_or(true);
+    if !exists || data.is_empty() {
+        return Ok(if want_set { -1 } else { 0 });
+    }
+    let end_given = values.len() >= 3;
+    let bit_unit = values
+        .get(3)
+        .map(|unit| ascii_eq_ci(unit.as_ref(), b"BIT"))
+        .unwrap_or(false);
+    let total_units = if bit_unit {
+        data.len() as i64 * 8
+    } else {
+        data.len() as i64
+    };
+    let start = match values.get(1) {
+        Some(start) => parse_i64_lossy(start).ok_or(ERR)?,
+        None => 0,
+    };
+    let end = if end_given {
+        parse_i64_lossy(&values[2]).ok_or(ERR)?
+    } else {
+        total_units - 1
+    };
+    let Some((first, last)) = bit_range_bounds(total_units, start, end) else {
+        return Ok(-1);
+    };
+    let (start_bit, end_bit) = if bit_unit {
+        (first, last)
+    } else {
+        (first * 8, last * 8 + 7)
+    };
+    for position in start_bit..=end_bit {
+        let is_set = data[position / 8] & (0x80u8 >> (position % 8)) != 0;
+        if is_set == want_set {
+            return Ok(position as i64);
+        }
+    }
+    if !want_set && !end_given {
+        // Redis: with no explicit end, a string of all ones reports the first
+        // clear bit just past the end of the string.
+        return Ok(end_bit as i64 + 1);
+    }
+    Ok(-1)
+}
+
+fn bitfield_ro_values(data: &[u8], values: &[Bytes]) -> Vec<i64> {
+    let mut out = Vec::new();
+    for pair in values.chunks_exact(2) {
+        let Ok((signed, bits)) = parse_bitfield_encoding(pair[0].as_ref()) else {
+            continue;
+        };
+        let Ok(offset) = parse_bitfield_offset(pair[1].as_ref(), bits) else {
+            continue;
+        };
+        let mut value: u64 = 0;
+        for index in 0..bits as u64 {
+            let bit_index = offset + index;
+            let byte_index = (bit_index / 8) as usize;
+            let bit = if byte_index < data.len() {
+                (data[byte_index] >> (7 - (bit_index % 8))) & 1
+            } else {
+                0
+            };
+            value = (value << 1) | bit as u64;
+        }
+        let result = if signed && bits < 64 && (value >> (bits - 1)) & 1 == 1 {
+            (value | (u64::MAX << bits)) as i64
+        } else {
+            value as i64
+        };
+        out.push(result);
+    }
+    out
+}
+
+// ===== Compatibility shims for observability and ACL commands =====
+
+fn write_string_array<W: Write>(writer: &mut W, items: &[&str]) -> std::io::Result<()> {
+    write_array_header(writer, items.len())?;
+    for item in items {
+        write_bulk(writer, item.as_bytes())?;
+    }
+    Ok(())
+}
+
+fn handle_slowlog_command<W: Write>(cmd: &Command, writer: &mut W) -> std::io::Result<()> {
+    let subcommand = cmd.args.first().map(|arg| arg.as_ref()).unwrap_or(b"");
+    if ascii_eq_ci(subcommand, b"GET") {
+        // No slowlog is recorded; monitoring tools expect an empty list.
+        write_array_header(writer, 0)
+    } else if ascii_eq_ci(subcommand, b"LEN") {
+        write_integer(writer, 0)
+    } else if ascii_eq_ci(subcommand, b"RESET") {
+        write_simple_ok(writer)
+    } else if ascii_eq_ci(subcommand, b"HELP") {
+        write_string_array(
+            writer,
+            &[
+                "SLOWLOG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                "GET [<count>]",
+                "    Return top <count> entries from the slowlog. This server records no slowlog, so the result is always empty.",
+                "LEN",
+                "    Return the length of the slowlog.",
+                "RESET",
+                "    Reset the slowlog.",
+                "HELP",
+                "    Print this help.",
+            ],
+        )
+    } else {
+        write_err(
+            writer,
+            "unknown subcommand or wrong number of arguments for 'SLOWLOG'. Try SLOWLOG HELP.",
+        )
+    }
+}
+
+fn handle_latency_command<W: Write>(cmd: &Command, writer: &mut W) -> std::io::Result<()> {
+    let subcommand = cmd.args.first().map(|arg| arg.as_ref()).unwrap_or(b"");
+    if ascii_eq_ci(subcommand, b"LATEST") {
+        write_array_header(writer, 0)
+    } else if ascii_eq_ci(subcommand, b"HISTORY") {
+        if cmd.args.len() != 2 {
+            return write_err(writer, "wrong number of arguments for 'latency|history' command");
+        }
+        write_array_header(writer, 0)
+    } else if ascii_eq_ci(subcommand, b"RESET") {
+        write_integer(writer, 0)
+    } else if ascii_eq_ci(subcommand, b"DOCTOR") {
+        write_bulk(
+            writer,
+            b"Dave, no latency spike was observed during the lifetime of this Redis instance, not in the slightest bit. I honestly think you ought to sit down calmly, take a stress pill, and think things over.\n",
+        )
+    } else if ascii_eq_ci(subcommand, b"HISTOGRAM") {
+        write_map_header(writer, 0)
+    } else if ascii_eq_ci(subcommand, b"HELP") {
+        write_string_array(
+            writer,
+            &[
+                "LATENCY <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                "DOCTOR",
+                "    Return a human readable latency analysis report.",
+                "HISTORY <event>",
+                "    Return time-latency samples for the <event> class.",
+                "LATEST",
+                "    Return the latest latency samples for all events.",
+                "RESET [<event> ...]",
+                "    Reset latency data of one or more <event> classes.",
+                "HISTOGRAM [<command> ...]",
+                "    Return a cumulative distribution of latencies per command.",
+                "HELP",
+                "    Print this help.",
+            ],
+        )
+    } else {
+        write_err(
+            writer,
+            "unknown subcommand or wrong number of arguments for 'LATENCY'. Try LATENCY HELP.",
+        )
+    }
+}
+
+fn handle_acl_command<W: Write>(cmd: &Command, writer: &mut W) -> std::io::Result<()> {
+    let subcommand = cmd.args.first().map(|arg| arg.as_ref()).unwrap_or(b"");
+    if ascii_eq_ci(subcommand, b"WHOAMI") {
+        write_bulk(writer, b"default")
+    } else if ascii_eq_ci(subcommand, b"USERS") {
+        write_string_array(writer, &["default"])
+    } else if ascii_eq_ci(subcommand, b"LIST") {
+        write_string_array(writer, &["user default on nopass sanitize-payload ~* &* +@all"])
+    } else if ascii_eq_ci(subcommand, b"CAT") {
+        if cmd.args.len() == 1 {
+            write_string_array(
+                writer,
+                &[
+                    "keyspace", "read", "write", "set", "sortedset", "list", "hash", "string",
+                    "bitmap", "hyperloglog", "geo", "stream", "pubsub", "admin", "fast", "slow",
+                    "blocking", "dangerous", "connection", "transaction", "scripting",
+                ],
+            )
+        } else {
+            write_array_header(writer, 0)
+        }
+    } else if ascii_eq_ci(subcommand, b"GETUSER") {
+        if cmd.args.len() == 2 && cmd.args[1].as_ref() == b"default" {
+            write_array_header(writer, 12)?;
+            write_bulk(writer, b"flags")?;
+            write_string_array(writer, &["on", "nopass", "sanitize-payload"])?;
+            write_bulk(writer, b"passwords")?;
+            write_array_header(writer, 0)?;
+            write_bulk(writer, b"commands")?;
+            write_bulk(writer, b"+@all")?;
+            write_bulk(writer, b"keys")?;
+            write_bulk(writer, b"~*")?;
+            write_bulk(writer, b"channels")?;
+            write_bulk(writer, b"&*")?;
+            write_bulk(writer, b"selectors")?;
+            write_array_header(writer, 0)
+        } else {
+            write_nil_bulk(writer)
+        }
+    } else if ascii_eq_ci(subcommand, b"LOG") {
+        if cmd.args.len() == 2 && ascii_eq_ci(cmd.args[1].as_ref(), b"RESET") {
+            write_simple_ok(writer)
+        } else {
+            write_array_header(writer, 0)
+        }
+    } else if ascii_eq_ci(subcommand, b"GENPASS") {
+        let mut seed = unix_time_ms() as u64 ^ 0x9E37_79B9_7F4A_7C15;
+        let mut out = String::with_capacity(64);
+        for _ in 0..4 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            out.push_str(&format!("{seed:016x}"));
+        }
+        write_bulk(writer, out.as_bytes())
+    } else if ascii_eq_ci(subcommand, b"HELP") {
+        write_string_array(
+            writer,
+            &[
+                "ACL <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                "CAT [<category>]",
+                "GETUSER <username>",
+                "GENPASS [<bits>]",
+                "LIST",
+                "LOG [<count> | RESET]",
+                "USERS",
+                "WHOAMI",
+                "HELP",
+                "This server runs with a single implicit 'default' user; ACL rules cannot be changed at runtime.",
+            ],
+        )
+    } else if ascii_eq_ci(subcommand, b"SETUSER")
+        || ascii_eq_ci(subcommand, b"DELUSER")
+        || ascii_eq_ci(subcommand, b"LOAD")
+        || ascii_eq_ci(subcommand, b"SAVE")
+        || ascii_eq_ci(subcommand, b"DRYRUN")
+    {
+        write_err(
+            writer,
+            "ACL configuration is not supported by this server; only the implicit 'default' user exists",
+        )
+    } else {
+        write_err(
+            writer,
+            "unknown subcommand or wrong number of arguments for 'ACL'. Try ACL HELP.",
+        )
+    }
+}
+
+fn handle_object_local<W: Write>(_cmd: &Command, writer: &mut W) -> std::io::Result<()> {
+    write_string_array(
+        writer,
+        &[
+            "OBJECT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+            "ENCODING <key>",
+            "    Return the kind of internal representation used in order to store the value",
+            "    associated with a <key>.",
+            "FREQ <key>",
+            "    Not supported: this server does not track access frequency.",
+            "IDLETIME <key>",
+            "    Not supported: this server does not track key access time.",
+            "REFCOUNT <key>",
+            "    Return the number of references of the value associated with the specified <key>.",
+            "HELP",
+            "    Print this help.",
+        ],
+    )
+}
+
+// ===== INFO keyspace =====
+
+static KEYSPACE_COUNT_CACHE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+static KEYSPACE_COUNT_AT_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Count visible keys the same way DBSIZE does, cached for two seconds so
+/// frequent INFO scrapes do not each walk the keyspace.
+fn keyspace_key_count() -> Option<i64> {
+    let now = unix_time_ms();
+    let cached = KEYSPACE_COUNT_CACHE.load(Ordering::Relaxed);
+    let cached_at = KEYSPACE_COUNT_AT_MS.load(Ordering::Relaxed);
+    if cached >= 0 && now.saturating_sub(cached_at) < 2000 {
+        return Some(cached);
+    }
+    let ops = [TxnOperation {
+        op: TXN_OP_SCAN,
+        key_ptr: std::ptr::null(),
+        key_len: 0,
+        val_ptr: std::ptr::null(),
+        val_len: 0,
+        flags: TXN_FLAG_SCAN_COUNT_ONLY,
+        expire_at_ms: -1,
+        group_id: 0,
+    }];
+    let count = if redis_backend() == RedisBackend::Memory {
+        let response = memory_execute_transaction(&ops);
+        let resp = response.as_response();
+        if resp.num_results >= 1 && !resp.results.is_null() {
+            let result = unsafe { &*resp.results };
+            if result.success {
+                Some(result.int_value)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        let request = TxnRequest {
+            num_ops: 1,
+            ops: ops.as_ptr(),
+        };
+        let mut response = TxnResponse {
+            transaction_success: false,
+            num_results: 0,
+            results: std::ptr::null_mut(),
+        };
+        let ok = unsafe { cpp_execute_transaction(&request, &mut response) };
+        let count = if ok
+            && response.transaction_success
+            && response.num_results >= 1
+            && !response.results.is_null()
+        {
+            let result = unsafe { &*response.results };
+            if result.success {
+                Some(result.int_value)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        unsafe { cpp_free_transaction_response(&mut response) };
+        count
+    };
+    if let Some(count) = count {
+        KEYSPACE_COUNT_CACHE.store(count, Ordering::Relaxed);
+        KEYSPACE_COUNT_AT_MS.store(now, Ordering::Relaxed);
+    }
+    count
+}
+
+fn append_keyspace_info(out: &mut String) {
+    out.push_str("# Keyspace\r\n");
+    if let Some(count) = keyspace_key_count() {
+        out.push_str("db0:keys=");
+        out.push_str(&count.to_string());
+        out.push_str(",expires=0,avg_ttl=0\r\n");
+    }
+    out.push_str("\r\n");
+}
+
 fn handle_memory_command<W: Write>(cmd: &Command, writer: &mut W) -> std::io::Result<()> {
     let Some(subcommand) = cmd.args.first() else {
         write_err(writer, "wrong number of arguments for 'memory' command")?;
@@ -10171,6 +11357,24 @@ fn config_value(name: &[u8]) -> Option<(&'static [u8], &'static [u8])> {
         Some((b"appendonly", b"no"))
     } else if ascii_eq_ci(name, b"databases") {
         Some((b"databases", b"1"))
+    } else if ascii_eq_ci(name, b"maxmemory-policy") {
+        Some((b"maxmemory-policy", b"noeviction"))
+    } else if ascii_eq_ci(name, b"timeout") {
+        Some((b"timeout", b"0"))
+    } else if ascii_eq_ci(name, b"maxclients") {
+        Some((b"maxclients", b"10000"))
+    } else if ascii_eq_ci(name, b"tcp-keepalive") {
+        Some((b"tcp-keepalive", b"300"))
+    } else if ascii_eq_ci(name, b"hz") {
+        Some((b"hz", b"10"))
+    } else if ascii_eq_ci(name, b"notify-keyspace-events") {
+        Some((b"notify-keyspace-events", b""))
+    } else if ascii_eq_ci(name, b"protected-mode") {
+        Some((b"protected-mode", b"no"))
+    } else if ascii_eq_ci(name, b"port") {
+        let value = env::var("MAKO_PORT").unwrap_or_else(|_| "6380".to_string());
+        let leaked: &'static [u8] = Box::leak(value.into_bytes().into_boxed_slice());
+        Some((b"port", leaked))
     } else if ascii_eq_ci(name, b"maxmemory") {
         let value = MAXMEMORY_SETTING.load(Ordering::Relaxed).to_string();
         let leaked: &'static [u8] = Box::leak(value.into_bytes().into_boxed_slice());
@@ -10200,6 +11404,14 @@ fn handle_config_command<W: Write>(cmd: &Command, writer: &mut W) -> std::io::Re
             b"appendonly",
             b"databases",
             b"maxmemory",
+            b"maxmemory-policy",
+            b"timeout",
+            b"maxclients",
+            b"tcp-keepalive",
+            b"hz",
+            b"notify-keyspace-events",
+            b"protected-mode",
+            b"port",
         ];
         let mut entries = Vec::new();
         for name in known {
@@ -10416,6 +11628,9 @@ fn handle_info<W: Write>(cmd: &Command, writer: &mut W) -> std::io::Result<()> {
         append_stats_info(&mut out);
         append_commandstats_info(&mut out);
         append_mako_info(&mut out, &metrics);
+        append_keyspace_info(&mut out);
+    } else if ascii_eq_ci(section, b"keyspace") {
+        append_keyspace_info(&mut out);
     } else if ascii_eq_ci(section, b"server") {
         append_server_info(&mut out, &metrics);
     } else if ascii_eq_ci(section, b"clients") {
@@ -10445,6 +11660,8 @@ fn handle_command<W: Write>(
                 | OpCode::Unsubscribe
                 | OpCode::PSubscribe
                 | OpCode::PUnsubscribe
+                | OpCode::SSubscribe
+                | OpCode::SUnsubscribe
                 | OpCode::Ping
                 | OpCode::Multi
                 | OpCode::Exec
@@ -10502,7 +11719,12 @@ fn handle_command<W: Write>(
             handle_command_command(cmd, writer)?;
         }
         OpCode::Memory => {
-            handle_memory_command(cmd, writer)?;
+            if !cmd.keys.is_empty() {
+                // MEMORY USAGE key: approximate from the serialized value size.
+                ffi_execute_single(cmd, client_state.protocol_version, writer)?;
+            } else {
+                handle_memory_command(cmd, writer)?;
+            }
         }
         OpCode::Config => {
             if txn_state.in_multi {
@@ -10699,6 +11921,33 @@ fn handle_command<W: Write>(
         OpCode::PubSub => {
             handle_pubsub(cmd, writer)?;
         }
+        OpCode::SSubscribe => {
+            handle_ssubscribe(cmd, client_state, writer)?;
+        }
+        OpCode::SUnsubscribe => {
+            if txn_state.in_multi {
+                txn_state.queue_command(cmd.clone());
+                write_queued(writer)?;
+            } else {
+                handle_sunsubscribe(cmd, client_state, writer)?;
+            }
+        }
+        OpCode::SlowLog => {
+            handle_slowlog_command(cmd, writer)?;
+        }
+        OpCode::Latency => {
+            handle_latency_command(cmd, writer)?;
+        }
+        OpCode::Acl => {
+            handle_acl_command(cmd, writer)?;
+        }
+        OpCode::Object => {
+            if cmd.keys.is_empty() {
+                handle_object_local(cmd, writer)?;
+            } else {
+                ffi_execute_single(cmd, client_state.protocol_version, writer)?;
+            }
+        }
         OpCode::Get
         | OpCode::GetEx
         | OpCode::GetDel
@@ -10713,6 +11962,12 @@ fn handle_command<W: Write>(
         | OpCode::Rename
         | OpCode::RenameNx
         | OpCode::Sort
+        | OpCode::SortRo
+        | OpCode::Touch
+        | OpCode::BitCount
+        | OpCode::BitPos
+        | OpCode::BitFieldRo
+        | OpCode::BitOp
         | OpCode::GetSet
         | OpCode::SetNx
         | OpCode::Append
@@ -11240,7 +12495,8 @@ mod tests {
         );
 
         assert_eq!(get_save, b"*2\r\n$4\r\nsave\r\n$0\r\n\r\n");
-        assert!(get_all.starts_with(b"*8\r\n"));
+        // 12 known keys, each reported as a name/value pair.
+        assert!(get_all.starts_with(b"*24\r\n"));
         assert_eq!(resetstat, b"+OK\r\n");
     }
 
