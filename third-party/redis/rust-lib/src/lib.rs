@@ -12192,7 +12192,8 @@ fn geo_hash_string(score: u64) -> Option<String> {
     Some(out)
 }
 
-/// Redis `extractUnitOrReply`, in meters per unit.
+/// Redis `extractUnitOrReply`, in meters per unit. Redis compares the token
+/// with strcasecmp, so `KM` and `km` are the same unit there as here.
 fn geo_unit_meters(unit: &[u8]) -> Option<f64> {
     if ascii_eq_ci(unit, b"m") {
         Some(1.0)
@@ -15139,9 +15140,12 @@ Note that u64 is not supported but i64 is.\r\n"
         assert_eq!(geo_format_distance(meters / 1000.0), "166.2742");
         assert_eq!(geo_format_distance(meters / 1609.34), "103.3182");
 
-        // Units, as Redis's extractUnitOrReply defines them.
+        // Units, as Redis's extractUnitOrReply defines them, matched the way
+        // it matches them: strcasecmp, so the upper-case spellings its own
+        // error text names are accepted too.
         assert_eq!(geo_unit_meters(b"m"), Some(1.0));
         assert_eq!(geo_unit_meters(b"KM"), Some(1000.0));
+        assert_eq!(geo_unit_meters(b"Km"), Some(1000.0));
         assert_eq!(geo_unit_meters(b"ft"), Some(0.3048));
         assert_eq!(geo_unit_meters(b"mi"), Some(1609.34));
         assert_eq!(geo_unit_meters(b"yards"), None);
