@@ -1999,6 +1999,198 @@ def check_streams_groups(host, port, c):
     for key in ("cg", "cg2", "cg3", "cl", "ac", "lg", "lg2", "cs", "cgplain", "bg"):
         c.cmd("DEL", key)
 
+def zrange_scores(reply):
+    """ZRANGE ... WITHSCORES as {member: float}."""
+    return {reply[i]: float(reply[i + 1]) for i in range(0, len(reply), 2)}
+
+
+def check_geo_store(host, port, c, near, coord_near):
+    """GEOSEARCHSTORE and the STORE/STOREDIST forms of the GEORADIUS pair.
+
+    The search reads and the destination replace are one storage transaction
+    (the interactive session), so the destination is never seen half written.
+    """
+    c.cmd("DEL", "GeoSrc", "GeoDst")
+    check("GEOADD store source",
+          c.cmd("GEOADD", "GeoSrc", "13.361389", "38.115556", "Palermo",
+                "15.087269", "37.502669", "Catania"), 2)
+
+    # Redis documentation example for GEOSEARCHSTORE.
+    check("GEOSEARCHSTORE STOREDIST doc example",
+          c.cmd("GEOSEARCHSTORE", "GeoDst", "GeoSrc", "FROMLONLAT", "15", "37",
+                "BYBOX", "400", "400", "km", "ASC", "COUNT", "3", "STOREDIST"), 2)
+    scores = zrange_scores(c.cmd("ZRANGE", "GeoDst", "0", "-1", "WITHSCORES"))
+    check("GEOSEARCHSTORE STOREDIST members", sorted(scores), [b"Catania", b"Palermo"])
+    check("GEOSEARCHSTORE STOREDIST Catania km", scores.get(b"Catania"),
+          pred=lambda g: near(g, 56.4413, 5e-4))
+    check("GEOSEARCHSTORE STOREDIST Palermo km", scores.get(b"Palermo"),
+          pred=lambda g: near(g, 190.4424, 5e-4))
+    check("GEOSEARCHSTORE destination is a zset", c.cmd("TYPE", "GeoDst"), "zset")
+
+    # Without STOREDIST the score is the member's own geohash, so the geo
+    # readers all work on the destination.
+    check("GEOSEARCHSTORE stores geohash scores",
+          c.cmd("GEOSEARCHSTORE", "GeoDst", "GeoSrc", "FROMLONLAT", "15", "37",
+                "BYBOX", "400", "400", "km", "ASC"), 2)
+    check("GEOSEARCHSTORE geohash scores match the source",
+          c.cmd("ZRANGE", "GeoDst", "0", "-1", "WITHSCORES"),
+          c.cmd("ZRANGE", "GeoSrc", "0", "-1", "WITHSCORES"))
+    check("GEOPOS decodes the stored geohash", c.cmd("GEOPOS", "GeoDst", "Palermo")[0],
+          pred=lambda g: coord_near(g, 13.361389, 38.115556))
+    check("GEODIST works on the destination", c.cmd("GEODIST", "GeoDst", "Palermo", "Catania", "km"),
+          b"166.2742")
+
+    # BYRADIUS, and a COUNT that really truncates.
+    check("GEOSEARCHSTORE BYRADIUS",
+          c.cmd("GEOSEARCHSTORE", "GeoDst", "GeoSrc", "FROMLONLAT", "15", "37",
+                "BYRADIUS", "200", "km"), 2)
+    check("GEOSEARCHSTORE BYRADIUS COUNT 1 keeps the closest",
+          c.cmd("GEOSEARCHSTORE", "GeoDst", "GeoSrc", "FROMLONLAT", "15", "37",
+                "BYRADIUS", "200", "km", "COUNT", "1"), 1)
+    check("GEOSEARCHSTORE COUNT 1 stored Catania", c.cmd("ZRANGE", "GeoDst", "0", "-1"), [b"Catania"])
+    check("GEOSEARCHSTORE DESC COUNT 1 stored Palermo",
+          [c.cmd("GEOSEARCHSTORE", "GeoDst", "GeoSrc", "FROMLONLAT", "15", "37",
+                 "BYRADIUS", "200", "km", "DESC", "COUNT", "1"),
+           c.cmd("ZRANGE", "GeoDst", "0", "-1")],
+          [1, [b"Palermo"]])
+
+    # FROMMEMBER: the center is the member's own position, read in the same
+    # transaction as the boxes and the write.
+    check("GEOSEARCHSTORE FROMMEMBER",
+          c.cmd("GEOSEARCHSTORE", "GeoDst", "GeoSrc", "FROMMEMBER", "Palermo",
+                "BYRADIUS", "200", "km", "ASC"), 2)
+    check("GEOSEARCHSTORE FROMMEMBER ordering", c.cmd("ZRANGE", "GeoDst", "0", "-1"),
+          pred=lambda g: sorted(g) == [b"Catania", b"Palermo"])
+    check("GEOSEARCHSTORE FROMMEMBER missing member",
+          c.cmd("GEOSEARCHSTORE", "GeoDst", "GeoSrc", "FROMMEMBER", "NoSuch",
+                "BYRADIUS", "200", "km"),
+          pred=lambda g: is_err(g, "ERR") and "could not decode requested zset member" in str(g))
+    check("GEOSEARCHSTORE left the destination alone after that error",
+          c.cmd("ZCARD", "GeoDst"), 2)
+
+    # The destination is replaced whatever type it held.
+    c.cmd("DEL", "GeoDst")
+    c.cmd("RPUSH", "GeoDst", "a", "b", "c")
+    check("GEOSEARCHSTORE replaces a list destination",
+          c.cmd("GEOSEARCHSTORE", "GeoDst", "GeoSrc", "FROMLONLAT", "15", "37",
+                "BYRADIUS", "200", "km"), 2)
+    check("replaced destination is a zset", c.cmd("TYPE", "GeoDst"), "zset")
+    check("replaced destination holds the matches", sorted(c.cmd("ZRANGE", "GeoDst", "0", "-1")),
+          [b"Catania", b"Palermo"])
+    c.cmd("DEL", "GeoDst")
+    c.cmd("SET", "GeoDst", "a string")
+    check("GEOSEARCHSTORE replaces a string destination",
+          c.cmd("GEOSEARCHSTORE", "GeoDst", "GeoSrc", "FROMLONLAT", "15", "37",
+                "BYRADIUS", "200", "km"), 2)
+    check("replaced string destination is a zset", c.cmd("TYPE", "GeoDst"), "zset")
+
+    # Zero matches delete the destination and answer 0.
+    check("GEOSEARCHSTORE with no matches answers 0",
+          c.cmd("GEOSEARCHSTORE", "GeoDst", "GeoSrc", "FROMLONLAT", "15", "37",
+                "BYRADIUS", "1", "m"), 0)
+    check("GEOSEARCHSTORE deleted the destination", c.cmd("EXISTS", "GeoDst"), 0)
+    check("GEOSEARCHSTORE missing source answers 0",
+          [c.cmd("GEOADD", "GeoDst", "1", "1", "leftover"),
+           c.cmd("GEOSEARCHSTORE", "GeoDst", "GeoNoSuchSource", "FROMLONLAT", "15", "37",
+                 "BYRADIUS", "200", "km"),
+           c.cmd("EXISTS", "GeoDst")],
+          [1, 0, 0])
+    check("GEOSEARCHSTORE FROMMEMBER on a missing source answers 0",
+          [c.cmd("GEOADD", "GeoDst", "1", "1", "leftover"),
+           c.cmd("GEOSEARCHSTORE", "GeoDst", "GeoNoSuchSource", "FROMMEMBER", "m",
+                 "BYRADIUS", "200", "km"),
+           c.cmd("EXISTS", "GeoDst")],
+          [1, 0, 0])
+
+    # A source of another type is a WRONGTYPE, and nothing is written.
+    c.cmd("DEL", "GeoStringSrc")
+    c.cmd("SET", "GeoStringSrc", "not-a-geo-set")
+    c.cmd("GEOADD", "GeoDst", "1", "1", "untouched")
+    check("GEOSEARCHSTORE WRONGTYPE source",
+          c.cmd("GEOSEARCHSTORE", "GeoDst", "GeoStringSrc", "FROMLONLAT", "15", "37",
+                "BYRADIUS", "200", "km"),
+          pred=lambda g: is_err(g, "WRONGTYPE"))
+    check("GEOSEARCHSTORE WRONGTYPE FROMMEMBER source",
+          c.cmd("GEOSEARCHSTORE", "GeoDst", "GeoStringSrc", "FROMMEMBER", "m",
+                "BYRADIUS", "200", "km"),
+          pred=lambda g: is_err(g, "WRONGTYPE"))
+    check("GEOSEARCHSTORE left the destination alone on WRONGTYPE",
+          c.cmd("ZRANGE", "GeoDst", "0", "-1"), [b"untouched"])
+
+    # GEORADIUS STORE / STOREDIST over the same data.
+    check("GEORADIUS STORE", c.cmd("GEORADIUS", "GeoSrc", "15", "37", "200", "km",
+                                   "STORE", "GeoDst"), 2)
+    check("GEORADIUS STORE wrote geohash scores",
+          c.cmd("ZRANGE", "GeoDst", "0", "-1", "WITHSCORES"),
+          c.cmd("ZRANGE", "GeoSrc", "0", "-1", "WITHSCORES"))
+    check("GEORADIUS STOREDIST", c.cmd("GEORADIUS", "GeoSrc", "15", "37", "200", "km",
+                                       "STOREDIST", "GeoDst"), 2)
+    dist = zrange_scores(c.cmd("ZRANGE", "GeoDst", "0", "-1", "WITHSCORES"))
+    check("GEORADIUS STOREDIST Catania km", dist.get(b"Catania"), pred=lambda g: near(g, 56.4413, 5e-4))
+    check("GEORADIUS STOREDIST Palermo km", dist.get(b"Palermo"), pred=lambda g: near(g, 190.4424, 5e-4))
+    check("GEORADIUS STOREDIST m uses the unit asked for",
+          [c.cmd("GEORADIUS", "GeoSrc", "15", "37", "200000", "m", "STOREDIST", "GeoDst"),
+           zrange_scores(c.cmd("ZRANGE", "GeoDst", "0", "-1", "WITHSCORES")).get(b"Catania")],
+          pred=lambda g: g[0] == 2 and near(g[1], 56441.2579, 1.0))
+    check("GEORADIUSBYMEMBER STORE",
+          c.cmd("GEORADIUSBYMEMBER", "GeoSrc", "Palermo", "200", "km", "STORE", "GeoDst"), 2)
+    check("GEORADIUSBYMEMBER STORE members", sorted(c.cmd("ZRANGE", "GeoDst", "0", "-1")),
+          [b"Catania", b"Palermo"])
+    check("GEORADIUSBYMEMBER STOREDIST puts the center first",
+          [c.cmd("GEORADIUSBYMEMBER", "GeoSrc", "Catania", "500", "km", "STOREDIST", "GeoDst"),
+           c.cmd("ZRANGE", "GeoDst", "0", "-1")],
+          [2, [b"Catania", b"Palermo"]])
+    check("GEORADIUSBYMEMBER STOREDIST center distance is zero",
+          zrange_scores(c.cmd("ZRANGE", "GeoDst", "0", "-1", "WITHSCORES")).get(b"Catania"),
+          pred=lambda g: near(g, 0.0, 1e-3))
+
+    # GEOSEARCHSTORE inside MULTI/EXEC: queued, then run with the rest of the
+    # transaction and answered in order.
+    c.cmd("DEL", "GeoDst")
+    check("MULTI before GEOSEARCHSTORE", c.cmd("MULTI"), "OK")
+    check("GEOSEARCHSTORE is queued",
+          c.cmd("GEOSEARCHSTORE", "GeoDst", "GeoSrc", "FROMLONLAT", "15", "37",
+                "BYRADIUS", "200", "km", "STOREDIST"), "QUEUED")
+    check("ZCARD is queued", c.cmd("ZCARD", "GeoDst"), "QUEUED")
+    check("SET is queued", c.cmd("SET", "GeoMultiWitness", "yes"), "QUEUED")
+    check("EXEC runs GEOSEARCHSTORE with the rest", c.cmd("EXEC"), [2, 2, "OK"])
+    check("MULTI GEOSEARCHSTORE really stored", sorted(c.cmd("ZRANGE", "GeoDst", "0", "-1")),
+          [b"Catania", b"Palermo"])
+    check("MULTI companion command also ran", c.cmd("GET", "GeoMultiWitness"), b"yes")
+
+    # A WATCH on the destination is invalidated by a GEOSEARCHSTORE elsewhere,
+    # and a WATCH on the source it only reads is not.
+    other = Resp(host, port)
+    c.cmd("WATCH", "GeoDst")
+    other.cmd("GEOSEARCHSTORE", "GeoDst", "GeoSrc", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km")
+    c.cmd("MULTI")
+    c.cmd("PING")
+    check("WATCH on the destination is invalidated", c.cmd("EXEC"), None)
+    c.cmd("WATCH", "GeoSrc")
+    other.cmd("GEOSEARCHSTORE", "GeoDst", "GeoSrc", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km")
+    c.cmd("MULTI")
+    c.cmd("PING")
+    check("WATCH on the source it only reads survives", c.cmd("EXEC"), ["PONG"])
+    other.cmd("QUIT")
+
+    # Database 1 stores into database 1 and leaves database 0 alone.
+    c1 = Resp(host, port)
+    check("SELECT 1 for the geo store", c1.cmd("SELECT", "1"), "OK")
+    c1.cmd("DEL", "GeoSrc", "GeoDst")
+    c1.cmd("GEOADD", "GeoSrc", "13.361389", "38.115556", "Palermo")
+    before = c.cmd("ZRANGE", "GeoDst", "0", "-1")
+    check("GEOSEARCHSTORE in database 1",
+          c1.cmd("GEOSEARCHSTORE", "GeoDst", "GeoSrc", "FROMLONLAT", "13.361389", "38.115556",
+                 "BYRADIUS", "10", "km"), 1)
+    check("database 1 destination holds its own member", c1.cmd("ZRANGE", "GeoDst", "0", "-1"),
+          [b"Palermo"])
+    check("database 0 destination is untouched", c.cmd("ZRANGE", "GeoDst", "0", "-1"), before)
+    c1.cmd("DEL", "GeoSrc", "GeoDst")
+    c1.cmd("QUIT")
+
+    c.cmd("DEL", "GeoSrc", "GeoDst", "GeoStringSrc", "GeoMultiWitness")
+
+
 def stream_id_tuple(raw):
     ms, _, seq = raw.decode().partition("-")
     return (int(ms), int(seq))
@@ -2456,13 +2648,43 @@ def main():
           pred=lambda g: is_err(g, "ERR unsupported unit provided. please use M, KM, FT, MI"))
     check("GEORADIUS negative radius", c.cmd("GEORADIUS", "Sicily", "15", "37", "-5", "km"),
           pred=lambda g: is_err(g, "ERR radius cannot be negative"))
-    check("GEORADIUS rejects STORE", c.cmd("GEORADIUS", "Sicily", "15", "37", "200", "km", "STORE", "dst"),
-          pred=lambda g: is_err(g, "ERR STORE option in GEORADIUS is not supported by this server"))
-    check("GEORADIUS rejects STOREDIST", c.cmd("GEORADIUS", "Sicily", "15", "37", "200", "km", "STOREDIST", "dst"),
-          pred=lambda g: is_err(g, "ERR STORE option in GEORADIUS is not supported by this server"))
-    check("GEOSEARCHSTORE is unknown", c.cmd("GEOSEARCHSTORE", "dst", "Sicily", "FROMLONLAT", "15", "37",
-                                             "BYRADIUS", "200", "km"),
-          pred=lambda g: is_err(g, "ERR unknown command"))
+    check("GEORADIUS_RO rejects STORE", c.cmd("GEORADIUS_RO", "Sicily", "15", "37", "200", "km", "STORE", "dst"),
+          pred=lambda g: is_err(g, "ERR syntax error"))
+    check("GEORADIUSBYMEMBER_RO rejects STOREDIST",
+          c.cmd("GEORADIUSBYMEMBER_RO", "Sicily", "Palermo", "200", "km", "STOREDIST", "dst"),
+          pred=lambda g: is_err(g, "ERR syntax error"))
+    check("GEORADIUS STORE refuses WITHDIST",
+          c.cmd("GEORADIUS", "Sicily", "15", "37", "200", "km", "STORE", "dst", "WITHDIST"),
+          pred=lambda g: is_err(g, "ERR STORE option in GEORADIUS is not compatible with "
+                                  "WITHDIST, WITHHASH and WITHCOORD options"))
+    check("GEORADIUS STOREDIST refuses WITHCOORD",
+          c.cmd("GEORADIUS", "Sicily", "15", "37", "200", "km", "STOREDIST", "dst", "WITHCOORD"),
+          pred=lambda g: is_err(g, "ERR STORE option in GEORADIUS is not compatible with "
+                                  "WITHDIST, WITHHASH and WITHCOORD options"))
+    check("GEOSEARCHSTORE refuses WITHHASH",
+          c.cmd("GEOSEARCHSTORE", "dst", "Sicily", "FROMLONLAT", "15", "37",
+                "BYRADIUS", "200", "km", "WITHHASH"),
+          pred=lambda g: is_err(g, "ERR syntax error"))
+    check("GEOSEARCHSTORE refuses a STORE token",
+          c.cmd("GEOSEARCHSTORE", "dst", "Sicily", "FROMLONLAT", "15", "37",
+                "BYRADIUS", "200", "km", "STORE", "dst"),
+          pred=lambda g: is_err(g, "ERR syntax error"))
+    check("GEOSEARCH refuses a bare STOREDIST",
+          c.cmd("GEOSEARCH", "Sicily", "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km", "STOREDIST"),
+          pred=lambda g: is_err(g, "ERR syntax error"))
+    check("GEOSEARCHSTORE ANY needs COUNT",
+          c.cmd("GEOSEARCHSTORE", "dst", "Sicily", "FROMLONLAT", "15", "37",
+                "BYRADIUS", "200", "km", "ANY"),
+          pred=lambda g: is_err(g, "ERR the ANY argument requires COUNT argument"))
+    check("GEOSEARCHSTORE needs a shape",
+          c.cmd("GEOSEARCHSTORE", "dst", "Sicily", "FROMLONLAT", "15", "37", "ASC"),
+          pred=lambda g: is_err(g, "ERR exactly one of BYRADIUS and BYBOX can be specified for GEOSEARCH"))
+    check("GEOSEARCHSTORE needs a center",
+          c.cmd("GEOSEARCHSTORE", "dst", "Sicily", "BYRADIUS", "200", "km", "ASC"),
+          pred=lambda g: is_err(g, "ERR exactly one of FROMMEMBER or FROMLONLAT "
+                                  "can be specified for GEOSEARCH"))
+    check("GEOSEARCHSTORE did not create the destination on an error",
+          c.cmd("EXISTS", "dst"), 0)
     c.cmd("SET", "geo-string", "not-a-geo-set")
     check("GEOADD wrongtype", c.cmd("GEOADD", "geo-string", "13.0", "38.0", "x"),
           pred=lambda g: is_err(g, "WRONGTYPE"))
@@ -2479,6 +2701,8 @@ def main():
     check("ZCARD Sicily", c.cmd("ZCARD", "Sicily"), 3)
     check("ZRANGE Sicily by geohash score", c.cmd("ZRANGE", "Sicily", "0", "-1"),
           [b"Agrigento", b"Palermo", b"Catania"])
+
+    check_geo_store(host, port, c, near, coord_near)
 
     # ----- Hash field expiration (Redis 7.4 HEXPIRE family) -----
 

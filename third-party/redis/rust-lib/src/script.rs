@@ -1467,7 +1467,7 @@ mod script_tests {
     #[test]
     fn cjson_round_trips_through_the_lua_state() {
         let lua = Lua::new();
-        let mut session = SessionTxn::begin(&[]).unwrap();
+        let mut session = SessionTxn::begin(&[], 2).unwrap();
         let state = Rc::new(RefCell::new(ScriptState {
             session: &mut session as *mut SessionTxn,
             read_only: false,

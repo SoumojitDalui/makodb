@@ -860,6 +860,7 @@ enum OpCode {
     XPending = 216,
     XClaim = 217,
     XAutoClaim = 218,
+    GeoSearchStore = 219,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -926,6 +927,11 @@ struct GeoSearchSpec {
     withcoord: bool,
     withdist: bool,
     withhash: bool,
+    /// GEOSEARCHSTORE / GEORADIUS[BYMEMBER] STORE|STOREDIST: the score written
+    /// to the destination is the distance in `unit_meters` rather than the
+    /// member's own geohash. The destination key itself is `cmd.keys[0]` and
+    /// the source is `cmd.values[0]`, as ZRANGESTORE spells it.
+    store_dist: bool,
 }
 
 /// Outcome of the FROMMEMBER center lookup.
@@ -2123,6 +2129,10 @@ fn parse_opcode(name: &[u8]) -> Option<OpCode> {
     {
         // The parse arm re-reads the name to pick the argument syntax.
         Some(OpCode::GeoSearch)
+    } else if ascii_eq_ci(name, b"GEOSEARCHSTORE") {
+        // GEORADIUS and GEORADIUSBYMEMBER also become this opcode, but only
+        // once their option loop has seen a STORE or STOREDIST destination.
+        Some(OpCode::GeoSearchStore)
     } else {
         None
     }
@@ -3192,7 +3202,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             cmd.values = vec![part_to_bytes(&parts[2])?, part_to_bytes(&parts[3])?];
             Ok(cmd)
         }
-        OpCode::GeoSearch => parse_geo_search(&parts),
+        OpCode::GeoSearch | OpCode::GeoSearchStore => parse_geo_search(&parts),
         OpCode::Object => {
             if parts.len() < 2 {
                 return Err(wrong_arity("object"));
@@ -9324,26 +9334,16 @@ fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)
                     spans.push((start, 0));
                     continue;
                 }
-                for (min, max) in geo_search_ranges(spec) {
-                    // Redis reads [min, max): the max is the next box's min.
-                    let bounds = [
-                        Bytes::from(min.to_string()),
-                        Bytes::from(format!("({max}")),
-                    ];
-                    let payload = pack_bytes_list(&bounds);
-                    payloads.push(payload);
-                    let payload = payloads.last().unwrap();
-                    ops.push(TxnOperation {
-                        op: TXN_OP_ZRANGE,
-                        key_ptr: key.as_ptr(),
-                        key_len: key.len(),
-                        val_ptr: payload.as_ptr(),
-                        val_len: payload.len(),
-                        flags: TXN_FLAG_Z_BYSCORE | TXN_FLAG_Z_WITHSCORES,
-                        expire_at_ms: -1,
-                        group_id: 0,
-                    });
-                }
+                let (range_ops, range_payloads) = geo_range_ops(key, spec);
+                payloads.extend(range_payloads);
+                ops.extend(range_ops);
+            }
+            OpCode::GeoSearchStore => {
+                // Nothing to build: the read-then-write cannot live in one
+                // op list, so this command runs on the interactive session
+                // path (`geo_search_store_in_session`) instead.
+                spans.push((start, 0));
+                continue;
             }
             OpCode::PfAdd | OpCode::PfCount | OpCode::PfMerge => {
                 let Some(key) = cmd.keys.first() else {
@@ -10522,6 +10522,7 @@ fn command_needs_retry(cmd: &Command) -> bool {
             | OpCode::GeoDist
             | OpCode::GeoHash
             | OpCode::GeoSearch
+            | OpCode::GeoSearchStore
             | OpCode::XAdd
             | OpCode::XRange
             | OpCode::XRevRange
@@ -11287,6 +11288,52 @@ fn ffi_execute_single<W: Write>(
     Ok(())
 }
 
+/// EXEC when the queue holds a GEOSEARCHSTORE. The batch path builds one op
+/// list for the whole transaction up front, which that command cannot join, so
+/// the whole queue runs command by command inside one open session and commits
+/// once. The session formats each reply exactly as the batch path would, and
+/// `ffi_run_session_as` re-runs the whole queue on an optimistic-concurrency
+/// abort, so EXEC stays all-or-nothing.
+fn ffi_execute_transaction_session<W: Write>(
+    commands: &[Command],
+    protocol_version: u8,
+    writer: &mut W,
+) -> std::io::Result<()> {
+    if commands.is_empty() {
+        return write_array_header(writer, 0);
+    }
+    // The stripes the session holds: every command's keys, plus the source a
+    // GEOSEARCHSTORE reads, which lives in `values` rather than `keys`.
+    let mut keys: Vec<Bytes> = Vec::new();
+    for command in commands {
+        keys.extend(command.keys.iter().cloned());
+        if command.op == OpCode::GeoSearchStore {
+            keys.extend(command.values.iter().cloned());
+        }
+    }
+    let replies = ffi_run_session_as(&keys, protocol_version, |session| {
+        let mut replies = Vec::with_capacity(commands.len());
+        for command in commands {
+            match session.execute(command) {
+                Ok(reply) => replies.push(reply),
+                Err(()) => return SessionRun::Retry,
+            }
+        }
+        SessionRun::Commit(replies)
+    });
+    match replies {
+        Some(replies) => {
+            write_array_header(writer, replies.len())?;
+            for reply in replies {
+                writer.write_all(&reply)?;
+            }
+            Ok(())
+        }
+        // A failed transaction answers a nil array, as the batch path does.
+        None => writer.write_all(b"*-1\r\n"),
+    }
+}
+
 /// Execute buffered commands as a single transaction (for MULTI/EXEC)
 /// Returns results wrapped in an array
 fn ffi_execute_transaction<W: Write>(
@@ -11426,6 +11473,9 @@ struct SessionTxn {
     /// visible only once it has run, so the messages are delivered after the
     /// commit and never at all if the session aborts.
     pending_publishes: Vec<(Bytes, Bytes)>,
+    /// RESP version the replies are formatted for. A script always sees RESP2,
+    /// so only an EXEC running on this path passes anything else.
+    protocol_version: u8,
 }
 
 impl SessionTxn {
@@ -11433,7 +11483,7 @@ impl SessionTxn {
     /// session touches without declaring them here are still correct, but they
     /// are serialized by STO's optimistic concurrency and a conflict shows up
     /// as a failed commit instead of a wait.
-    fn begin(keys: &[Bytes]) -> Option<SessionTxn> {
+    fn begin(keys: &[Bytes], protocol_version: u8) -> Option<SessionTxn> {
         if redis_backend() == RedisBackend::Memory {
             return Some(SessionTxn {
                 handle: std::ptr::null_mut(),
@@ -11442,6 +11492,7 @@ impl SessionTxn {
                 dirty: false,
                 written_keys: Vec::new(),
                 pending_publishes: Vec::new(),
+                protocol_version,
             });
         }
         let key_ptrs: Vec<*const u8> = keys.iter().map(|key| key.as_ptr()).collect();
@@ -11457,7 +11508,49 @@ impl SessionTxn {
             dirty: false,
             written_keys: Vec::new(),
             pending_publishes: Vec::new(),
+            protocol_version,
         })
+    }
+
+    /// Runs a raw op list inside the session and hands the results to
+    /// `consume`. This is the one way into the session that is not a whole
+    /// `Command`: GEOSEARCHSTORE needs the range reads themselves, not their
+    /// RESP formatting, before it can decide what to store.
+    fn run_ops<T>(
+        &mut self,
+        ops: &[TxnOperation],
+        consume: impl FnOnce(&[TxnOpResult]) -> T,
+    ) -> Result<T, ()> {
+        if ops.is_empty() {
+            return Ok(consume(&[]));
+        }
+        if self.memory {
+            let owned = memory_execute_transaction(ops);
+            let response = owned.as_response();
+            if response.num_results < ops.len() {
+                return Err(());
+            }
+            return Ok(consume(unsafe {
+                std::slice::from_raw_parts(response.results, ops.len())
+            }));
+        }
+        let request = TxnRequest {
+            num_ops: ops.len(),
+            ops: ops.as_ptr(),
+        };
+        let mut response = TxnResponse {
+            transaction_success: false,
+            num_results: 0,
+            results: std::ptr::null_mut(),
+        };
+        let call_ok = unsafe { cpp_txn_execute(self.handle, &request, &mut response) };
+        if !call_ok || response.num_results < ops.len() {
+            unsafe { cpp_free_transaction_response(&mut response) };
+            return Err(());
+        }
+        let value = consume(unsafe { std::slice::from_raw_parts(response.results, ops.len()) });
+        unsafe { cpp_free_transaction_response(&mut response) };
+        Ok(value)
     }
 
     /// Runs one command inside the session and returns its RESP2 reply.
@@ -11474,6 +11567,12 @@ impl SessionTxn {
             }
         }
 
+        // GEOSEARCHSTORE's write depends on what its own reads returned, which
+        // is exactly what a session is for; it answers for itself.
+        if cmd.op == OpCode::GeoSearchStore {
+            return geo_search_store_in_session(self, cmd);
+        }
+
         // PUBLISH is not a storage op: buffer it so a script's messages are
         // delivered only if the script's writes become visible. The reply is
         // the number of subscribers at the time of the call.
@@ -11488,14 +11587,21 @@ impl SessionTxn {
 
         if ops.is_empty() {
             // PING, TIME and WAIT answer from write_command_result itself.
-            write_command_result(cmd, None, spans[0], 2, &mut reply).map_err(|_| ())?;
+            write_command_result(cmd, None, spans[0], self.protocol_version, &mut reply)
+                .map_err(|_| ())?;
             return Ok(reply);
         }
 
         if self.memory {
             let response = memory_execute_transaction(&ops);
-            write_command_result(cmd, Some(response.as_response()), spans[0], 2, &mut reply)
-                .map_err(|_| ())?;
+            write_command_result(
+                cmd,
+                Some(response.as_response()),
+                spans[0],
+                self.protocol_version,
+                &mut reply,
+            )
+            .map_err(|_| ())?;
             return Ok(reply);
         }
 
@@ -11513,7 +11619,13 @@ impl SessionTxn {
             unsafe { cpp_free_transaction_response(&mut response) };
             return Err(());
         }
-        let formatted = write_command_result(cmd, Some(&response), spans[0], 2, &mut reply);
+        let formatted = write_command_result(
+            cmd,
+            Some(&response),
+            spans[0],
+            self.protocol_version,
+            &mut reply,
+        );
         unsafe { cpp_free_transaction_response(&mut response) };
         formatted.map_err(|_| ())?;
         Ok(reply)
@@ -11590,10 +11702,19 @@ impl Drop for SessionTxn {
 /// same answer the batch path gives.
 fn ffi_run_session<T>(
     keys: &[Bytes],
+    body: impl FnMut(&mut SessionTxn) -> SessionRun<T>,
+) -> Option<T> {
+    ffi_run_session_as(keys, 2, body)
+}
+
+/// `ffi_run_session` with the RESP version the replies must be formatted for.
+fn ffi_run_session_as<T>(
+    keys: &[Bytes],
+    protocol_version: u8,
     mut body: impl FnMut(&mut SessionTxn) -> SessionRun<T>,
 ) -> Option<T> {
     for attempt in 0..TXN_MAX_ATTEMPTS {
-        let Some(mut session) = SessionTxn::begin(keys) else {
+        let Some(mut session) = SessionTxn::begin(keys, protocol_version) else {
             return None;
         };
         match body(&mut session) {
@@ -12141,74 +12262,19 @@ fn write_command_result<W: Write>(
             };
             // Merge the candidates of every box, keep the ones the exact shape
             // test accepts, then sort, truncate and format as Redis does.
-            let mut points: Vec<GeoPoint> = Vec::new();
-            let mut seen: HashSet<Vec<u8>> = HashSet::new();
-            // COUNT ... ANY stops as soon as enough candidates are in hand.
-            let early_stop = if spec.any { spec.count } else { None };
-            'boxes: for index in start..start + len {
-                let result = unsafe { &*response.results.add(index) };
-                if !result.success {
+            let boxes = unsafe { std::slice::from_raw_parts(response.results.add(start), len) };
+            let mut points = match geo_collect_matches(spec, boxes) {
+                GeoMatches::Points(points) => points,
+                GeoMatches::WrongType => {
                     write_wrongtype(writer)?;
                     return Ok(());
                 }
-                let data = result_value_bytes(result);
-                let items = if data.is_empty() {
-                    Vec::new()
-                } else {
-                    match parse_list_payload(data) {
-                        Some(items) => items,
-                        None => {
-                            write_err(writer, "operation failed")?;
-                            return Ok(());
-                        }
-                    }
-                };
-                for pair in items.chunks_exact(2) {
-                    let Some(score) = geo_score_from_bytes(&pair[1]) else {
-                        continue;
-                    };
-                    let (lon, lat) = geo_decode_score(score);
-                    let Some(dist) = geo_distance_if_inside(spec, lon, lat) else {
-                        continue;
-                    };
-                    if !seen.insert(pair[0].clone()) {
-                        continue;
-                    }
-                    points.push(GeoPoint {
-                        member: pair[0].clone(),
-                        lon,
-                        lat,
-                        score,
-                        dist,
-                    });
-                    if let Some(limit) = early_stop {
-                        if points.len() >= limit {
-                            break 'boxes;
-                        }
-                    }
+                GeoMatches::Failed => {
+                    write_err(writer, "operation failed")?;
+                    return Ok(());
                 }
-            }
-
-            // Redis sorts ascending before truncating when COUNT was given
-            // without ANY, because the N closest are what COUNT means.
-            let mut sort = spec.sort;
-            if spec.count.is_some() && sort == GeoSort::None && !spec.any {
-                sort = GeoSort::Asc;
-            }
-            match sort {
-                GeoSort::Asc => points.sort_by(|a, b| {
-                    a.dist
-                        .partial_cmp(&b.dist)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                }),
-                GeoSort::Desc => points.sort_by(|a, b| {
-                    b.dist
-                        .partial_cmp(&a.dist)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                }),
-                GeoSort::None => {}
-            }
-            let returned = spec.count.map_or(points.len(), |c| c.min(points.len()));
+            };
+            let returned = geo_sort_matches(spec, &mut points);
 
             write_array_header(writer, returned)?;
             if !spec.withcoord && !spec.withdist && !spec.withhash {
@@ -12247,6 +12313,11 @@ fn write_command_result<W: Write>(
                     }
                 }
             }
+        }
+        OpCode::GeoSearchStore => {
+            // Never reached: GEOSEARCHSTORE answers from the session that ran
+            // its reads and its write, and `build_txn_ops` gives it no ops.
+            write_err(writer, "operation failed")?;
         }
         OpCode::PfAdd | OpCode::PfCount => {
             if first.success {
@@ -14446,8 +14517,11 @@ fn is_dirty_command(op: OpCode) -> bool {
             | OpCode::ZUnionStore
             | OpCode::ZInterStore
             | OpCode::ZDiffStore
-            // GEOADD is the only geo writer: everything else reads scores.
+            // GEOADD writes the set it is given; GEOSEARCHSTORE (and
+            // GEORADIUS[BYMEMBER] STORE|STOREDIST, which parse to it) writes
+            // the destination. Every other geo command only reads scores.
             | OpCode::GeoAdd
+            | OpCode::GeoSearchStore
             // XADD is what wakes a client blocked in XREAD or XREADGROUP.
             | OpCode::XAdd
             | OpCode::XDel
@@ -14833,10 +14907,16 @@ fn should_defer_dirty_command(client: &ClientConn, cmd: &Command) -> bool {
 
 fn should_wait_for_blocked_completion(cmd: &Command) -> bool {
     // GEOADD is a ZADD, so it can serve a client blocked in BZPOPMIN/BZMPOP
-    // and has to wait for that client the same way ZADD does.
+    // and has to wait for that client the same way ZADD does; GEOSEARCHSTORE
+    // creates a sorted set at its destination, so it can too.
     matches!(
         cmd.op,
-        OpCode::LPush | OpCode::RPush | OpCode::ZAdd | OpCode::GeoAdd | OpCode::XAdd
+        OpCode::LPush
+            | OpCode::RPush
+            | OpCode::ZAdd
+            | OpCode::GeoAdd
+            | OpCode::GeoSearchStore
+            | OpCode::XAdd
     )
 }
 
@@ -15527,7 +15607,10 @@ const GEO_MERCATOR_MAX: f64 = 20_037_726.37;
 const GEO_EARTH_RADIUS_M: f64 = 6_372_797.560856;
 
 const GEO_UNIT_ERROR: &str = "unsupported unit provided. please use M, KM, FT, MI";
-const GEO_STORE_ERROR: &str = "STORE option in GEORADIUS is not supported by this server";
+/// Redis refuses a destination together with the output columns, because the
+/// stored sorted set can carry only one score per member.
+const GEO_STORE_WITH_ERROR: &str =
+    "STORE option in GEORADIUS is not compatible with WITHDIST, WITHHASH and WITHCOORD options";
 
 /// Redis `interleave64`: x (latitude) into the even bits, y (longitude) into
 /// the odd ones.
@@ -16085,12 +16168,18 @@ fn geo_unit_meters(unit: &[u8]) -> Option<f64> {
 /// cover all five; only the way the center and the shape are given differs.
 fn parse_geo_search(parts: &[BytesFrame]) -> Result<Command, ParseError> {
     let name = part_to_bytes(&parts[0])?;
-    let is_search = ascii_eq_ci(name.as_ref(), b"GEOSEARCH");
+    // GEOSEARCHSTORE takes GEOSEARCH's whole option syntax with one extra key
+    // in front of the source, so it shares `is_search` and differs only in
+    // where the source key sits and in accepting a bare STOREDIST flag.
+    let store_command = ascii_eq_ci(name.as_ref(), b"GEOSEARCHSTORE");
+    let is_search = store_command || ascii_eq_ci(name.as_ref(), b"GEOSEARCH");
     let by_member = ascii_eq_ci(name.as_ref(), b"GEORADIUSBYMEMBER")
         || ascii_eq_ci(name.as_ref(), b"GEORADIUSBYMEMBER_RO");
     let read_only = ascii_eq_ci(name.as_ref(), b"GEORADIUS_RO")
         || ascii_eq_ci(name.as_ref(), b"GEORADIUSBYMEMBER_RO");
-    let (command_name, min_args) = if is_search {
+    let (command_name, min_args) = if store_command {
+        ("geosearchstore", 7)
+    } else if is_search {
         ("geosearch", 7)
     } else if by_member && read_only {
         ("georadiusbymember_ro", 5)
@@ -16105,8 +16194,19 @@ fn parse_geo_search(parts: &[BytesFrame]) -> Result<Command, ParseError> {
         return Err(wrong_arity(command_name));
     }
 
-    let key = part_to_bytes(&parts[1])?;
+    // GEOSEARCHSTORE destination source ...: the source is the second key.
+    let key = part_to_bytes(&parts[if store_command { 2 } else { 1 }])?;
     let key = validate_user_key(&key)?;
+    // The destination, once a STORE/STOREDIST option or GEOSEARCHSTORE names
+    // one. `store_seen` is separate so a second STORE is a syntax error rather
+    // than silently replacing the first one.
+    let mut destination: Option<Bytes> = None;
+    let mut store_seen = false;
+    if store_command {
+        let destination_key = part_to_bytes(&parts[1])?;
+        let destination_key = validate_user_key(&destination_key)?;
+        destination = Some(destination_key);
+    }
 
     let mut spec = GeoSearchSpec {
         center_lon: 0.0,
@@ -16124,13 +16224,14 @@ fn parse_geo_search(parts: &[BytesFrame]) -> Result<Command, ParseError> {
         withcoord: false,
         withdist: false,
         withhash: false,
+        store_dist: false,
     };
     let mut have_center = false;
     let mut have_shape = false;
     let mut index;
 
     if is_search {
-        index = 2;
+        index = if store_command { 3 } else { 2 };
     } else {
         if by_member {
             spec.from_member = Some(part_to_bytes(&parts[2])?);
@@ -16174,14 +16275,21 @@ fn parse_geo_search(parts: &[BytesFrame]) -> Result<Command, ParseError> {
         } else if ascii_eq_ci(arg.as_ref(), b"DESC") {
             spec.sort = GeoSort::Desc;
             index += 1;
-        } else if ascii_eq_ci(arg.as_ref(), b"WITHCOORD") {
+        } else if !store_command && ascii_eq_ci(arg.as_ref(), b"WITHCOORD") {
+            // GEOSEARCHSTORE writes a sorted set, so it has no output columns
+            // to ask for: Redis answers a plain syntax error.
             spec.withcoord = true;
             index += 1;
-        } else if ascii_eq_ci(arg.as_ref(), b"WITHDIST") {
+        } else if !store_command && ascii_eq_ci(arg.as_ref(), b"WITHDIST") {
             spec.withdist = true;
             index += 1;
-        } else if ascii_eq_ci(arg.as_ref(), b"WITHHASH") {
+        } else if !store_command && ascii_eq_ci(arg.as_ref(), b"WITHHASH") {
             spec.withhash = true;
+            index += 1;
+        } else if store_command && ascii_eq_ci(arg.as_ref(), b"STOREDIST") {
+            // GEOSEARCHSTORE's STOREDIST is a bare flag: the destination is
+            // already the command's first argument.
+            spec.store_dist = true;
             index += 1;
         } else if ascii_eq_ci(arg.as_ref(), b"COUNT") && index + 1 < parts.len() {
             let count = parse_i64_error_arg(
@@ -16278,13 +16386,29 @@ fn parse_geo_search(parts: &[BytesFrame]) -> Result<Command, ParseError> {
         } else if !is_search
             && !read_only
             && (ascii_eq_ci(arg.as_ref(), b"STORE") || ascii_eq_ci(arg.as_ref(), b"STOREDIST"))
+            && index + 1 < parts.len()
         {
-            // Writing the result back is a separate package; refuse it rather
-            // than silently dropping the destination key.
-            return Err(ParseError::Error(GEO_STORE_ERROR));
+            // GEORADIUS / GEORADIUSBYMEMBER name the destination after the
+            // option. The two spellings are mutually exclusive; the _RO forms
+            // never reach here, so they answer a plain syntax error.
+            if store_seen {
+                return Err(ParseError::Error("syntax error"));
+            }
+            store_seen = true;
+            spec.store_dist = ascii_eq_ci(arg.as_ref(), b"STOREDIST");
+            let store_key = part_to_bytes(&parts[index + 1])?;
+            let store_key = validate_user_key(&store_key)?;
+            destination = Some(store_key);
+            index += 2;
         } else {
             return Err(ParseError::Error("syntax error"));
         }
+    }
+
+    // Redis refuses the output columns together with a destination, because a
+    // sorted set has nowhere to put them.
+    if destination.is_some() && (spec.withcoord || spec.withdist || spec.withhash) {
+        return Err(ParseError::Error(GEO_STORE_WITH_ERROR));
     }
 
     if !have_center {
@@ -16298,12 +16422,27 @@ fn parse_geo_search(parts: &[BytesFrame]) -> Result<Command, ParseError> {
         ));
     }
 
-    let mut cmd = Command::new(
-        OpCode::GeoSearch,
-        vec![key],
-        None,
-        command_args(parts).ok_or(ParseError::Protocol("invalid argument"))?,
-    );
+    let mut cmd = match destination {
+        // ZRANGESTORE's convention: the written key is the command's key and
+        // the read key travels in `values`, so WATCH invalidation and the
+        // dirty-key bookkeeping name only the destination.
+        Some(destination) => {
+            let mut cmd = Command::new(
+                OpCode::GeoSearchStore,
+                vec![destination],
+                None,
+                command_args(parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values = vec![key];
+            cmd
+        }
+        None => Command::new(
+            OpCode::GeoSearch,
+            vec![key],
+            None,
+            command_args(parts).ok_or(ParseError::Protocol("invalid argument"))?,
+        ),
+    };
     cmd.geo = Some(Box::new(spec));
     Ok(cmd)
 }
@@ -16386,10 +16525,18 @@ fn ffi_run_ops<T>(ops: &[TxnOperation], consume: impl FnOnce(Option<&[TxnOpResul
 /// a later op in a request cannot read an earlier op's result, so the range
 /// reads that follow cannot see this score. Recorded in known_divergences.txt.
 fn geo_lookup_member(key: &Bytes, member: &Bytes) -> GeoMemberLookup {
-    // ZSCORE says where the member is; ZCARD separates "there is no such key"
-    // (Redis answers an empty result) from "the key has no such member"
-    // (Redis answers an error). Both read the same key in one request.
-    let ops = [
+    let ops = geo_member_lookup_ops(key, member);
+    ffi_run_ops(&ops, |results| match results {
+        Some(results) => geo_member_lookup_result(results),
+        None => GeoMemberLookup::Failed,
+    })
+}
+
+/// ZSCORE says where the member is; ZCARD separates "there is no such key"
+/// (Redis answers an empty result) from "the key has no such member" (Redis
+/// answers an error). Both read the same key, so they go out together.
+fn geo_member_lookup_ops(key: &Bytes, member: &Bytes) -> [TxnOperation; 2] {
+    [
         TxnOperation {
             op: TXN_OP_ZSCORE,
             key_ptr: key.as_ptr(),
@@ -16410,27 +16557,28 @@ fn geo_lookup_member(key: &Bytes, member: &Bytes) -> GeoMemberLookup {
             expire_at_ms: -1,
             group_id: 0,
         },
-    ];
-    ffi_run_ops(&ops, |results| {
-        let Some(results) = results else {
-            return GeoMemberLookup::Failed;
-        };
-        let (score, cardinality) = (&results[0], &results[1]);
-        if !score.success || !cardinality.success {
-            return GeoMemberLookup::WrongType;
+    ]
+}
+
+fn geo_member_lookup_result(results: &[TxnOpResult]) -> GeoMemberLookup {
+    if results.len() < 2 {
+        return GeoMemberLookup::Failed;
+    }
+    let (score, cardinality) = (&results[0], &results[1]);
+    if !score.success || !cardinality.success {
+        return GeoMemberLookup::WrongType;
+    }
+    if score.value_present {
+        if let Some(bits) = geo_score_from_bytes(result_value_bytes(score)) {
+            let (lon, lat) = geo_decode_score(bits);
+            return GeoMemberLookup::Position(lon, lat);
         }
-        if score.value_present {
-            if let Some(bits) = geo_score_from_bytes(result_value_bytes(score)) {
-                let (lon, lat) = geo_decode_score(bits);
-                return GeoMemberLookup::Position(lon, lat);
-            }
-        }
-        if cardinality.int_value <= 0 {
-            GeoMemberLookup::KeyMissing
-        } else {
-            GeoMemberLookup::MemberMissing
-        }
-    })
+    }
+    if cardinality.int_value <= 0 {
+        GeoMemberLookup::KeyMissing
+    } else {
+        GeoMemberLookup::MemberMissing
+    }
 }
 
 /// Resolve a FROMMEMBER search center. Returns a copy of the command with the
@@ -16456,6 +16604,161 @@ fn geo_resolve_search_center(cmd: &Command) -> Option<Command> {
     Some(resolved)
 }
 
+/// A distance as a ZADD score. Rust's `{:?}` is the shortest decimal that
+/// parses back to the same double, which is what the executor's `strtod`
+/// needs; the geohash form goes in as the integer GEOADD itself writes.
+fn geo_format_store_score(value: f64) -> String {
+    if value == 0.0 {
+        return String::from("0");
+    }
+    format!("{value:?}")
+}
+
+/// GEOSEARCHSTORE, and GEORADIUS / GEORADIUSBYMEMBER with STORE or STOREDIST.
+///
+/// The whole command is one open session, so the FROMMEMBER center lookup, the
+/// neighbor-box range reads, the destination delete and the ZADD of the
+/// matches are one Mako transaction. That is what the session interface is
+/// for: the op list of the write cannot be built until the reads have
+/// answered, and `cpp_execute_transaction` takes its whole op list up front.
+/// It also makes the FROMMEMBER center exact here, where the read-only
+/// searches read it in a request of their own (see known_divergences.txt).
+fn geo_search_store_in_session(session: &mut SessionTxn, cmd: &Command) -> Result<Vec<u8>, ()> {
+    let mut reply = Vec::new();
+    let (Some(spec), Some(destination), Some(source)) =
+        (cmd.geo.as_deref(), cmd.keys.first(), cmd.values.first())
+    else {
+        write_err(&mut reply, "operation failed").map_err(|_| ())?;
+        return Ok(reply);
+    };
+    let mut spec = spec.clone();
+
+    if let Some(member) = spec.from_member.take() {
+        let lookup_ops = geo_member_lookup_ops(source, &member);
+        match session.run_ops(&lookup_ops, geo_member_lookup_result)? {
+            GeoMemberLookup::Position(lon, lat) => {
+                spec.center_lon = lon;
+                spec.center_lat = lat;
+            }
+            // Redis searches an empty set when the source is not there, which
+            // with a destination means "delete it and answer 0".
+            GeoMemberLookup::KeyMissing => {
+                geo_store_replace(session, destination, &spec, &[])?;
+                write_integer(&mut reply, 0).map_err(|_| ())?;
+                return Ok(reply);
+            }
+            // A key that exists but has no such member is an error, and the
+            // destination is left exactly as it was.
+            GeoMemberLookup::MemberMissing => {
+                write_err(&mut reply, "could not decode requested zset member").map_err(|_| ())?;
+                return Ok(reply);
+            }
+            GeoMemberLookup::WrongType => {
+                write_wrongtype(&mut reply).map_err(|_| ())?;
+                return Ok(reply);
+            }
+            GeoMemberLookup::Failed => return Err(()),
+        }
+    }
+
+    let (range_ops, _payloads) = geo_range_ops(source, &spec);
+    let matches = session.run_ops(&range_ops, |results| geo_collect_matches(&spec, results))?;
+    let mut points = match matches {
+        GeoMatches::Points(points) => points,
+        GeoMatches::WrongType => {
+            write_wrongtype(&mut reply).map_err(|_| ())?;
+            return Ok(reply);
+        }
+        GeoMatches::Failed => {
+            write_err(&mut reply, "operation failed").map_err(|_| ())?;
+            return Ok(reply);
+        }
+    };
+    let returned = geo_sort_matches(&spec, &mut points);
+    geo_store_replace(session, destination, &spec, &points[..returned])?;
+    write_integer(&mut reply, returned as i64).map_err(|_| ())?;
+    Ok(reply)
+}
+
+/// Replace `destination` with `points`, whatever type it held. Redis deletes
+/// the key outright when nothing matched, so DEL runs either way; the
+/// executor's deferred deletes are what let the ZADD rewrite the same key
+/// inside the same transaction.
+fn geo_store_replace(
+    session: &mut SessionTxn,
+    destination: &Bytes,
+    spec: &GeoSearchSpec,
+    points: &[GeoPoint],
+) -> Result<(), ()> {
+    let delete = [TxnOperation {
+        op: TXN_OP_DEL,
+        key_ptr: destination.as_ptr(),
+        key_len: destination.len(),
+        val_ptr: std::ptr::null(),
+        val_len: 0,
+        flags: 0,
+        expire_at_ms: -1,
+        group_id: 0,
+    }];
+    session.run_ops(&delete, |_| ())?;
+    if points.is_empty() {
+        return Ok(());
+    }
+    let mut members = Vec::with_capacity(points.len() * 2);
+    for point in points {
+        // Without STOREDIST the score is the member's own geohash, so GEOPOS,
+        // GEODIST and GEOHASH all work on the destination; with it, Redis
+        // converts the distance to the unit the search asked for.
+        let score = if spec.store_dist {
+            geo_format_store_score(point.dist / spec.unit_meters)
+        } else {
+            point.score.to_string()
+        };
+        members.push(Bytes::from(score));
+        members.push(Bytes::copy_from_slice(&point.member));
+    }
+    let payload = pack_bytes_list(&members);
+    let add = [TxnOperation {
+        op: TXN_OP_ZADD,
+        key_ptr: destination.as_ptr(),
+        key_len: destination.len(),
+        val_ptr: payload.as_ptr(),
+        val_len: payload.len(),
+        flags: 0,
+        expire_at_ms: -1,
+        group_id: 0,
+    }];
+    match session.run_ops(&add, |results| results[0].success)? {
+        true => Ok(()),
+        // The destination was just deleted, so a refusal here is not a type
+        // clash: treat it as a broken session and let the caller re-run.
+        false => Err(()),
+    }
+}
+
+/// GEOSEARCHSTORE outside MULTI. `ffi_run_session` owns the bounded retry on
+/// an optimistic-concurrency abort, exactly as it does for a script, and the
+/// declared keys are the destination and the source so both lock stripes are
+/// held for the transaction.
+fn geo_search_store_command<W: Write>(
+    cmd: &Command,
+    protocol_version: u8,
+    writer: &mut W,
+) -> std::io::Result<()> {
+    let mut keys = cmd.keys.clone();
+    keys.extend(cmd.values.iter().cloned());
+    let reply = ffi_run_session_as(&keys, protocol_version, |session| {
+        match session.execute(cmd) {
+            Ok(reply) => SessionRun::Commit(reply),
+            Err(()) => SessionRun::Retry,
+        }
+    });
+    match reply {
+        Some(reply) => writer.write_all(&reply),
+        None => write_err(writer, "backend"),
+    }
+}
+
 /// One candidate of a geo search, after the exact shape test.
 struct GeoPoint {
     member: Vec<u8>,
@@ -16463,6 +16766,117 @@ struct GeoPoint {
     lat: f64,
     score: u64,
     dist: f64,
+}
+
+/// What the neighbor-box results turned into.
+enum GeoMatches {
+    Points(Vec<GeoPoint>),
+    /// One of the range reads refused the key: it holds another type.
+    WrongType,
+    /// A range read came back in a shape this cannot read.
+    Failed,
+}
+
+/// Merge the candidates of every neighbor box, drop the ones outside the exact
+/// shape and de-duplicate the members the boxes share. Shared by the GEOSEARCH
+/// reply and by GEOSEARCHSTORE, which runs the same reads inside a session.
+fn geo_collect_matches(spec: &GeoSearchSpec, boxes: &[TxnOpResult]) -> GeoMatches {
+    let mut points: Vec<GeoPoint> = Vec::new();
+    let mut seen: HashSet<Vec<u8>> = HashSet::new();
+    // COUNT ... ANY stops as soon as enough candidates are in hand.
+    let early_stop = if spec.any { spec.count } else { None };
+    'boxes: for result in boxes {
+        if !result.success {
+            return GeoMatches::WrongType;
+        }
+        let data = result_value_bytes(result);
+        let items = if data.is_empty() {
+            Vec::new()
+        } else {
+            match parse_list_payload(data) {
+                Some(items) => items,
+                None => return GeoMatches::Failed,
+            }
+        };
+        for pair in items.chunks_exact(2) {
+            let Some(score) = geo_score_from_bytes(&pair[1]) else {
+                continue;
+            };
+            let (lon, lat) = geo_decode_score(score);
+            let Some(dist) = geo_distance_if_inside(spec, lon, lat) else {
+                continue;
+            };
+            if !seen.insert(pair[0].clone()) {
+                continue;
+            }
+            points.push(GeoPoint {
+                member: pair[0].clone(),
+                lon,
+                lat,
+                score,
+                dist,
+            });
+            if let Some(limit) = early_stop {
+                if points.len() >= limit {
+                    break 'boxes;
+                }
+            }
+        }
+    }
+    GeoMatches::Points(points)
+}
+
+/// Redis's ordering rule, then COUNT. Returns how many of `points` are
+/// reported: Redis sorts ascending before truncating when COUNT was given
+/// without ANY, because the N closest are what COUNT means.
+fn geo_sort_matches(spec: &GeoSearchSpec, points: &mut [GeoPoint]) -> usize {
+    let mut sort = spec.sort;
+    if spec.count.is_some() && sort == GeoSort::None && !spec.any {
+        sort = GeoSort::Asc;
+    }
+    match sort {
+        GeoSort::Asc => points.sort_by(|a, b| {
+            a.dist
+                .partial_cmp(&b.dist)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+        GeoSort::Desc => points.sort_by(|a, b| {
+            b.dist
+                .partial_cmp(&a.dist)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+        GeoSort::None => {}
+    }
+    spec.count.map_or(points.len(), |c| c.min(points.len()))
+}
+
+/// The ZRANGEBYSCORE-with-scores op list one geo search needs, one op per
+/// neighbor box. The payloads must outlive the ops, so the caller owns them.
+fn geo_range_ops(key: &Bytes, spec: &GeoSearchSpec) -> (Vec<TxnOperation>, Vec<Bytes>) {
+    let ranges = geo_search_ranges(spec);
+    let mut payloads = Vec::with_capacity(ranges.len());
+    for (min, max) in &ranges {
+        // Redis reads [min, max): the max is the next box's min.
+        let bounds = [
+            Bytes::from(min.to_string()),
+            Bytes::from(format!("({max}")),
+        ];
+        payloads.push(pack_bytes_list(&bounds));
+    }
+    let ops = payloads
+        .iter()
+        .map(|payload| TxnOperation {
+            op: TXN_OP_ZRANGE,
+            key_ptr: key.as_ptr(),
+            key_len: key.len(),
+            val_ptr: payload.as_ptr(),
+            val_len: payload.len(),
+            flags: TXN_FLAG_Z_BYSCORE | TXN_FLAG_Z_WITHSCORES,
+            expire_at_ms: -1,
+            group_id: 0,
+        })
+        .collect();
+    (ops, payloads)
 }
 
 fn result_value_bytes(result: &TxnOpResult) -> &[u8] {
@@ -17834,7 +18248,21 @@ fn handle_command<W: Write>(
                         }
                     }
                 } else {
-                    ffi_execute_transaction(&commands, client_state.protocol_version, writer)?;
+                    // GEOSEARCHSTORE cannot join one op list, so a queue that
+                    // holds one runs command by command inside a single open
+                    // session. Everything else keeps the batch path.
+                    if commands
+                        .iter()
+                        .any(|command| command.op == OpCode::GeoSearchStore)
+                    {
+                        ffi_execute_transaction_session(
+                            &commands,
+                            client_state.protocol_version,
+                            writer,
+                        )?;
+                    } else {
+                        ffi_execute_transaction(&commands, client_state.protocol_version, writer)?;
+                    }
                     for command in &commands {
                         if is_dirty_command(command.op) {
                             bump_modified_key_versions(command);
@@ -18140,6 +18568,17 @@ fn handle_command<W: Write>(
                 write_queued(writer)?;
             } else {
                 ffi_execute_single(target, client_state.protocol_version, writer)?;
+            }
+        }
+        OpCode::GeoSearchStore => {
+            // Queued like any other write. EXEC notices it and runs the whole
+            // queue on the session path, because this command's own write
+            // cannot be built until its own reads have answered.
+            if txn_state.in_multi {
+                txn_state.queue_command(cmd.clone());
+                write_queued(writer)?;
+            } else {
+                geo_search_store_command(cmd, client_state.protocol_version, writer)?;
             }
         }
     }
@@ -20206,11 +20645,19 @@ $2\r\nkm\r\n$5\r\nCOUNT\r\n$1\r\n1\r\n$3\r\nANY\r\n$4\r\nDESC\r\n$8\r\nWITHHASH\
             ),
             b"-ERR radius cannot be negative\r\n"
         );
+        // STORE is accepted now; the refusal is only for the _RO spellings
+        // and for combining a destination with the output columns.
         assert_eq!(
             run_raw(
-                b"*8\r\n$9\r\nGEORADIUS\r\n$1\r\nk\r\n$1\r\n1\r\n$1\r\n2\r\n$1\r\n5\r\n$2\r\nkm\r\n$5\r\nSTORE\r\n$3\r\ndst\r\n"
+                b"*9\r\n$12\r\nGEORADIUS_RO\r\n$1\r\nk\r\n$1\r\n1\r\n$1\r\n2\r\n$1\r\n5\r\n$2\r\nkm\r\n$5\r\nSTORE\r\n$3\r\ndst\r\n$3\r\nASC\r\n"
             ),
-            b"-ERR STORE option in GEORADIUS is not supported by this server\r\n"
+            b"-ERR syntax error\r\n"
+        );
+        assert_eq!(
+            run_raw(
+                b"*9\r\n$9\r\nGEORADIUS\r\n$1\r\nk\r\n$1\r\n1\r\n$1\r\n2\r\n$1\r\n5\r\n$2\r\nkm\r\n$5\r\nSTORE\r\n$3\r\ndst\r\n$8\r\nWITHDIST\r\n"
+            ),
+            b"-ERR STORE option in GEORADIUS is not compatible with WITHDIST, WITHHASH and WITHCOORD options\r\n"
         );
         assert_eq!(
             run_raw(
@@ -20233,8 +20680,206 @@ $2\r\nkm\r\n$5\r\nCOUNT\r\n$1\r\n1\r\n$3\r\nANY\r\n$4\r\nDESC\r\n$8\r\nWITHHASH\
             run_raw(b"*2\r\n$20\r\nGEORADIUSBYMEMBER_RO\r\n$1\r\nk\r\n"),
             b"-ERR wrong number of arguments for 'georadiusbymember_ro' command\r\n"
         );
-        // GEOSEARCHSTORE is deliberately not recognized in this package.
-        assert!(parse_opcode(b"GEOSEARCHSTORE").is_none());
+        assert!(parse_opcode(b"GEOSEARCHSTORE") == Some(OpCode::GeoSearchStore));
+    }
+
+    /// GEOSEARCHSTORE and the two STORE spellings of GEORADIUS all become one
+    /// opcode whose key is the destination and whose `values[0]` is the source,
+    /// the way ZRANGESTORE spells it, and they build no ops: the command runs
+    /// on the session path because its write depends on its own reads.
+    #[test]
+    fn geo_store_searches_name_the_destination_first_and_build_no_ops() {
+        let cmd = parse_one(
+            b"*12\r\n$14\r\nGEOSEARCHSTORE\r\n$4\r\ndest\r\n$3\r\nsrc\r\n\
+$10\r\nFROMLONLAT\r\n$2\r\n15\r\n$2\r\n37\r\n$5\r\nBYBOX\r\n$3\r\n400\r\n\
+$3\r\n400\r\n$2\r\nkm\r\n$3\r\nASC\r\n$9\r\nSTOREDIST\r\n",
+        );
+        assert!(cmd.op == OpCode::GeoSearchStore);
+        assert_eq!(cmd.keys, vec![Bytes::from_static(b"dest")]);
+        assert_eq!(cmd.values, vec![Bytes::from_static(b"src")]);
+        let spec = cmd.geo.as_deref().expect("a search spec");
+        assert!(spec.store_dist);
+        assert!(spec.sort == GeoSort::Asc);
+        assert!(!spec.circular);
+        assert!(spec.from_member.is_none());
+        // Nothing to hand the batch executor: the session runs this one.
+        let (ops, spans, _payloads) = build_txn_ops(std::slice::from_ref(&cmd));
+        assert!(ops.is_empty());
+        assert_eq!(spans, vec![(0, 0)]);
+        assert!(is_dirty_command(cmd.op));
+
+        // GEORADIUS names the destination after the option instead, and STORE
+        // stores the geohash where STOREDIST stores the distance.
+        let cmd = parse_one(
+            b"*9\r\n$9\r\nGEORADIUS\r\n$3\r\nsrc\r\n$2\r\n15\r\n$2\r\n37\r\n\
+$3\r\n200\r\n$2\r\nkm\r\n$5\r\nSTORE\r\n$4\r\ndest\r\n$3\r\nASC\r\n",
+        );
+        assert!(cmd.op == OpCode::GeoSearchStore);
+        assert_eq!(cmd.keys, vec![Bytes::from_static(b"dest")]);
+        assert_eq!(cmd.values, vec![Bytes::from_static(b"src")]);
+        assert!(!cmd.geo.as_deref().expect("a search spec").store_dist);
+
+        let cmd = parse_one(
+            b"*7\r\n$17\r\nGEORADIUSBYMEMBER\r\n$3\r\nsrc\r\n$6\r\nmember\r\n\
+$3\r\n200\r\n$2\r\nkm\r\n$9\r\nSTOREDIST\r\n$4\r\ndest\r\n",
+        );
+        assert!(cmd.op == OpCode::GeoSearchStore);
+        let spec = cmd.geo.as_deref().expect("a search spec");
+        assert!(spec.store_dist);
+        assert_eq!(spec.from_member, Some(Bytes::from_static(b"member")));
+
+        // Both keys carry the logical database, destination and source alike.
+        let cmd = parsed(
+            1,
+            &[
+                b"GEOSEARCHSTORE",
+                b"dest",
+                b"src",
+                b"FROMMEMBER",
+                b"m",
+                b"BYRADIUS",
+                b"5",
+                b"km",
+            ],
+        );
+        assert_eq!(cmd.keys, vec![Bytes::from_static(b"\x02\x01:dest")]);
+        assert_eq!(cmd.values, vec![Bytes::from_static(b"\x02\x01:src")]);
+    }
+
+    #[test]
+    fn geo_store_searches_report_redis_error_texts() {
+        // The output columns have nowhere to go in a sorted set.
+        assert_eq!(
+            parse_refusal(
+                0,
+                &[
+                    b"GEOSEARCHSTORE",
+                    b"dest",
+                    b"src",
+                    b"FROMLONLAT",
+                    b"15",
+                    b"37",
+                    b"BYRADIUS",
+                    b"5",
+                    b"km",
+                    b"WITHCOORD",
+                ],
+            ),
+            "-ERR syntax error"
+        );
+        // GEOSEARCHSTORE already has its destination, so STORE is a stray token.
+        assert_eq!(
+            parse_refusal(
+                0,
+                &[
+                    b"GEOSEARCHSTORE",
+                    b"dest",
+                    b"src",
+                    b"FROMLONLAT",
+                    b"15",
+                    b"37",
+                    b"BYRADIUS",
+                    b"5",
+                    b"km",
+                    b"STORE",
+                    b"dest",
+                ],
+            ),
+            "-ERR syntax error"
+        );
+        // GEOSEARCH itself never stores, so a bare STOREDIST is a syntax error.
+        assert_eq!(
+            parse_refusal(
+                0,
+                &[
+                    b"GEOSEARCH",
+                    b"src",
+                    b"FROMLONLAT",
+                    b"15",
+                    b"37",
+                    b"BYRADIUS",
+                    b"5",
+                    b"km",
+                    b"STOREDIST",
+                ],
+            ),
+            "-ERR syntax error"
+        );
+        assert_eq!(
+            parse_refusal(
+                0,
+                &[
+                    b"GEOSEARCHSTORE",
+                    b"dest",
+                    b"src",
+                    b"FROMLONLAT",
+                    b"15",
+                    b"37",
+                    b"BYRADIUS",
+                    b"5",
+                    b"km",
+                    b"ANY",
+                ],
+            ),
+            "-ERR the ANY argument requires COUNT argument"
+        );
+        assert_eq!(
+            parse_refusal(
+                0,
+                &[
+                    b"GEOSEARCHSTORE",
+                    b"dest",
+                    b"src",
+                    b"FROMLONLAT",
+                    b"15",
+                    b"37",
+                    b"FROMMEMBER",
+                    b"m",
+                    b"BYRADIUS",
+                    b"5",
+                    b"km",
+                ],
+            ),
+            "-ERR syntax error"
+        );
+        assert_eq!(
+            parse_refusal(
+                0,
+                &[
+                    b"GEOSEARCHSTORE",
+                    b"dest",
+                    b"src",
+                    b"FROMLONLAT",
+                    b"15",
+                    b"37",
+                    b"ASC",
+                ],
+            ),
+            "-ERR exactly one of BYRADIUS and BYBOX can be specified for GEOSEARCH"
+        );
+        assert_eq!(
+            parse_refusal(0, &[b"GEOSEARCHSTORE", b"dest", b"src"]),
+            "-ERR wrong number of arguments for 'geosearchstore' command"
+        );
+        // A second destination is a syntax error, not a silent replacement.
+        assert_eq!(
+            parse_refusal(
+                0,
+                &[
+                    b"GEORADIUS",
+                    b"src",
+                    b"15",
+                    b"37",
+                    b"200",
+                    b"km",
+                    b"STORE",
+                    b"one",
+                    b"STOREDIST",
+                    b"two",
+                ],
+            ),
+            "-ERR syntax error"
+        );
     }
 
     #[test]
@@ -20489,13 +21134,16 @@ $6\r\nFIELDS\r\n$1\r\n1\r\n$2\r\nf1\r\n"
                 "key call site binds {bound} but reads {argument}: {line}"
             );
         }
+        // 115: the 113 above plus GEOSEARCHSTORE's destination and the
+        // destination GEORADIUS / GEORADIUSBYMEMBER name after STORE or
+        // STOREDIST. The source key reuses the existing geo call site.
         // 113: the 99 from package 8 plus one for each stream parse arm that
         // names a key -- XADD, XRANGE/XREVRANGE, XLEN, XDEL, XTRIM, XSETID,
         // XINFO STREAM, XINFO GROUPS/CONSUMERS, the shared XREAD/XREADGROUP
         // key list, XGROUP, XACK, XPENDING, XCLAIM and XAUTOCLAIM. XINFO HELP
         // and XGROUP HELP name none.
         assert_eq!(
-            sites, 113,
+            sites, 115,
             "the number of Redis-visible key call sites changed; audit the new one"
         );
     }
