@@ -309,6 +309,7 @@ add_custom_command(
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/third-party/redis/rust-lib/Cargo.toml
             ${CMAKE_CURRENT_SOURCE_DIR}/third-party/redis/rust-lib/src/lib.rs
             ${CMAKE_CURRENT_SOURCE_DIR}/third-party/redis/rust-lib/src/resp3_handler.rs
+            ${CMAKE_CURRENT_SOURCE_DIR}/third-party/redis/rust-lib/src/script.rs
     COMMENT "Building Rust library if needed"
 )
 

@@ -21,7 +21,11 @@ Whole-file exclusions:
 - unit/moduleapi: Mako does not expose the Redis module ABI.
 - unit/dump, unit/rdb, unit/aof: Redis persistence internals are replaced by
   Mako storage/replication paths.
-- unit/scripting and Lua-specific files: Lua is outside this PR scope.
+- unit/scripting: run and reported since package 8, but not gated. The adapter
+  implements the EVAL/EVALSHA/SCRIPT command surface; that file also tests
+  Redis's scripting internals (LDB, function and effects replication, the
+  global-protection sandbox, RESP3 inside scripts), which this adapter does not
+  claim.
 - Streams-specific files: Streams are outside this PR scope.
 - ACL/TLS/client-cache files: outside this Redis layer scope.
 

@@ -11,6 +11,7 @@ identical in both modes.
 
 Exits non-zero on the first failing assertion and prints a summary otherwise.
 """
+import hashlib
 import os
 import re
 import socket
@@ -714,6 +715,428 @@ def check_logical_databases(host, port):
     c0.sock.close()
 
 
+def check_scripting(host, port, c):
+    """EVAL, EVALSHA, EVAL_RO, EVALSHA_RO and SCRIPT.
+
+    Scripts run inside one interactive transaction, so everything here is also
+    a check on that transaction: read-your-writes between two redis.call
+    invocations, nothing visible until the script returns, and nothing at all
+    visible when it fails.
+    """
+    # ----- the redis.io EVAL examples -----
+    check("EVAL returns KEYS and ARGV",
+          c.cmd("EVAL", "return {KEYS[1],KEYS[2],ARGV[1],ARGV[2]}", "2",
+                "key1", "key2", "first", "second"),
+          [b"key1", b"key2", b"first", b"second"])
+    c.cmd("DEL", "lua:foo")
+    check("EVAL SET returns the status reply",
+          c.cmd("EVAL", "return redis.call('set', KEYS[1], 'bar')", "1", "lua:foo"),
+          "OK")
+    check("EVAL GET returns the value the script wrote",
+          c.cmd("EVAL", "return redis.call('get', KEYS[1])", "1", "lua:foo"),
+          b"bar")
+    check("the write a script made is visible outside it",
+          c.cmd("GET", "lua:foo"), b"bar")
+
+    # ----- Lua to RESP -----
+    check("number truncates to an integer", c.cmd("EVAL", "return 3.9", "0"), 3)
+    check("negative number truncates toward zero",
+          c.cmd("EVAL", "return -3.9", "0"), -3)
+    check("string returns a bulk", c.cmd("EVAL", "return 'hello'", "0"), b"hello")
+    check("true returns 1", c.cmd("EVAL", "return true", "0"), 1)
+    check("false returns nil", c.cmd("EVAL", "return false", "0"), None)
+    check("no return value is nil", c.cmd("EVAL", "local x = 1", "0"), None)
+    check("a table returns an array",
+          c.cmd("EVAL", "return {1,2,3,'ciao',{1,2}}", "0"),
+          [1, 2, 3, b"ciao", [1, 2]])
+    check("an array stops at the first nil",
+          c.cmd("EVAL", "return {1,2,nil,4}", "0"), [1, 2])
+    check("a table with ok returns a status reply",
+          c.cmd("EVAL", "return {ok='fine'}", "0"), "fine")
+    check("a table with err returns an error",
+          c.cmd("EVAL", "return {err='My Error'}", "0"),
+          pred=lambda g: is_err(g, "My Error"))
+    check("redis.status_reply builds a status reply",
+          c.cmd("EVAL", "return redis.status_reply('TEST')", "0"), "TEST")
+    check("redis.error_reply builds an error",
+          c.cmd("EVAL", "return redis.error_reply('My Error')", "0"),
+          pred=lambda g: is_err(g, "My Error"))
+
+    # ----- RESP to Lua -----
+    c.cmd("DEL", "lua:missing")
+    check("a missing key reaches Lua as false",
+          c.cmd("EVAL", "return type(redis.call('get', KEYS[1]))", "1", "lua:missing"),
+          b"boolean")
+    check("a status reply reaches Lua as a table with ok",
+          c.cmd("EVAL", "return redis.call('set', KEYS[1], 'v')['ok']", "1", "lua:conv"),
+          b"OK")
+    check("an integer reply reaches Lua as a number",
+          c.cmd("EVAL",
+                "redis.call('set', KEYS[1], '41') "
+                "return redis.call('incr', KEYS[1]) + 1", "1", "lua:conv"),
+          43)
+    check("a bulk reply reaches Lua as a string",
+          c.cmd("EVAL", "return redis.call('get', KEYS[1]) .. '!'", "1", "lua:conv"),
+          b"42!")
+    c.cmd("DEL", "lua:list")
+    c.cmd("RPUSH", "lua:list", "a", "b")
+    check("a multi-bulk reply reaches Lua as a table",
+          c.cmd("EVAL", "return redis.call('lrange', KEYS[1], 0, -1)", "1", "lua:list"),
+          [b"a", b"b"])
+    check("redis.pcall hands an error back as a table",
+          c.cmd("EVAL", "local reply = redis.pcall('incr', KEYS[1]) return reply.err",
+                "1", "lua:list"),
+          pred=lambda g: isinstance(g, bytes) and g.startswith(b"WRONGTYPE"))
+    check("redis.call raises the command's error",
+          c.cmd("EVAL", "return redis.call('incr', KEYS[1])", "1", "lua:list"),
+          pred=lambda g: is_err(g, "WRONGTYPE"))
+    check("an unknown command from a script is an error",
+          c.cmd("EVAL", "return redis.call('nosuchcommand')", "0"),
+          pred=lambda g: is_err(g, "ERR Unknown Redis command called from script"))
+    check("a command with the wrong number of arguments is an error",
+          c.cmd("EVAL", "return redis.call('get')", "0"),
+          pred=lambda g: is_err(
+              g, "ERR Wrong number of args calling Redis command from script"))
+    check("a command that cannot run in a script is refused",
+          c.cmd("EVAL", "return redis.call('subscribe', 'ch')", "0"),
+          pred=lambda g: is_err(g, "ERR This Redis command is not allowed from script"))
+    check("EVAL from a script is refused",
+          c.cmd("EVAL", "return redis.call('eval', 'return 1', '0')", "0"),
+          pred=lambda g: is_err(g, "ERR This Redis command is not allowed from script"))
+    c.cmd("DEL", "lua:empty")
+    check("a blocking pop from a script does not block",
+          c.cmd("EVAL", "return redis.call('blpop', KEYS[1], '0')", "1", "lua:empty"),
+          None)
+    check("and it pops when there is something to pop",
+          c.cmd("EVAL", "return redis.call('blpop', KEYS[1], '0')", "1", "lua:list"),
+          [b"lua:list", b"a"])
+    c.cmd("DEL", "lua:list")
+    c.cmd("RPUSH", "lua:list", "a", "b")
+
+    # ----- the helper library -----
+    check("redis.sha1hex of the empty string",
+          c.cmd("EVAL", "return redis.sha1hex('')", "0"),
+          b"da39a3ee5e6b4b0d3255bfef95601890afd80709")
+    check("redis.REDIS_VERSION names the version the adapter targets",
+          c.cmd("EVAL", "return redis.REDIS_VERSION", "0"), b"7.4.0")
+    check("redis.setresp(2) is accepted",
+          c.cmd("EVAL", "redis.setresp(2) return 1", "0"), 1)
+    check("redis.setresp(3) is refused",
+          c.cmd("EVAL", "redis.setresp(3) return 1", "0"),
+          pred=lambda g: is_err(g, "ERR"))
+    check("redis.log is callable",
+          c.cmd("EVAL", "redis.log(redis.LOG_WARNING, 'from a test') return 1", "0"), 1)
+    check("cjson encodes an array", c.cmd("EVAL", "return cjson.encode({1,2,3})", "0"),
+          b"[1,2,3]")
+    check("cjson decodes an array",
+          c.cmd("EVAL", "return cjson.decode('[1,2,3]')[2]", "0"), 2)
+    check("cjson round-trips an object",
+          c.cmd("EVAL",
+                "local t = cjson.decode(ARGV[1]) "
+                "return {t['name'], tostring(t['n']), cjson.encode(t['list'])}",
+                "0", '{"name":"mako","n":7,"list":[1,2]}'),
+          [b"mako", b"7", b"[1,2]"])
+    check("cmsgpack is not provided",
+          c.cmd("EVAL", "return type(cmsgpack)", "0"),
+          pred=lambda g: isinstance(g, Exception)
+          and "nonexistent global variable 'cmsgpack'" in str(g))
+
+    # The sandbox: nothing a script can reach may leave the process, and a
+    # global it never declared is an error rather than a silent nil.
+    check("os.execute is gone",
+          c.cmd("EVAL", "return os.execute('true')", "0"),
+          pred=lambda g: is_err(g, "ERR"))
+    check("os.time survives", c.cmd("EVAL", "return type(os.time())", "0"), b"number")
+    check("io is gone",
+          c.cmd("EVAL", "return io.open('/etc/passwd')", "0"),
+          pred=lambda g: isinstance(g, Exception) and "nonexistent global" in str(g))
+    check("loadstring is gone",
+          c.cmd("EVAL", "return loadstring('return 1')()", "0"),
+          pred=lambda g: isinstance(g, Exception) and "nonexistent global" in str(g))
+    check("reading an undeclared global is an error",
+          c.cmd("EVAL", "return nosuchglobal", "0"),
+          pred=lambda g: isinstance(g, Exception)
+          and "attempted to access nonexistent global variable" in str(g))
+    check("creating a global is an error",
+          c.cmd("EVAL", "created = 1 return 1", "0"),
+          pred=lambda g: isinstance(g, Exception)
+          and "attempted to create global variable" in str(g))
+    check("locals are unaffected",
+          c.cmd("EVAL", "local ok = 1 return ok", "0"), 1)
+
+    # A script can return a table that contains itself. The conversion has to
+    # stop on its own rather than recurse until the stack gives out.
+    recursive = c.cmd("EVAL", "local a = {} local b = {a} a[1] = b return a", "0")
+    depth = 0
+    while isinstance(recursive, list) and recursive:
+        recursive = recursive[0]
+        depth += 1
+    check("a recursive table nests before it stops", depth, pred=lambda g: g > 1)
+    check("and the reply ends by saying so", recursive,
+          pred=lambda g: is_err(g, "ERR reached lua stack limit"))
+    check("the connection still works after it", c.cmd("PING"), "PONG")
+
+    # ----- SCRIPT LOAD / EVALSHA / EXISTS / FLUSH -----
+    source = "return redis.call('get', KEYS[1])"
+    sha = hashlib.sha1(source.encode()).hexdigest()
+    check("SCRIPT LOAD returns the lowercase hex sha1",
+          c.cmd("SCRIPT", "LOAD", source), sha.encode())
+    check("SCRIPT EXISTS reports the loaded script",
+          c.cmd("SCRIPT", "EXISTS", sha), [1])
+    check("SCRIPT EXISTS reports several shas",
+          c.cmd("SCRIPT", "EXISTS", sha, "0" * 40), [1, 0])
+    check("SCRIPT EXISTS accepts an uppercase sha",
+          c.cmd("SCRIPT", "EXISTS", sha.upper()), [1])
+    check("EVALSHA runs the loaded script",
+          c.cmd("EVALSHA", sha, "1", "lua:foo"), b"bar")
+    check("EVALSHA_RO runs a read-only script",
+          c.cmd("EVALSHA_RO", sha, "1", "lua:foo"), b"bar")
+    check("EVAL caches the script it ran",
+          c.cmd("SCRIPT", "EXISTS", hashlib.sha1(b"return 1").hexdigest()),
+          pred=lambda g: g == [0] or g == [1])
+    c.cmd("EVAL", "return 1", "0")
+    check("EVAL has cached the script by now",
+          c.cmd("SCRIPT", "EXISTS", hashlib.sha1(b"return 1").hexdigest()), [1])
+    check("SCRIPT FLUSH empties the cache", c.cmd("SCRIPT", "FLUSH"), "OK")
+    check("SCRIPT EXISTS after FLUSH", c.cmd("SCRIPT", "EXISTS", sha), [0])
+    check("EVALSHA of a flushed script is NOSCRIPT",
+          c.cmd("EVALSHA", sha, "1", "lua:foo"),
+          pred=lambda g: is_err(g, "NOSCRIPT No matching script. Please use EVAL."))
+    check("SCRIPT FLUSH ASYNC is accepted", c.cmd("SCRIPT", "FLUSH", "ASYNC"), "OK")
+    check("SCRIPT FLUSH SYNC is accepted", c.cmd("SCRIPT", "FLUSH", "SYNC"), "OK")
+    check("SCRIPT HELP returns lines",
+          c.cmd("SCRIPT", "HELP"), pred=lambda g: isinstance(g, list) and len(g) > 1)
+    check("an unknown SCRIPT subcommand is an error",
+          c.cmd("SCRIPT", "BOGUS"),
+          pred=lambda g: is_err(g, "ERR Unknown SCRIPT subcommand"))
+
+    # ----- read-only scripts -----
+    check("EVAL_RO reads",
+          c.cmd("EVAL_RO", "return redis.call('get', KEYS[1])", "1", "lua:foo"),
+          b"bar")
+    check("EVAL_RO refuses a write",
+          c.cmd("EVAL_RO", "return redis.call('set', KEYS[1], 'x')", "1", "lua:foo"),
+          pred=lambda g: is_err(
+              g, "ERR Write commands are not allowed from read-only scripts."))
+    check("the refused write did not happen", c.cmd("GET", "lua:foo"), b"bar")
+
+    # ----- numkeys validation -----
+    check("numkeys greater than the arguments given",
+          c.cmd("EVAL", "return 1", "3", "k1"),
+          pred=lambda g: is_err(
+              g, "ERR Number of keys can't be greater than number of args"))
+    check("negative numkeys", c.cmd("EVAL", "return 1", "-1"),
+          pred=lambda g: is_err(g, "ERR Number of keys can't be negative"))
+    check("numkeys that is not a number", c.cmd("EVAL", "return 1", "notanumber"),
+          pred=lambda g: is_err(g, "ERR value is not an integer or out of range"))
+    check("EVAL with no numkeys is an arity error", c.cmd("EVAL", "return 1"),
+          pred=lambda g: is_err(g, "ERR wrong number of arguments"))
+
+    # ----- a failing script leaves nothing behind -----
+    c.cmd("SET", "lua:atomic", "before")
+    check("a script that errors after writing",
+          c.cmd("EVAL", "redis.call('set', KEYS[1], 'after') error('boom')",
+                "1", "lua:atomic"),
+          pred=lambda g: is_err(g, "ERR"))
+    check("the write it made is not visible", c.cmd("GET", "lua:atomic"), b"before")
+    check("a script whose redis.call fails writes nothing either",
+          c.cmd("EVAL",
+                "redis.call('set', KEYS[1], 'after') return redis.call('incr', KEYS[2])",
+                "2", "lua:atomic", "lua:list"),
+          pred=lambda g: is_err(g, "WRONGTYPE"))
+    check("still the old value", c.cmd("GET", "lua:atomic"), b"before")
+
+    # ----- logical databases -----
+    db1 = Resp(host, port)
+    db1.cmd("SELECT", "1")
+    db1.cmd("SET", "lua:db", "in-db-1")
+    c.cmd("SET", "lua:db", "in-db-0")
+    check("a script in database 1 reads database 1",
+          db1.cmd("EVAL", "return redis.call('get', KEYS[1])", "1", "lua:db"),
+          b"in-db-1")
+    check("a script in database 0 reads database 0",
+          c.cmd("EVAL", "return redis.call('get', KEYS[1])", "1", "lua:db"),
+          b"in-db-0")
+    db1.cmd("EVAL", "redis.call('set', KEYS[1], 'written-in-1') return 1", "1", "lua:db")
+    check("the write stayed in database 1", c.cmd("GET", "lua:db"), b"in-db-0")
+    check("and database 1 has it",
+          db1.cmd("GET", "lua:db"), b"written-in-1")
+    db1.cmd("FLUSHDB")
+    db1.sock.close()
+
+    # ----- PUBLISH from a script -----
+    subscriber = Resp(host, port)
+    subscriber.cmd("SUBSCRIBE", "lua:channel")
+    check("a script publishes",
+          c.cmd("EVAL", "return redis.call('publish', ARGV[1], ARGV[2])",
+                "0", "lua:channel", "from-lua"),
+          pred=lambda g: isinstance(g, int))
+    delivered = subscriber.read_pushed(1.0)
+    check("the subscriber got the message the script published",
+          delivered, pred=lambda g: "from-lua" in g)
+    subscriber.sock.close()
+
+    # ----- a read-then-write script is atomic under concurrent clients -----
+    check_script_atomicity(host, port, c)
+
+    # ----- BUSY, SCRIPT KILL, UNKILLABLE, NOTBUSY -----
+    check_script_kill(host, port, c)
+
+
+def check_script_atomicity(host, port, c):
+    """Eight clients run the same read-then-write script on one key.
+
+    The script is `v = GET k; SET k v .. 'x'; return v`, which is only correct
+    if the read and the write are one atomic unit. Every successful run appends
+    exactly one character, so the final length has to equal the number of
+    successful runs -- a torn read would make two clients write the same value
+    and lose one.
+    """
+    import threading
+
+    key = "lua:rmw"
+    c.cmd("SET", key, "")
+    script = ("local v = redis.call('get', KEYS[1]) "
+              "redis.call('set', KEYS[1], v .. 'x') "
+              "return v")
+    clients = 8
+    deadline = time.time() + 2.0
+    counts = [0] * clients
+    errors = []
+
+    def hammer(index):
+        conn = Resp(host, port)
+        try:
+            while time.time() < deadline:
+                reply = conn.cmd("EVAL", script, "1", key)
+                if isinstance(reply, Exception):
+                    errors.append(str(reply))
+                    break
+                counts[index] += 1
+        except Exception as exc:  # noqa: BLE001 - reported as a failure below
+            errors.append(repr(exc))
+        finally:
+            conn.sock.close()
+
+    threads = [threading.Thread(target=hammer, args=(index,)) for index in range(clients)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    total = sum(counts)
+    final = c.cmd("GET", key)
+    check("the concurrent read-then-write script never errored", errors, [])
+    check("eight clients each ran the script", min(counts),
+          pred=lambda g: g > 0)
+    check("every successful run appended exactly one character",
+          len(final) if isinstance(final, bytes) else final, total)
+
+
+def check_script_kill(host, port, c):
+    """SCRIPT KILL, and the BUSY state other connections see meanwhile.
+
+    A script occupies the worker thread that read it, so the interesting case
+    is the connection that shares that worker: it is only answered because the
+    script's busy hook drains it. Connections are handed to workers round
+    robin, so eight fillers between the runner and the killer put the two on
+    the same worker for any of 1, 2, 4 or 8 worker threads.
+    """
+    import threading
+
+    check("SCRIPT KILL with nothing running", c.cmd("SCRIPT", "KILL"),
+          pred=lambda g: is_err(g, "NOTBUSY No scripts in execution right now."))
+
+    check("the busy threshold is readable", c.cmd("CONFIG", "GET", "lua-time-limit"),
+          pred=lambda g: isinstance(g, list) and g[0] == b"lua-time-limit")
+    check("the busy threshold is settable",
+          c.cmd("CONFIG", "SET", "lua-time-limit", "10"), "OK")
+    check("busy-reply-threshold is the same setting",
+          c.cmd("CONFIG", "GET", "busy-reply-threshold"), [b"busy-reply-threshold", b"10"])
+
+    runner = Resp(host, port)
+    fillers = [Resp(host, port) for _ in range(8)]
+    killer = Resp(host, port)
+    watcher = Resp(host, port)
+    replies = {}
+
+    def run_forever():
+        replies["script"] = runner.cmd("EVAL", "while true do end", "0")
+
+    thread = threading.Thread(target=run_forever)
+    thread.start()
+    time.sleep(0.5)
+
+    check("another connection gets BUSY while a script runs",
+          watcher.cmd("GET", "lua:foo"),
+          pred=lambda g: is_err(
+              g, "BUSY Redis is busy running a script. You can only call SCRIPT KILL"))
+    latecomer = Resp(host, port)
+    check("a connection made while a script runs is still accepted",
+          latecomer.cmd("PING"),
+          pred=lambda g: is_err(g, "BUSY Redis is busy running a script"))
+    latecomer.sock.close()
+    check("SCRIPT KILL is answered while a script runs",
+          killer.cmd("SCRIPT", "KILL"), "OK")
+    thread.join(timeout=20)
+    check("the killed script reported it to its own connection",
+          replies.get("script"),
+          pred=lambda g: is_err(g, "ERR Script killed by user with SCRIPT KILL"))
+    check("the server is not busy any more", watcher.cmd("GET", "lua:foo"), b"bar")
+
+    # A script that wraps its work in pcall must not be able to swallow the
+    # kill and carry on.
+    def run_pcall_loop():
+        replies["pcall"] = runner.cmd(
+            "EVAL",
+            "local f = function() while 1 do redis.call('ping') end end "
+            "while 1 do pcall(f) end",
+            "0",
+        )
+
+    thread = threading.Thread(target=run_pcall_loop)
+    thread.start()
+    time.sleep(0.5)
+    check("a script that catches everything is still killable",
+          killer.cmd("SCRIPT", "KILL"), "OK")
+    thread.join(timeout=20)
+    check("and it reported the kill",
+          replies.get("pcall"),
+          pred=lambda g: is_err(g, "ERR Script killed by user with SCRIPT KILL"))
+    check("the server is usable again", watcher.cmd("PING"), "PONG")
+
+    # A script that has written cannot be killed; this one stops on its own so
+    # the suite can carry on.
+    c.cmd("SET", "lua:unkillable", "before")
+    spin = ("redis.call('set', KEYS[1], 'after') "
+            "local n = 0 while n < 40000000 do n = n + 1 end "
+            "return redis.call('get', KEYS[1])")
+
+    def run_spin():
+        replies["spin"] = runner.cmd("EVAL", spin, "1", "lua:unkillable")
+
+    thread = threading.Thread(target=run_spin)
+    thread.start()
+    time.sleep(0.5)
+    check("a script that has written is UNKILLABLE",
+          killer.cmd("SCRIPT", "KILL"),
+          pred=lambda g: is_err(g, "UNKILLABLE Sorry the script already executed"))
+    thread.join(timeout=60)
+    check("the unkillable script finished on its own", replies.get("spin"), b"after")
+    check("and its write is visible", c.cmd("GET", "lua:unkillable"), b"after")
+    check("nothing is running again", killer.cmd("SCRIPT", "KILL"),
+          pred=lambda g: is_err(g, "NOTBUSY"))
+
+    check("a connection opened while nothing runs still works",
+          Resp(host, port).cmd("PING"), "PONG")
+
+    c.cmd("CONFIG", "SET", "lua-time-limit", "5000")
+    runner.sock.close()
+    killer.sock.close()
+    watcher.sock.close()
+    for filler in fillers:
+        filler.sock.close()
+
 def main():
     host, port = sys.argv[1], int(sys.argv[2])
     c = Resp(host, port)
@@ -978,7 +1401,7 @@ def main():
 
     # CONFIG GET extras / INFO keyspace
     check("CONFIG GET maxmemory-policy", c.cmd("CONFIG", "GET", "maxmemory-policy"), [b"maxmemory-policy", b"noeviction"])
-    check("CONFIG GET *", c.cmd("CONFIG", "GET", "*"), pred=lambda g: isinstance(g, list) and len(g) == 24)
+    check("CONFIG GET *", c.cmd("CONFIG", "GET", "*"), pred=lambda g: isinstance(g, list) and len(g) == 28)
     check("CONFIG GET port", c.cmd("CONFIG", "GET", "port"), [b"port", str(port).encode()])
     info = c.cmd("INFO", "keyspace")
     check("INFO keyspace", info, pred=lambda g: isinstance(g, bytes) and b"# Keyspace" in g and b"db0:keys=" in g)
@@ -2148,6 +2571,9 @@ def main():
 
     # ----- Logical databases: SELECT, MOVE, COPY ... DB -----
     check_logical_databases(host, port)
+
+    # ----- Lua scripting -----
+    check_scripting(host, port, c)
 
     c.cmd("SET", "t1", "v")
     c.cmd("SADD", "s1", "a")

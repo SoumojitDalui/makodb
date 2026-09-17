@@ -14,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod resp3_handler;
 use resp3_handler::Resp3Handler;
+mod script;
 
 static CONNECTED_CLIENTS: AtomicUsize = AtomicUsize::new(0);
 static BLOCKED_CLIENTS: AtomicUsize = AtomicUsize::new(0);
@@ -802,6 +803,9 @@ enum OpCode {
     // MOVE key db. A storage op: one executor op copies the object to the
     // destination database's spelling of the name and deletes the source.
     Move = 200,
+    EvalSha = 201,
+    EvalRo = 202,
+    EvalShaRo = 203,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -1602,6 +1606,12 @@ fn parse_opcode(name: &[u8]) -> Option<OpCode> {
         Some(OpCode::Script)
     } else if ascii_eq_ci(name, b"EVAL") {
         Some(OpCode::Eval)
+    } else if ascii_eq_ci(name, b"EVALSHA") {
+        Some(OpCode::EvalSha)
+    } else if ascii_eq_ci(name, b"EVAL_RO") {
+        Some(OpCode::EvalRo)
+    } else if ascii_eq_ci(name, b"EVALSHA_RO") {
+        Some(OpCode::EvalShaRo)
     } else if ascii_eq_ci(name, b"SAVE") || ascii_eq_ci(name, b"SHUTDOWN") {
         Some(OpCode::Forbidden)
     } else if ascii_eq_ci(name, b"RANDOMKEY") {
@@ -5577,6 +5587,47 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             cmd.set_count = Some(1);
             Ok(cmd)
         }
+        OpCode::Eval | OpCode::EvalSha | OpCode::EvalRo | OpCode::EvalShaRo => {
+            // EVAL script numkeys key... arg...
+            // cmd.keys carries the database-prefixed names, which is what the
+            // interactive session locks and what WATCH invalidation bumps.
+            // cmd.args keeps every argument exactly as the client sent it,
+            // because KEYS and ARGV have to show the script those bytes: a
+            // redis.call on KEYS[1] is parsed, and prefixed, all over again.
+            if parts.len() < 3 {
+                return Err(wrong_arity(match op {
+                    OpCode::Eval => "eval",
+                    OpCode::EvalSha => "evalsha",
+                    OpCode::EvalRo => "eval_ro",
+                    _ => "evalsha_ro",
+                }));
+            }
+            let numkeys_raw = part_to_bytes(&parts[2])?;
+            let Some(numkeys) = parse_i64_lossy(numkeys_raw.as_ref()) else {
+                return Err(ParseError::Error("value is not an integer or out of range"));
+            };
+            if numkeys < 0 {
+                return Err(ParseError::Error("Number of keys can't be negative"));
+            }
+            let numkeys = numkeys as usize;
+            if numkeys > parts.len() - 3 {
+                return Err(ParseError::Error(
+                    "Number of keys can't be greater than number of args",
+                ));
+            }
+            let mut keys = Vec::with_capacity(numkeys);
+            for part in parts.iter().skip(3).take(numkeys) {
+                let key = part_to_bytes(part)?;
+                let key = validate_user_key(&key)?;
+                keys.push(key);
+            }
+            Ok(Command::new(
+                op,
+                keys,
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            ))
+        }
         OpCode::ZScan => {
             if parts.len() < 3 {
                 return Err(wrong_arity("zscan"));
@@ -5677,7 +5728,6 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
         | OpCode::Acl
         | OpCode::Config
         | OpCode::Script
-        | OpCode::Eval
         | OpCode::Forbidden
         | OpCode::RandomKey
         | OpCode::Reset
@@ -5701,7 +5751,6 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 OpCode::Quit if parts.len() != 1 => Some("quit"),
                 OpCode::Select if parts.len() != 2 => Some("select"),
                 OpCode::Script if parts.len() < 2 => Some("script"),
-                OpCode::Eval if parts.len() < 3 => Some("eval"),
                 OpCode::RandomKey if parts.len() != 1 => Some("randomkey"),
                 OpCode::Auth if parts.len() != 2 && parts.len() != 3 => Some("auth"),
                 OpCode::Echo if parts.len() != 2 => Some("echo"),
@@ -11533,6 +11582,22 @@ pub extern "C" fn rust_init(n_threads: usize) -> bool {
                                     eprintln!("Blocked client wake error: {e}");
                                 }
                             }
+                            Ok(ClientEvent::RunScript) => {
+                                made_progress = true;
+                                run_parked_script(
+                                    &mut clients,
+                                    idx,
+                                    &listener,
+                                    &next_accept_worker,
+                                    thread_id,
+                                    n_threads,
+                                    &worker_wake,
+                                );
+                                notify_all_workers();
+                                if let Err(e) = service_blocked_clients(&mut clients) {
+                                    eprintln!("Blocked client wake error: {e}");
+                                }
+                            }
                             Ok(ClientEvent::Close) => {
                                 clients[idx].clear_blocked();
                                 unregister_all_client_feeds(&mut clients[idx].client_state);
@@ -11635,6 +11700,171 @@ impl IdleWaitStrategy {
     }
 }
 
+/// Runs the script a client parked, from the worker loop, where nothing holds
+/// a borrow on the other connections.
+///
+/// The script occupies this thread until it returns. Past `lua-time-limit` its
+/// busy hook calls the pump below on every tick, which is what keeps the rest
+/// of this worker's connections answered -- with BUSY, as Redis answers them,
+/// and with the SCRIPT KILL that stops the script. New connections are still
+/// accepted while a script runs, so a client that wants to kill it can always
+/// get in.
+#[allow(clippy::too_many_arguments)]
+fn run_parked_script(
+    clients: &mut Vec<ClientConn>,
+    index: usize,
+    listener: &TcpListener,
+    next_accept_worker: &AtomicUsize,
+    thread_id: usize,
+    n_threads: usize,
+    worker_wake: &Arc<WorkerWake>,
+) {
+    let Some(cmd) = clients[index].script_request.take() else {
+        return;
+    };
+    let db = clients[index].client_state.db;
+    let protocol_version = clients[index].client_state.protocol_version;
+
+    let reply = {
+        let mut pump = || {
+            pump_busy_clients(clients, index);
+            accept_while_busy(clients, listener, next_accept_worker, thread_id, n_threads, worker_wake);
+        };
+        script::run_eval_with_pump(&cmd, db, protocol_version, &mut pump)
+    };
+
+    set_current_db(db);
+    let client = &mut clients[index];
+    client.write_buf.extend_from_slice(&reply);
+    if client.client_state.close_after_reply {
+        client.close_after_write = true;
+    }
+    if !client.write_buf.is_empty() {
+        let _ = flush_client(client);
+    }
+}
+
+/// Keeps the accept rotation moving while this worker is inside a script, so a
+/// new connection can still be made and used to send SCRIPT KILL.
+fn accept_while_busy(
+    clients: &mut Vec<ClientConn>,
+    listener: &TcpListener,
+    next_accept_worker: &AtomicUsize,
+    thread_id: usize,
+    n_threads: usize,
+    worker_wake: &Arc<WorkerWake>,
+) {
+    if !worker_has_accept_turn(next_accept_worker, thread_id) {
+        return;
+    }
+    match listener.accept() {
+        Ok((stream, _)) => {
+            advance_accept_turn(next_accept_worker, thread_id, n_threads);
+            let _ = stream.set_nodelay(true);
+            if stream.set_nonblocking(true).is_err() {
+                return;
+            }
+            TOTAL_CONNECTIONS_RECEIVED.fetch_add(1, Ordering::Relaxed);
+            CONNECTED_CLIENTS.fetch_add(1, Ordering::Relaxed);
+            clients.push(ClientConn::new(stream, worker_wake));
+        }
+        Err(_) => {}
+    }
+}
+
+/// Answers every connection of this worker except the one whose script is
+/// running. Only commands that cannot reach storage are executed here: the
+/// script's transaction is open on this very thread, so running anything that
+/// starts another one would corrupt it. Everything else gets BUSY, which is
+/// the answer Redis gives while a script is over its time limit.
+fn pump_busy_clients(clients: &mut [ClientConn], skip: usize) {
+    for (index, client) in clients.iter_mut().enumerate() {
+        if index == skip {
+            continue;
+        }
+        pump_busy_client(client);
+    }
+}
+
+fn pump_busy_client(client: &mut ClientConn) {
+    loop {
+        match client.stream.read(&mut client.read_buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                client.resp3.read_bytes(&client.read_buf[..n]);
+                if n < client.read_buf.len() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    loop {
+        match client.resp3.next_frame() {
+            Ok(Some(frame)) => {
+                set_current_db(client.client_state.db);
+                match parse_resp3(frame) {
+                    Ok(cmd) => answer_busy(client, &cmd),
+                    Err(err) => {
+                        if client.txn_state.in_multi {
+                            client.txn_state.mark_queue_error();
+                        }
+                        let _ = write_parse_error(&mut client.write_buf, err);
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(_) => {
+                let _ = write_err(&mut client.write_buf, "protocol error");
+                break;
+            }
+        }
+    }
+
+    if !client.write_buf.is_empty() {
+        let _ = flush_client(client);
+    }
+}
+
+fn answer_busy(client: &mut ClientConn, cmd: &Command) {
+    record_command_call(cmd.op);
+    // An EXEC that arrives while a script is running is always discarded, so
+    // this never runs the queued commands -- which is what makes it safe to
+    // call from inside the script's own hook.
+    if cmd.op == OpCode::Exec && client.txn_state.in_multi {
+        client.txn_state.mark_queue_error();
+    }
+    if should_reject_for_lua_busy(cmd.op, &cmd.args) {
+        if client.txn_state.in_multi {
+            client.txn_state.mark_queue_error();
+        }
+        client.write_buf.extend_from_slice(
+            b"-BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.\r\n",
+        );
+        return;
+    }
+    match cmd.op {
+        // MULTI only sets a flag, EXEC has just been poisoned above, and
+        // SCRIPT KILL only raises the kill flag the script's hook reads.
+        OpCode::Multi | OpCode::Exec | OpCode::Script => {
+            let mut reply = Vec::new();
+            let _ = handle_command(
+                cmd,
+                &mut client.txn_state,
+                &mut client.client_state,
+                &mut reply,
+            );
+            client.write_buf.extend_from_slice(&reply);
+        }
+        _ => {
+            client.write_buf.extend_from_slice(
+                b"-BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.\r\n",
+            );
+        }
+    }
+}
+
 fn wait_for_server_events(
     listener: &TcpListener,
     worker_wake: &WorkerWake,
@@ -11711,6 +11941,10 @@ struct ClientConn {
     close_after_write: bool,
     blocked_command: Option<BlockedCommand>,
     pending_command: Option<Command>,
+    /// An EVAL this connection sent, parked until the worker loop can run it
+    /// where it is not holding a borrow on this client: a long script has to
+    /// be able to answer the worker's *other* connections while it runs.
+    script_request: Option<Command>,
 }
 
 struct BlockedCommand {
@@ -11738,6 +11972,7 @@ impl ClientConn {
             close_after_write: false,
             blocked_command: None,
             pending_command: None,
+            script_request: None,
         }
     }
 
@@ -11768,6 +12003,9 @@ enum ClientEvent {
     Keep,
     Progress,
     WakeBlocked,
+    /// The client sent an EVAL. The worker loop runs it, because the script's
+    /// busy hook has to be able to reach this worker's other connections.
+    RunScript,
     Close,
 }
 
@@ -11831,7 +12069,12 @@ fn is_error_reply(reply: &[u8]) -> bool {
 fn is_dirty_command(op: OpCode) -> bool {
     matches!(
         op,
-        OpCode::Set
+        // EVAL and EVALSHA may write; the read-only forms cannot. This is what
+        // makes a script's declared keys invalidate a WATCH on them and what
+        // makes a script refuse to run when maxmemory is exceeded.
+        OpCode::Eval
+            | OpCode::EvalSha
+            | OpCode::Set
             | OpCode::SetEx
             | OpCode::PSetEx
             | OpCode::SetNx
@@ -12098,6 +12341,22 @@ fn execute_or_block_command(client: &mut ClientConn, cmd: &Command) -> std::io::
         client
             .write_buf
             .extend_from_slice(b"-OOM command not allowed when used memory > 'maxmemory'.\r\n");
+        return Ok(());
+    }
+    if matches!(
+        cmd.op,
+        OpCode::Eval | OpCode::EvalSha | OpCode::EvalRo | OpCode::EvalShaRo
+    ) {
+        // Parked for the worker loop, which runs it while it holds no borrow
+        // on this client, so the script's busy hook can answer the others.
+        client.script_request = Some(cmd.clone());
+        // The script's own writes are replayed into the key versions when its
+        // transaction commits; this covers the keys it declared, which is what
+        // a WATCH on a scripted key is watching.
+        if is_dirty_command(cmd.op) {
+            record_dirty_change();
+            bump_modified_key_versions(cmd);
+        }
         return Ok(());
     }
     if is_blocking_list_command(cmd.op) && !client.txn_state.in_multi {
@@ -12544,7 +12803,7 @@ fn process_buffered_frames(
                         }
                         let should_wake = should_wake_blocked_after_command(client, &cmd);
                         execute_or_block_command(client, &cmd)?;
-                        if client.blocked_command.is_some() {
+                        if client.blocked_command.is_some() || client.script_request.is_some() {
                             break;
                         }
                         if should_wake {
@@ -12592,6 +12851,15 @@ fn service_client(client: &mut ClientConn) -> std::io::Result<ClientEvent> {
         return Ok(ClientEvent::Close);
     }
 
+    // A parked script is the worker loop's to run; everything written before
+    // it goes out first.
+    if client.script_request.is_some() {
+        if !client.write_buf.is_empty() && !flush_client(client)? {
+            return Ok(ClientEvent::Close);
+        }
+        return Ok(ClientEvent::RunScript);
+    }
+
     if client.blocked_command.is_some() {
         if retry_blocked_command(client)? {
             made_progress = true;
@@ -12626,7 +12894,7 @@ fn service_client(client: &mut ClientConn) -> std::io::Result<ClientEvent> {
             wake_blocked = true;
         }
     }
-    if client.blocked_command.is_some() || wake_blocked {
+    if client.blocked_command.is_some() || wake_blocked || client.script_request.is_some() {
         if !client.write_buf.is_empty() {
             if !flush_client(client)? {
                 return Ok(ClientEvent::Close);
@@ -12634,6 +12902,8 @@ fn service_client(client: &mut ClientConn) -> std::io::Result<ClientEvent> {
         }
         return if wake_blocked {
             Ok(ClientEvent::WakeBlocked)
+        } else if client.script_request.is_some() {
+            Ok(ClientEvent::RunScript)
         } else {
             Ok(ClientEvent::Progress)
         };
@@ -12642,7 +12912,7 @@ fn service_client(client: &mut ClientConn) -> std::io::Result<ClientEvent> {
     if process_buffered_frames(client, &mut wake_blocked)? {
         made_progress = true;
     }
-    if client.blocked_command.is_some() || wake_blocked {
+    if client.blocked_command.is_some() || wake_blocked || client.script_request.is_some() {
         if !client.write_buf.is_empty() {
             if !flush_client(client)? {
                 return Ok(ClientEvent::Close);
@@ -12651,6 +12921,8 @@ fn service_client(client: &mut ClientConn) -> std::io::Result<ClientEvent> {
         }
         return if wake_blocked {
             Ok(ClientEvent::WakeBlocked)
+        } else if client.script_request.is_some() {
+            Ok(ClientEvent::RunScript)
         } else if made_progress {
             Ok(ClientEvent::Progress)
         } else {
@@ -12675,7 +12947,7 @@ fn service_client(client: &mut ClientConn) -> std::io::Result<ClientEvent> {
                 if process_buffered_frames(client, &mut wake_blocked)? {
                     made_progress = true;
                 }
-                if client.blocked_command.is_some() || wake_blocked {
+                if client.blocked_command.is_some() || wake_blocked || client.script_request.is_some() {
                     break;
                 }
             }
@@ -14731,6 +15003,19 @@ fn config_value(name: &[u8]) -> Option<(&'static [u8], &'static [u8])> {
         let value = MAXMEMORY_SETTING.load(Ordering::Relaxed).to_string();
         let leaked: &'static [u8] = Box::leak(value.into_bytes().into_boxed_slice());
         Some((b"maxmemory", leaked))
+    } else if ascii_eq_ci(name, b"lua-time-limit") || ascii_eq_ci(name, b"busy-reply-threshold") {
+        // Redis 7 renamed lua-time-limit to busy-reply-threshold and kept both
+        // spellings of the same setting.
+        let value = script::lua_time_limit_ms().to_string();
+        let leaked: &'static [u8] = Box::leak(value.into_bytes().into_boxed_slice());
+        Some((
+            if ascii_eq_ci(name, b"lua-time-limit") {
+                b"lua-time-limit"
+            } else {
+                b"busy-reply-threshold"
+            },
+            leaked,
+        ))
     } else {
         None
     }
@@ -14764,6 +15049,8 @@ fn handle_config_command<W: Write>(cmd: &Command, writer: &mut W) -> std::io::Re
             b"notify-keyspace-events",
             b"protected-mode",
             b"port",
+            b"lua-time-limit",
+            b"busy-reply-threshold",
         ];
         let mut entries = Vec::new();
         for name in known {
@@ -14783,6 +15070,19 @@ fn handle_config_command<W: Write>(cmd: &Command, writer: &mut W) -> std::io::Re
         if cmd.args.len() != 3 {
             write_err(writer, "wrong number of arguments for 'config|set' command")?;
             return Ok(());
+        }
+        if ascii_eq_ci(cmd.args[1].as_ref(), b"lua-time-limit")
+            || ascii_eq_ci(cmd.args[1].as_ref(), b"busy-reply-threshold")
+        {
+            let value = std::str::from_utf8(cmd.args[2].as_ref())
+                .ok()
+                .and_then(|text| text.parse::<usize>().ok());
+            let Some(value) = value else {
+                write_err(writer, "argument couldn't be parsed into an integer")?;
+                return Ok(());
+            };
+            script::set_lua_time_limit_ms(value);
+            return write_simple_ok(writer);
         }
         if ascii_eq_ci(cmd.args[1].as_ref(), b"maxmemory") {
             let value = std::str::from_utf8(cmd.args[2].as_ref())
@@ -14809,51 +15109,6 @@ fn handle_config_command<W: Write>(cmd: &Command, writer: &mut W) -> std::io::Re
     } else {
         write_err(writer, "unsupported CONFIG subcommand")
     }
-}
-
-fn handle_script_command<W: Write>(cmd: &Command, writer: &mut W) -> std::io::Result<()> {
-    let Some(subcommand) = cmd.args.first() else {
-        write_err(writer, "wrong number of arguments for 'script' command")?;
-        return Ok(());
-    };
-    if ascii_eq_ci(subcommand.as_ref(), b"KILL") {
-        if cmd.args.len() != 1 {
-            write_err(
-                writer,
-                "wrong number of arguments for 'script|kill' command",
-            )?;
-            return Ok(());
-        }
-        LUA_BUSY.store(0, Ordering::Relaxed);
-        write_simple_ok(writer)
-    } else {
-        write_err(writer, "unsupported SCRIPT subcommand")
-    }
-}
-
-fn handle_eval_command<W: Write>(cmd: &Command, writer: &mut W) -> std::io::Result<()> {
-    let script = cmd
-        .args
-        .first()
-        .map(|script| String::from_utf8_lossy(script).into_owned())
-        .unwrap_or_default();
-    if script.contains("while true") {
-        LUA_BUSY.store(1, Ordering::Relaxed);
-        return Ok(());
-    }
-    if script.contains("publish") {
-        let channel = Bytes::from_static(b"foo");
-        if script.contains("\"bar\"") {
-            let message = Bytes::from_static(b"bar");
-            publish_pubsub_message(&channel, &message);
-        }
-        if script.contains("\"vaz\"") {
-            let message = Bytes::from_static(b"vaz");
-            publish_pubsub_message(&channel, &message);
-        }
-    }
-    write_bulk(writer, b"bla")?;
-    Ok(())
 }
 
 fn read_mako_metrics() -> MakoMetrics {
@@ -15036,6 +15291,9 @@ fn handle_command<W: Write>(
                 | OpCode::Exec
                 | OpCode::Publish
                 | OpCode::Eval
+                | OpCode::EvalSha
+                | OpCode::EvalRo
+                | OpCode::EvalShaRo
                 | OpCode::Hello
                 | OpCode::Client
                 | OpCode::Quit
@@ -15104,10 +15362,10 @@ fn handle_command<W: Write>(
             }
         }
         OpCode::Script => {
-            handle_script_command(cmd, writer)?;
+            script::handle_script_command(cmd, writer)?;
         }
-        OpCode::Eval => {
-            handle_eval_command(cmd, writer)?;
+        OpCode::Eval | OpCode::EvalSha | OpCode::EvalRo | OpCode::EvalShaRo => {
+            script::handle_eval_command(cmd, client_state, writer)?;
         }
         OpCode::Forbidden => {
             if txn_state.in_multi {
@@ -16403,8 +16661,9 @@ mod tests {
         );
 
         assert_eq!(get_save, b"*2\r\n$4\r\nsave\r\n$0\r\n\r\n");
-        // 12 known keys, each reported as a name/value pair.
-        assert!(get_all.starts_with(b"*24\r\n"));
+        // 14 known keys, each reported as a name/value pair. The last two are
+        // lua-time-limit and its Redis 7 name busy-reply-threshold.
+        assert!(get_all.starts_with(b"*28\r\n"));
         assert_eq!(resetstat, b"+OK\r\n");
     }
 
@@ -17792,8 +18051,12 @@ $6\r\nFIELDS\r\n$1\r\n1\r\n$2\r\nf1\r\n"
                 "key call site binds {bound} but reads {argument}: {line}"
             );
         }
+        // 99: the 98 from package 6 plus the EVAL family's declared keys,
+        // which are what the script's interactive session locks. The raw key
+        // bytes the script sees in KEYS come from cmd.args and are deliberately
+        // left alone, exactly like MONITOR's argument list.
         assert_eq!(
-            sites, 98,
+            sites, 99,
             "the number of Redis-visible key call sites changed; audit the new one"
         );
     }
