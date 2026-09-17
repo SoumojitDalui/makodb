@@ -842,6 +842,7 @@ enum OpCode {
     XTrim = 209,
     XSetId = 210,
     XInfo = 211,
+    XRead = 212,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -2019,6 +2020,8 @@ fn parse_opcode(name: &[u8]) -> Option<OpCode> {
         Some(OpCode::XSetId)
     } else if ascii_eq_ci(name, b"XINFO") {
         Some(OpCode::XInfo)
+    } else if ascii_eq_ci(name, b"XREAD") {
+        Some(OpCode::XRead)
     } else if ascii_eq_ci(name, b"GEOSEARCH")
         || ascii_eq_ci(name, b"GEORADIUS")
         || ascii_eq_ci(name, b"GEORADIUS_RO")
@@ -4193,6 +4196,83 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                     STREAM_READ_REVERSE
                 }),
             ];
+            Ok(cmd)
+        }
+        OpCode::XRead => {
+            if parts.len() < 4 {
+                return Err(wrong_arity("xread"));
+            }
+            let mut count = 0i64;
+            let mut block_ms = -1i64;
+            let mut index = 1usize;
+            let mut streams_at = None;
+            while index < parts.len() {
+                let arg = part_to_bytes(&parts[index])?;
+                if ascii_eq_ci(arg.as_ref(), b"COUNT") && index + 1 < parts.len() {
+                    count = parse_i64_error_arg(
+                        part_to_bytes(&parts[index + 1])?.as_ref(),
+                        "value is not an integer or out of range",
+                    )?;
+                    if count < 0 {
+                        count = 0;
+                    }
+                    index += 2;
+                } else if ascii_eq_ci(arg.as_ref(), b"BLOCK") && index + 1 < parts.len() {
+                    block_ms = parse_i64_error_arg(
+                        part_to_bytes(&parts[index + 1])?.as_ref(),
+                        "timeout is not an integer or out of range",
+                    )?;
+                    if block_ms < 0 {
+                        return Err(ParseError::Error("timeout is negative"));
+                    }
+                    index += 2;
+                } else if ascii_eq_ci(arg.as_ref(), b"STREAMS") {
+                    streams_at = Some(index + 1);
+                    break;
+                } else {
+                    return Err(ParseError::Protocol("syntax error"));
+                }
+            }
+            let Some(streams_at) = streams_at else {
+                return Err(ParseError::Protocol("syntax error"));
+            };
+            let rest = parts.len() - streams_at;
+            if rest == 0 || rest % 2 != 0 {
+                return Err(ParseError::Error(
+                    "Unbalanced 'xread' list of streams: for each stream key an ID or '$' \
+                     must be specified.",
+                ));
+            }
+            let stream_count = rest / 2;
+            let mut cmd = Command::new(
+                op,
+                Vec::with_capacity(stream_count),
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            for part in &parts[streams_at..streams_at + stream_count] {
+                let key = part_to_bytes(part)?;
+                let key = validate_user_key(&key)?;
+                cmd.keys.push(key);
+            }
+            // One ID spec per key, in the same order. "$" and "+" name a
+            // position rather than an entry and are resolved once, when the
+            // command arrives; everything else is normalized here.
+            for part in &parts[streams_at + stream_count..] {
+                let raw = part_to_bytes(part)?;
+                if raw.as_ref() == b"$" || raw.as_ref() == b"+" {
+                    cmd.values.push(raw);
+                } else if raw.as_ref() == b">" {
+                    return Err(ParseError::Error(
+                        "The > ID can be specified only when calling XREADGROUP using the \
+                         GROUP <group> <consumer> option.",
+                    ));
+                } else {
+                    cmd.values.push(parse_stream_id_strict(raw.as_ref(), 0)?.text());
+                }
+            }
+            cmd.scan_count = count;
+            cmd.expire_at_ms = block_ms;
             Ok(cmd)
         }
         OpCode::XLen => {
@@ -6579,9 +6659,12 @@ fn stream_bool_arg(value: bool) -> Bytes {
     Bytes::from_static(if value { b"1" } else { b"0" })
 }
 
-/// The read mode of one TXN_OP_XRANGE op.
+/// The read mode of one TXN_OP_XRANGE op: forward, reverse, or "report the
+/// stream's last ID and no entries at all", which is what the first attempt at
+/// a blocking `XREAD ... $` asks for.
 const STREAM_READ_FORWARD: &[u8] = b"0";
 const STREAM_READ_REVERSE: &[u8] = b"1";
+const STREAM_READ_NONE: &[u8] = b"2";
 
 /// One `[id, [field, value, ...]]` element of a stream reply. An empty field
 /// blob is a PEL entry whose stream entry has been deleted, which Redis answers
@@ -8533,6 +8616,55 @@ fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)
                     group_id: 0,
                 });
             }
+            OpCode::XRead => {
+                // One TXN_OP_XRANGE op per stream, in the order the command
+                // named them, each carrying the read mode its ID spec asks for.
+                for (index, key) in cmd.keys.iter().enumerate() {
+                    let spec = cmd.values.get(index).cloned().unwrap_or_default();
+                    let (start, end, count, mode) = if spec.as_ref() == b"$" {
+                        // Only entries added after the call, so nothing that is
+                        // already stored can qualify.
+                        (STREAM_ID_MIN, STREAM_ID_MIN, 0, STREAM_READ_NONE)
+                    } else if spec.as_ref() == b"+" {
+                        // The last entry, whatever it is; COUNT does not apply.
+                        (STREAM_ID_MIN, STREAM_ID_MAX, 1, STREAM_READ_REVERSE)
+                    } else {
+                        match parse_stream_id_generic(spec.as_ref(), 0, true, false)
+                            .and_then(|(id, _)| id.incr())
+                        {
+                            // XREAD's ID is exclusive, so the range starts at
+                            // the ID after it.
+                            Some(start) => (
+                                start,
+                                STREAM_ID_MAX,
+                                cmd.scan_count,
+                                STREAM_READ_FORWARD,
+                            ),
+                            // The client named the largest ID there is: nothing
+                            // can ever follow it.
+                            None => (STREAM_ID_MIN, STREAM_ID_MIN, 0, STREAM_READ_NONE),
+                        }
+                    };
+                    let payload = pack_bytes_list(&[
+                        start.text(),
+                        end.text(),
+                        Bytes::from(count.to_string()),
+                        Bytes::from_static(mode),
+                    ]);
+                    payloads.push(payload);
+                    let payload = payloads.last().unwrap();
+                    ops.push(TxnOperation {
+                        op: TXN_OP_XRANGE,
+                        key_ptr: key.as_ptr(),
+                        key_len: key.len(),
+                        val_ptr: payload.as_ptr(),
+                        val_len: payload.len(),
+                        flags: 0,
+                        expire_at_ms: -1,
+                        group_id: 0,
+                    });
+                }
+            }
             OpCode::XAdd
             | OpCode::XRange
             | OpCode::XRevRange
@@ -9546,6 +9678,7 @@ fn command_needs_retry(cmd: &Command) -> bool {
             | OpCode::XTrim
             | OpCode::XSetId
             | OpCode::XInfo
+            | OpCode::XRead
     )
 }
 
@@ -11581,6 +11714,64 @@ fn write_command_result<W: Write>(
                 write_err(writer, "operation failed")?;
             }
         }
+        OpCode::XRead => {
+            // One op per stream. A stream with no matching entry is left out,
+            // and a reply with no stream at all is a null -- which is also
+            // what tells the blocking path to park the client.
+            let db = current_db();
+            let mut served: Vec<(usize, Vec<(Bytes, Bytes)>)> = Vec::new();
+            let mut outcome = Ok(());
+            for offset in 0..len {
+                let result = unsafe { &*response.results.add(start + offset) };
+                if !result.success {
+                    outcome = Err(true);
+                    break;
+                }
+                match stream_read_entries(result) {
+                    Some(entries) => {
+                        if !entries.is_empty() {
+                            served.push((offset, entries));
+                        }
+                    }
+                    None => {
+                        outcome = Err(false);
+                        break;
+                    }
+                }
+            }
+            match outcome {
+                Err(true) => write_wrongtype(writer)?,
+                Err(false) => write_err(writer, "operation failed")?,
+                Ok(()) => {
+                    if served.is_empty() {
+                        if protocol_version >= 3 {
+                            write_null(writer, protocol_version)?;
+                        } else {
+                            writer.write_all(b"*-1\r\n")?;
+                        }
+                    } else {
+                        // RESP2 pairs each key with its entries in a two-element
+                        // array; RESP3 sends the same thing as a map.
+                        if protocol_version >= 3 {
+                            write_map_header(writer, served.len())?;
+                        } else {
+                            write_array_header(writer, served.len())?;
+                        }
+                        for (offset, entries) in &served {
+                            if protocol_version < 3 {
+                                write_array_header(writer, 2)?;
+                            }
+                            let key = cmd.keys.get(*offset).cloned().unwrap_or_default();
+                            write_bulk(writer, strip_db_key(db, &key))?;
+                            write_array_header(writer, entries.len())?;
+                            for (id, fields) in entries {
+                                write_stream_entry(writer, id, fields, protocol_version)?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         OpCode::XLen | OpCode::XDel | OpCode::XTrim => {
             if first.success {
                 write_integer(writer, first.int_value)?;
@@ -13027,6 +13218,91 @@ fn is_blocking_list_command(op: OpCode) -> bool {
     )
 }
 
+/// Whether this command parks the client when it finds nothing. The list and
+/// sorted-set pops always do; a stream read only when it was given BLOCK,
+/// which is what `expire_at_ms` carries for it (-1 for no BLOCK, 0 for
+/// "forever", otherwise the timeout in milliseconds).
+fn command_blocks(cmd: &Command) -> bool {
+    is_blocking_list_command(cmd.op) || (cmd.op == OpCode::XRead && cmd.expire_at_ms >= 0)
+}
+
+/// Fix the position that "$" and "+" name, once, when a blocking stream read
+/// arrives, so an XADD that lands while the client is parked is delivered
+/// rather than skipped. Returns the command to attempt now and the command to
+/// park; the two differ only for "+", which reads the stream's last entry on
+/// the first attempt and then waits for whatever follows it.
+///
+/// Redis fixes the position inside the command. Here it is one extra read of
+/// every named stream's last-generated ID, issued before the first attempt,
+/// because a request's operation list is built before the executor runs it.
+/// Nothing is lost by the gap: the first attempt reads everything after the
+/// resolved position, which is exactly what Redis would have delivered.
+fn resolve_stream_read_positions(cmd: &Command) -> Option<(Command, Command)> {
+    if cmd.op != OpCode::XRead {
+        return None;
+    }
+    if !cmd
+        .values
+        .iter()
+        .any(|spec| spec.as_ref() == b"$" || spec.as_ref() == b"+")
+    {
+        return None;
+    }
+    let payload = pack_bytes_list(&[
+        Bytes::from_static(b"0-0"),
+        Bytes::from_static(b"0-0"),
+        Bytes::from_static(b"0"),
+        Bytes::from_static(STREAM_READ_NONE),
+    ]);
+    let ops: Vec<TxnOperation> = cmd
+        .keys
+        .iter()
+        .map(|key| TxnOperation {
+            op: TXN_OP_XRANGE,
+            key_ptr: key.as_ptr(),
+            key_len: key.len(),
+            val_ptr: payload.as_ptr(),
+            val_len: payload.len(),
+            flags: 0,
+            expire_at_ms: -1,
+            group_id: 0,
+        })
+        .collect();
+    let last_ids: Vec<Bytes> = ffi_run_ops(&ops, |results| {
+        let Some(results) = results else {
+            return Vec::new();
+        };
+        results
+            .iter()
+            .map(|result| {
+                parse_list_payload(result_value_bytes(result))
+                    .and_then(|items| items.first().cloned())
+                    .map(Bytes::from)
+                    // A key holding another type reports nothing; the first
+                    // attempt is what answers WRONGTYPE for it.
+                    .unwrap_or_else(|| Bytes::from_static(b"0-0"))
+            })
+            .collect()
+    });
+    if last_ids.len() != cmd.keys.len() {
+        return None;
+    }
+    let mut attempt = cmd.clone();
+    let mut parked = cmd.clone();
+    for (index, spec) in cmd.values.iter().enumerate() {
+        let Some(last_id) = last_ids.get(index) else {
+            continue;
+        };
+        if spec.as_ref() == b"$" {
+            attempt.values[index] = last_id.clone();
+            parked.values[index] = last_id.clone();
+        } else if spec.as_ref() == b"+" {
+            parked.values[index] = last_id.clone();
+        }
+    }
+    Some((attempt, parked))
+}
+
 fn is_null_reply(reply: &[u8]) -> bool {
     reply == b"$-1\r\n" || reply == b"*-1\r\n" || reply == b"_\r\n"
 }
@@ -13337,11 +13613,17 @@ fn execute_or_block_command(client: &mut ClientConn, cmd: &Command) -> std::io::
         }
         return Ok(());
     }
-    if is_blocking_list_command(cmd.op) && !client.txn_state.in_multi {
+    if command_blocks(cmd) && !client.txn_state.in_multi {
+        let resolved = resolve_stream_read_positions(cmd);
+        let attempt = resolved.as_ref().map(|(first, _)| first).unwrap_or(cmd);
         let mut reply = Vec::new();
-        ffi_execute_single(cmd, client.client_state.protocol_version, &mut reply)?;
+        ffi_execute_single(attempt, client.client_state.protocol_version, &mut reply)?;
         if is_null_reply(&reply) {
-            client.set_blocked(cmd.clone());
+            client.set_blocked(
+                resolved
+                    .map(|(_, parked)| parked)
+                    .unwrap_or_else(|| cmd.clone()),
+            );
         } else {
             if is_dirty_command(cmd.op) && !is_error_reply(&reply) {
                 record_dirty_change();
@@ -13433,8 +13715,13 @@ fn retry_blocked_command(client: &mut ClientConn) -> std::io::Result<bool> {
     ffi_execute_single(&cmd, client.client_state.protocol_version, &mut reply)?;
     if is_null_reply(&reply) {
         Ok(false)
-    } else if matches!(cmd.op, OpCode::BLPop | OpCode::BRPop | OpCode::BLMPop)
-        && is_wrongtype_reply(&reply)
+    } else if matches!(
+        cmd.op,
+        // A blocking XREAD ignores a key that holds another type and keeps
+        // waiting for a stream to appear there, as Redis does; the wrong type
+        // is only reported by the first attempt, before the client parks.
+        OpCode::BLPop | OpCode::BRPop | OpCode::BLMPop | OpCode::XRead
+    ) && is_wrongtype_reply(&reply)
     {
         Ok(false)
     } else {
@@ -13506,7 +13793,7 @@ fn should_wait_for_blocked_completion(cmd: &Command) -> bool {
     // and has to wait for that client the same way ZADD does.
     matches!(
         cmd.op,
-        OpCode::LPush | OpCode::RPush | OpCode::ZAdd | OpCode::GeoAdd
+        OpCode::LPush | OpCode::RPush | OpCode::ZAdd | OpCode::GeoAdd | OpCode::XAdd
     )
 }
 
@@ -16773,7 +17060,8 @@ fn handle_command<W: Write>(
         | OpCode::XDel
         | OpCode::XTrim
         | OpCode::XSetId
-        | OpCode::XInfo => {
+        | OpCode::XInfo
+        | OpCode::XRead => {
             if txn_state.in_multi {
                 // Queue command for later execution
                 txn_state.queue_command(cmd.clone());
@@ -18288,6 +18576,78 @@ mod tests {
     }
 
     #[test]
+    fn xread_builds_one_range_op_per_stream() {
+        // XREAD COUNT 2 BLOCK 100 STREAMS a b 0-0 $: two ops, in the order the
+        // command named the streams, and the BLOCK timeout parked on the
+        // command rather than turned into a TTL.
+        let cmd = parsed(
+            0,
+            &[
+                b"XREAD", b"COUNT", b"2", b"BLOCK", b"100", b"STREAMS", b"a", b"b", b"0-0", b"$",
+            ],
+        );
+        assert!(cmd.op == OpCode::XRead);
+        assert_eq!(
+            cmd.keys,
+            vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")]
+        );
+        assert_eq!(
+            cmd.values,
+            vec![Bytes::from_static(b"0-0"), Bytes::from_static(b"$")]
+        );
+        assert_eq!(cmd.scan_count, 2);
+        assert_eq!(cmd.expire_at_ms, 100);
+        assert!(command_blocks(&cmd));
+        let (ops, spans, payloads) = build_txn_ops(std::slice::from_ref(&cmd));
+        assert_eq!(ops.len(), 2);
+        assert_eq!(spans, vec![(0, 2)]);
+        assert!(ops.iter().all(|op| op.op == TXN_OP_XRANGE));
+        // An explicit ID is exclusive, so the range starts one past it.
+        assert_eq!(
+            parse_list_payload(&payloads[0]).unwrap(),
+            vec![
+                b"0-1".to_vec(),
+                b"18446744073709551615-18446744073709551615".to_vec(),
+                b"2".to_vec(),
+                b"0".to_vec(),
+            ]
+        );
+        // "$" reads no entry at all; it only reports the stream's last ID.
+        assert_eq!(
+            parse_list_payload(&payloads[1]).unwrap(),
+            vec![
+                b"0-0".to_vec(),
+                b"0-0".to_vec(),
+                b"0".to_vec(),
+                b"2".to_vec(),
+            ]
+        );
+
+        // Without BLOCK the command answers and never parks.
+        let cmd = parsed(0, &[b"XREAD", b"STREAMS", b"a", b"b", b"5", b"5"]);
+        assert_eq!(cmd.expire_at_ms, -1);
+        assert!(!command_blocks(&cmd));
+    }
+
+    #[test]
+    fn xread_refuses_the_arguments_only_xreadgroup_accepts() {
+        assert_eq!(
+            run_raw(b"*4\r\n$5\r\nXREAD\r\n$7\r\nSTREAMS\r\n$1\r\na\r\n$1\r\n>\r\n"),
+            b"-ERR The > ID can be specified only when calling XREADGROUP using the \
+GROUP <group> <consumer> option.\r\n"
+        );
+        assert_eq!(
+            run_raw(b"*5\r\n$5\r\nXREAD\r\n$5\r\nCOUNT\r\n$1\r\n1\r\n$7\r\nSTREAMS\r\n$1\r\na\r\n"),
+            b"-ERR Unbalanced 'xread' list of streams: for each stream key an ID or '$' \
+must be specified.\r\n"
+        );
+        assert_eq!(
+            run_raw(b"*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$2\r\n-1\r\n$7\r\nSTREAMS\r\n$1\r\na\r\n$1\r\n0\r\n"),
+            b"-ERR timeout is negative\r\n"
+        );
+    }
+
+    #[test]
     fn hyperloglog_commands_report_wrong_arity() {
         assert_eq!(
             run_raw(b"*1\r\n$5\r\nPFADD\r\n"),
@@ -19037,11 +19397,11 @@ $6\r\nFIELDS\r\n$1\r\n1\r\n$2\r\nf1\r\n"
                 "key call site binds {bound} but reads {argument}: {line}"
             );
         }
-        // 106: the 99 from package 8 plus one for each of the seven stream
-        // commands that name a key (XADD, XRANGE, XREVRANGE, XLEN, XDEL, XTRIM,
-        // XSETID, XINFO STREAM -- XINFO HELP names none).
+        // 107: the 99 from package 8 plus one for each stream command that
+        // names a key (XADD, XRANGE, XREVRANGE, XLEN, XDEL, XTRIM, XSETID,
+        // XINFO STREAM and XREAD's key list -- XINFO HELP names none).
         assert_eq!(
-            sites, 106,
+            sites, 107,
             "the number of Redis-visible key call sites changed; audit the new one"
         );
     }

@@ -1498,6 +1498,134 @@ def check_streams_basic(host, port, c):
         c.cmd("DEL", key)
 
 
+def check_streams_read(host, port, c):
+    """XREAD: several streams at once, and BLOCK on the blocked-client path."""
+    c.cmd("DEL", "xr1", "xr2", "xr3", "xrplain")
+    c.cmd("XADD", "xr1", "1-1", "a", "1")
+    c.cmd("XADD", "xr1", "1-2", "b", "2")
+    check("XREAD reads the entries after an exclusive ID",
+          c.cmd("XREAD", "STREAMS", "xr1", "0-0"),
+          [[b"xr1", [[b"1-1", [b"a", b"1"]], [b"1-2", [b"b", b"2"]]]]])
+    check("XREAD COUNT limits the entries",
+          c.cmd("XREAD", "COUNT", "1", "STREAMS", "xr1", "0-0"),
+          [[b"xr1", [[b"1-1", [b"a", b"1"]]]]])
+    check("XREAD from a partial ID means ms-0",
+          c.cmd("XREAD", "STREAMS", "xr1", "1"),
+          [[b"xr1", [[b"1-1", [b"a", b"1"]], [b"1-2", [b"b", b"2"]]]]])
+    check("XREAD from the last ID is nil", c.cmd("XREAD", "STREAMS", "xr1", "1-2"), None)
+    check("XREAD $ with no new entry is nil", c.cmd("XREAD", "STREAMS", "xr1", "$"), None)
+    check("XREAD of a missing stream is nil", c.cmd("XREAD", "STREAMS", "xr-missing", "0-0"), None)
+    check("XREAD from the largest ID there is stays nil",
+          c.cmd("XREAD", "STREAMS", "xr1", "18446744073709551615-18446744073709551615"), None)
+
+    c.cmd("XADD", "xr2", "5-0", "c", "3")
+    check("XREAD reads several streams in the order they were named",
+          c.cmd("XREAD", "STREAMS", "xr1", "xr2", "0-0", "0-0"),
+          [[b"xr1", [[b"1-1", [b"a", b"1"]], [b"1-2", [b"b", b"2"]]]],
+           [b"xr2", [[b"5-0", [b"c", b"3"]]]]])
+    check("XREAD leaves out a stream with nothing to give",
+          c.cmd("XREAD", "STREAMS", "xr1", "xr2", "1-2", "0-0"),
+          [[b"xr2", [[b"5-0", [b"c", b"3"]]]]])
+    check("XREAD is nil when no stream has anything",
+          c.cmd("XREAD", "STREAMS", "xr1", "xr2", "1-2", "5-0"), None)
+    check("XREAD + reads the last entry", c.cmd("XREAD", "STREAMS", "xr1", "+"),
+          [[b"xr1", [[b"1-2", [b"b", b"2"]]]]])
+    check("XREAD + ignores COUNT", c.cmd("XREAD", "COUNT", "5", "STREAMS", "xr1", "+"),
+          [[b"xr1", [[b"1-2", [b"b", b"2"]]]]])
+    check("XREAD + on a stream that never had an entry is nil",
+          c.cmd("XREAD", "STREAMS", "xr3", "+"), None)
+    c.cmd("XADD", "xr3", "1-0", "k", "v")
+    c.cmd("XDEL", "xr3", "1-0")
+    check("XREAD + on a stream that ran dry is nil",
+          c.cmd("XREAD", "STREAMS", "xr3", "+"), None)
+
+    c.cmd("SET", "xrplain", "x")
+    check("XREAD on a string is WRONGTYPE", c.cmd("XREAD", "STREAMS", "xrplain", "0"),
+          pred=lambda g: is_err(g, "WRONGTYPE"))
+    check("XREAD needs STREAMS", c.cmd("XREAD", "COUNT", "1", "xr1", "0"),
+          pred=lambda g: is_err(g, "ERR") and "syntax error" in str(g))
+    check("XREAD needs one ID per key", c.cmd("XREAD", "COUNT", "1", "STREAMS", "xr1"),
+          pred=lambda g: is_err(g, "ERR Unbalanced 'xread' list of streams: for each "
+                                   "stream key an ID or '$' must be specified."))
+    check("XREAD refuses the group-only > ID", c.cmd("XREAD", "STREAMS", "xr1", ">"),
+          pred=lambda g: is_err(g, "ERR The > ID can be specified only when calling "
+                                   "XREADGROUP using the GROUP <group> <consumer> option."))
+    check("XREAD refuses a negative BLOCK", c.cmd("XREAD", "BLOCK", "-1", "STREAMS", "xr1", "0"),
+          pred=lambda g: is_err(g, "ERR timeout is negative"))
+    check("XREAD refuses a non-numeric BLOCK",
+          c.cmd("XREAD", "BLOCK", "abc", "STREAMS", "xr1", "0"),
+          pred=lambda g: is_err(g, "ERR timeout is not an integer or out of range"))
+    check("XREAD reports wrong arity", c.cmd("XREAD", "STREAMS"),
+          pred=lambda g: is_err(g, "ERR wrong number of arguments for 'xread' command"))
+
+    # ----- BLOCK -----
+    reader = Resp(host, port)
+    writer = Resp(host, port)
+
+    started = time.time()
+    check("a blocking XREAD that nothing satisfies times out with nil",
+          reader.cmd("XREAD", "BLOCK", "400", "STREAMS", "xr1", "$"), None)
+    waited = time.time() - started
+    check("the timeout waited roughly as long as it was asked to", waited,
+          pred=lambda g: 0.3 <= g < 5.0)
+
+    reader.send("XREAD", "BLOCK", "10000", "STREAMS", "xr1", "$")
+    time.sleep(0.4)
+    started = time.time()
+    writer.cmd("XADD", "xr1", "9-9", "woken", "yes")
+    woken = reader.read()
+    waited = time.time() - started
+    check("an XADD from another connection wakes a blocked XREAD", woken,
+          [[b"xr1", [[b"9-9", [b"woken", b"yes"]]]]])
+    check("the wake arrived well inside the 10 s BLOCK timeout", waited,
+          pred=lambda g: g < 3.0)
+
+    # "$" names the position the stream had when the command arrived, so an
+    # entry added while the client is parked is delivered rather than skipped.
+    reader.send("XREAD", "BLOCK", "10000", "STREAMS", "xr1", "$")
+    time.sleep(0.4)
+    writer.cmd("XADD", "xr1", "10-1", "first", "1")
+    writer.cmd("XADD", "xr1", "10-2", "second", "2")
+    woken = reader.read()
+    check("the entry added right after $ was resolved is the one delivered", woken,
+          pred=lambda g: g[0][0] == b"xr1" and g[0][1][0][0] == b"10-1")
+
+    reader.send("XREAD", "BLOCK", "0", "STREAMS", "xr1", "$")
+    time.sleep(0.4)
+    writer.cmd("XADD", "xr1", "11-0", "forever", "no")
+    check("BLOCK 0 waits until an entry arrives", reader.read(),
+          [[b"xr1", [[b"11-0", [b"forever", b"no"]]]]])
+
+    reader.send("XREAD", "BLOCK", "10000", "STREAMS", "xr1", "xr2", "$", "$")
+    time.sleep(0.4)
+    writer.cmd("XADD", "xr2", "7-0", "second", "stream")
+    check("a multi-stream blocking XREAD reports only the stream that moved",
+          reader.read(), [[b"xr2", [[b"7-0", [b"second", b"stream"]]]]])
+
+    # An XADD that is immediately undone must not wake the client with an
+    # empty reply.
+    reader.send("XREAD", "BLOCK", "10000", "STREAMS", "xr4", "$")
+    time.sleep(0.4)
+    writer.cmd("MULTI")
+    writer.cmd("XADD", "xr4", "*", "gone", "1")
+    writer.cmd("DEL", "xr4")
+    writer.cmd("EXEC")
+    time.sleep(0.3)
+    writer.cmd("XADD", "xr4", "1-1", "real", "1")
+    check("an XADD undone in the same transaction does not wake the client",
+          reader.read(), [[b"xr4", [[b"1-1", [b"real", b"1"]]]]])
+
+    check("MULTI before a blocking read", c.cmd("MULTI"), "OK")
+    check("the blocking read queues", c.cmd("XREAD", "BLOCK", "0", "STREAMS", "xr1", "$"),
+          "QUEUED")
+    check("a blocking XREAD inside MULTI answers nil instead of blocking",
+          c.cmd("EXEC"), [None])
+
+    reader.sock.close()
+    writer.sock.close()
+    for key in ("xr1", "xr2", "xr3", "xr4", "xrplain"):
+        c.cmd("DEL", key)
+
 def stream_id_tuple(raw):
     ms, _, seq = raw.decode().partition("-")
     return (int(ms), int(seq))
@@ -2942,6 +3070,7 @@ def main():
 
     # ----- Streams -----
     check_streams_basic(host, port, c)
+    check_streams_read(host, port, c)
 
     c.cmd("SET", "t1", "v")
     c.cmd("SADD", "s1", "a")

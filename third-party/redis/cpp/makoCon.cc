@@ -7190,6 +7190,11 @@ static bool execute_ops_impl(
                 int64_t count = 0;
                 parse_int64(args[2], count);
                 const bool reverse = args[3] == "1";
+                // Mode "2" asks for the stream's last-generated ID and no
+                // entries: it is what the first attempt at a blocking
+                // `XREAD ... $` does, where by definition nothing already
+                // stored can qualify.
+                const bool id_only = args[3] == "2";
 
                 bool allowed = false;
                 mako::Status s = stream_key_allowed(txn, user_key, result, allowed);
@@ -7207,7 +7212,7 @@ static bool execute_ops_impl(
                     s = read_stream_meta(txn, user_key, meta, exists);
                 }
                 std::vector<std::pair<RedisStreamId, std::string>> entries;
-                if (s.ok() && exists && meta.length > 0) {
+                if (s.ok() && !id_only && exists && meta.length > 0) {
                     s = collect_stream_entries(
                         txn, user_key, start, end,
                         count > 0 ? static_cast<size_t>(count) : 0, reverse, entries);
