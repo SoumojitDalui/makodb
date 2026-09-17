@@ -18,6 +18,7 @@ After package 8: 211 of 249 recognized. The three new names are EVALSHA,
 EVAL_RO and EVALSHA_RO; EVAL and SCRIPT were already counted, because both were
 recognized as stubs before this package replaced them with a real interpreter.
 FUNCTION and FCALL are not part of this package and are not counted.
+After package 9: 226 of 249 recognized.
 
 | # | Package | Commands | Where the work is | Acceptance |
 |---|---|---|---|---|

@@ -1064,6 +1064,7 @@ static bool redis_op_is_read_only(const TxnOperation& op) {
         case TXN_OP_XRANGE:
         case TXN_OP_XLEN:
         case TXN_OP_XINFO:
+        case TXN_OP_XPENDING:
             return true;
         case TXN_OP_SET_ALGEBRA:
             return (op.flags & TXN_FLAG_SET_ALGEBRA_STORE) == 0;
@@ -7562,9 +7563,939 @@ static bool execute_ops_impl(
                     if (!copy_result_value(result, pack_bytes_list(payload))) {
                         all_success = false;
                     }
+                } else if (args[0] == "GROUPS") {
+                    s = append_stream_group_info(
+                        txn, user_key, meta, std::string(), 0, false, payload);
+                    if (!s.ok()) {
+                        all_success = false;
+                        continue;
+                    }
+                    result.success = true;
+                    result.int_value = 0;
+                    if (!copy_result_value(result, pack_bytes_list(payload))) {
+                        all_success = false;
+                    }
+                } else if (args[0] == "CONSUMERS") {
+                    if (args.size() < 2) {
+                        all_success = false;
+                        continue;
+                    }
+                    RedisStreamGroup group;
+                    bool group_exists = false;
+                    s = read_stream_group(txn, user_key, args[1], group, group_exists);
+                    if (!s.ok()) {
+                        all_success = false;
+                        continue;
+                    }
+                    if (!group_exists) {
+                        result.success = true;
+                        result.value_present = false;
+                        result.int_value = TXN_STREAM_ERR_NOGROUP;
+                        continue;
+                    }
+                    s = append_stream_consumer_info(txn, user_key, args[1], payload);
+                    if (!s.ok()) {
+                        all_success = false;
+                        continue;
+                    }
+                    result.success = true;
+                    result.int_value = 0;
+                    if (!copy_result_value(result, pack_bytes_list(payload))) {
+                        all_success = false;
+                    }
                 } else {
                     all_success = false;
                     continue;
+                }
+            } else if (op.op == TXN_OP_XGROUP) {
+                // XGROUP CREATE/SETID/DESTROY/CREATECONSUMER/DELCONSUMER, one
+                // op each: every one of them is a read of the group record
+                // followed by a write that depends on it.
+                std::vector<std::string> args;
+                if (!unpack_bytes_list(op.val_ptr, op.val_len, args) || args.size() < 2) {
+                    all_success = false;
+                    continue;
+                }
+                const std::string subcommand = args[0];
+                const std::string group_name = args[1];
+
+                bool allowed = false;
+                mako::Status s = stream_key_allowed(txn, user_key, result, allowed);
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                if (!allowed) {
+                    continue;
+                }
+                s = expire_stream_if_needed(txn, user_key);
+                RedisStreamMeta meta;
+                bool exists = false;
+                if (s.ok()) {
+                    s = read_stream_meta(txn, user_key, meta, exists);
+                }
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                result.success = true;
+                result.value_present = true;
+
+                if (subcommand == "CREATE") {
+                    if (args.size() < 5) {
+                        all_success = false;
+                        continue;
+                    }
+                    const bool mkstream = args[3] == "1";
+                    if (!exists && !mkstream) {
+                        result.value_present = false;
+                        result.int_value = TXN_STREAM_ERR_NO_KEY_FOR_GROUP;
+                        continue;
+                    }
+                    RedisStreamGroup group;
+                    bool group_exists = false;
+                    s = read_stream_group(txn, user_key, group_name, group, group_exists);
+                    if (!s.ok()) {
+                        all_success = false;
+                        continue;
+                    }
+                    if (group_exists) {
+                        result.value_present = false;
+                        result.int_value = TXN_STREAM_ERR_BUSYGROUP;
+                        continue;
+                    }
+                    RedisStreamId id;
+                    if (args[2] == "$") {
+                        id = meta.last_id;
+                    } else if (!stream_id_parse(args[2], id)) {
+                        all_success = false;
+                        continue;
+                    }
+                    group = RedisStreamGroup{};
+                    group.last_id = id;
+                    if (!args[4].empty() && !parse_int64(args[4], group.entries_read)) {
+                        all_success = false;
+                        continue;
+                    }
+                    s = write_stream_group(txn, user_key, group_name, group);
+                    if (s.ok()) {
+                        meta.groups += 1;
+                        s = write_stream_meta(txn, user_key, meta);
+                    }
+                    if (!s.ok()) {
+                        all_success = false;
+                        continue;
+                    }
+                    result.int_value = 1;
+                    continue;
+                }
+
+                RedisStreamGroup group;
+                bool group_exists = false;
+                if (exists) {
+                    s = read_stream_group(txn, user_key, group_name, group, group_exists);
+                    if (!s.ok()) {
+                        all_success = false;
+                        continue;
+                    }
+                }
+
+                if (subcommand == "DESTROY") {
+                    // The one subcommand Redis answers with a count rather than
+                    // an error when the key or the group is not there.
+                    if (!group_exists) {
+                        result.int_value = 0;
+                        continue;
+                    }
+                    s = delete_stream_group_records(txn, user_key, group_name);
+                    if (s.ok()) {
+                        if (meta.groups > 0) {
+                            meta.groups -= 1;
+                        }
+                        s = write_stream_meta(txn, user_key, meta);
+                    }
+                    if (!s.ok()) {
+                        all_success = false;
+                        continue;
+                    }
+                    result.int_value = 1;
+                    continue;
+                }
+
+                if (!group_exists) {
+                    result.value_present = false;
+                    result.int_value = TXN_STREAM_ERR_NOGROUP;
+                    continue;
+                }
+
+                if (subcommand == "SETID") {
+                    if (args.size() < 4) {
+                        all_success = false;
+                        continue;
+                    }
+                    RedisStreamId id;
+                    if (args[2] == "$") {
+                        id = meta.last_id;
+                    } else if (!stream_id_parse(args[2], id)) {
+                        all_success = false;
+                        continue;
+                    }
+                    group.last_id = id;
+                    // Redis resets the read counter unless ENTRIESREAD is given,
+                    // because the new position says nothing about how many
+                    // entries the group has seen.
+                    group.entries_read = -1;
+                    if (!args[3].empty() && !parse_int64(args[3], group.entries_read)) {
+                        all_success = false;
+                        continue;
+                    }
+                    s = write_stream_group(txn, user_key, group_name, group);
+                    if (!s.ok()) {
+                        all_success = false;
+                        continue;
+                    }
+                    result.int_value = 1;
+                } else if (subcommand == "CREATECONSUMER") {
+                    if (args.size() < 3) {
+                        all_success = false;
+                        continue;
+                    }
+                    RedisStreamConsumer consumer;
+                    bool consumer_exists = false;
+                    s = read_stream_consumer(txn, user_key, group_name, args[2], consumer, consumer_exists);
+                    if (!s.ok()) {
+                        all_success = false;
+                        continue;
+                    }
+                    if (consumer_exists) {
+                        result.int_value = 0;
+                        continue;
+                    }
+                    bool created = false;
+                    s = touch_stream_consumer(
+                        txn, user_key, group_name, group, args[2], false, consumer, created);
+                    if (s.ok()) {
+                        s = write_stream_group(txn, user_key, group_name, group);
+                    }
+                    if (!s.ok()) {
+                        all_success = false;
+                        continue;
+                    }
+                    result.int_value = 1;
+                } else if (subcommand == "DELCONSUMER") {
+                    if (args.size() < 3) {
+                        all_success = false;
+                        continue;
+                    }
+                    RedisStreamConsumer consumer;
+                    bool consumer_exists = false;
+                    s = read_stream_consumer(txn, user_key, group_name, args[2], consumer, consumer_exists);
+                    if (!s.ok()) {
+                        all_success = false;
+                        continue;
+                    }
+                    if (!consumer_exists) {
+                        result.int_value = 0;
+                        continue;
+                    }
+                    RedisStreamId min_id;
+                    RedisStreamId max_id;
+                    max_id.ms = std::numeric_limits<uint64_t>::max();
+                    max_id.seq = std::numeric_limits<uint64_t>::max();
+                    std::vector<std::pair<RedisStreamId, RedisStreamNack>> pel;
+                    s = collect_stream_pel(txn, user_key, group_name, min_id, max_id, 0, pel);
+                    if (!s.ok()) {
+                        all_success = false;
+                        continue;
+                    }
+                    int64_t removed = 0;
+                    for (const auto& [id, nack] : pel) {
+                        if (nack.consumer != args[2]) {
+                            continue;
+                        }
+                        s = delete_raw_if_exists(txn, make_stream_pel_key(user_key, group_name, id));
+                        if (!s.ok()) {
+                            break;
+                        }
+                        if (group.pel > 0) {
+                            group.pel -= 1;
+                        }
+                        removed += 1;
+                    }
+                    if (s.ok()) {
+                        s = delete_raw_if_exists(
+                            txn, make_stream_consumer_key(user_key, group_name, args[2]));
+                    }
+                    if (s.ok()) {
+                        if (group.consumers > 0) {
+                            group.consumers -= 1;
+                        }
+                        s = write_stream_group(txn, user_key, group_name, group);
+                    }
+                    if (!s.ok()) {
+                        all_success = false;
+                        continue;
+                    }
+                    result.int_value = removed;
+                } else {
+                    all_success = false;
+                    continue;
+                }
+            } else if (op.op == TXN_OP_XREADGROUP) {
+                // One op per stream, as XREAD is. ">" hands over new entries and
+                // records them in the group's pending-entry list; an explicit ID
+                // replays this consumer's own pending entries from there.
+                std::vector<std::string> args;
+                if (!unpack_bytes_list(op.val_ptr, op.val_len, args) || args.size() != 6) {
+                    all_success = false;
+                    continue;
+                }
+                const std::string group_name = args[0];
+                const std::string consumer_name = args[1];
+                const std::string mode = args[2];
+                RedisStreamId start;
+                if (!stream_id_parse(args[3], start)) {
+                    all_success = false;
+                    continue;
+                }
+                int64_t count = 0;
+                parse_int64(args[4], count);
+                const bool noack = args[5] == "1";
+
+                bool allowed = false;
+                mako::Status s = stream_key_allowed(txn, user_key, result, allowed);
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                if (!allowed) {
+                    continue;
+                }
+                s = expire_stream_if_needed(txn, user_key);
+                RedisStreamMeta meta;
+                bool exists = false;
+                if (s.ok()) {
+                    s = read_stream_meta(txn, user_key, meta, exists);
+                }
+                RedisStreamGroup group;
+                bool group_exists = false;
+                if (s.ok() && exists) {
+                    s = read_stream_group(txn, user_key, group_name, group, group_exists);
+                }
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                if (!exists || !group_exists) {
+                    result.success = true;
+                    result.value_present = false;
+                    result.int_value = TXN_STREAM_ERR_NOGROUP;
+                    continue;
+                }
+
+                const int64_t now = now_unix_ms();
+                RedisStreamId max_id;
+                max_id.ms = std::numeric_limits<uint64_t>::max();
+                max_id.seq = std::numeric_limits<uint64_t>::max();
+                std::vector<std::string> payload;
+                RedisStreamConsumer consumer;
+                bool created = false;
+
+                if (mode == "NEW") {
+                    RedisStreamId first_new = group.last_id;
+                    if (!stream_id_incr(first_new)) {
+                        // The group is already past the largest ID there is.
+                        s = touch_stream_consumer(
+                            txn, user_key, group_name, group, consumer_name, false, consumer, created);
+                        if (s.ok() && created) {
+                            s = write_stream_group(txn, user_key, group_name, group);
+                        }
+                        if (!s.ok()) {
+                            all_success = false;
+                            continue;
+                        }
+                        result.success = true;
+                        result.int_value = 0;
+                        if (!copy_result_value(result, pack_bytes_list(payload))) {
+                            all_success = false;
+                        }
+                        continue;
+                    }
+                    std::vector<std::pair<RedisStreamId, std::string>> entries;
+                    s = collect_stream_entries(
+                        txn, user_key, first_new, max_id,
+                        count > 0 ? static_cast<size_t>(count) : 0, false, entries);
+                    if (!s.ok()) {
+                        all_success = false;
+                        continue;
+                    }
+                    s = touch_stream_consumer(
+                        txn, user_key, group_name, group, consumer_name,
+                        !entries.empty(), consumer, created);
+                    if (!s.ok()) {
+                        all_success = false;
+                        continue;
+                    }
+                    for (const auto& [id, fields] : entries) {
+                        payload.push_back(stream_id_format(id));
+                        payload.push_back(fields);
+                        if (noack) {
+                            continue;
+                        }
+                        RedisStreamNack nack;
+                        nack.consumer = consumer_name;
+                        nack.delivery_time_ms = now;
+                        nack.delivery_count = 1;
+                        s = write_stream_nack(txn, user_key, group_name, id, nack);
+                        if (!s.ok()) {
+                            break;
+                        }
+                        group.pel += 1;
+                        consumer.pending += 1;
+                    }
+                    if (!s.ok()) {
+                        all_success = false;
+                        continue;
+                    }
+                    if (!entries.empty()) {
+                        const RedisStreamId first_served = entries.front().first;
+                        group.last_id = entries.back().first;
+                        // Redis's rule: the counter can be advanced by simple
+                        // addition only when nothing was deleted at or after the
+                        // first entry served; otherwise it is re-estimated, and
+                        // an estimate is not always possible.
+                        if (group.entries_read >= 0
+                            && !stream_range_has_tombstones(meta, first_served)) {
+                            group.entries_read += static_cast<int64_t>(entries.size());
+                        } else {
+                            int64_t estimate = 0;
+                            group.entries_read =
+                                stream_estimate_entries_read(meta, group.last_id, estimate)
+                                    ? estimate
+                                    : -1;
+                        }
+                    }
+                    s = write_stream_group(txn, user_key, group_name, group);
+                    if (s.ok()) {
+                        s = write_stream_consumer(txn, user_key, group_name, consumer_name, consumer);
+                    }
+                    if (!s.ok()) {
+                        all_success = false;
+                        continue;
+                    }
+                } else {
+                    // History: this consumer's pending entries from `start` on.
+                    // An entry that has since been deleted from the stream is
+                    // reported as its ID with no fields and stays in the PEL.
+                    s = touch_stream_consumer(
+                        txn, user_key, group_name, group, consumer_name, false, consumer, created);
+                    if (s.ok() && created) {
+                        s = write_stream_group(txn, user_key, group_name, group);
+                    }
+                    if (!s.ok()) {
+                        all_success = false;
+                        continue;
+                    }
+                    if (mode == "HISTORY") {
+                        std::vector<std::pair<RedisStreamId, RedisStreamNack>> pel;
+                        s = collect_stream_pel(txn, user_key, group_name, start, max_id, 0, pel);
+                        if (!s.ok()) {
+                            all_success = false;
+                            continue;
+                        }
+                        int64_t served = 0;
+                        for (auto& [id, nack] : pel) {
+                            if (nack.consumer != consumer_name) {
+                                continue;
+                            }
+                            if (count > 0 && served >= count) {
+                                break;
+                            }
+                            std::string fields;
+                            bool entry_exists = false;
+                            s = read_stream_entry(txn, user_key, id, fields, entry_exists);
+                            if (!s.ok()) {
+                                break;
+                            }
+                            payload.push_back(stream_id_format(id));
+                            payload.push_back(entry_exists ? fields : std::string());
+                            served += 1;
+                            if (!entry_exists) {
+                                continue;
+                            }
+                            nack.delivery_time_ms = now;
+                            nack.delivery_count += 1;
+                            s = write_stream_nack(txn, user_key, group_name, id, nack);
+                            if (!s.ok()) {
+                                break;
+                            }
+                        }
+                        if (!s.ok()) {
+                            all_success = false;
+                            continue;
+                        }
+                    }
+                }
+                result.success = true;
+                result.int_value = 0;
+                if (!copy_result_value(result, pack_bytes_list(payload))) {
+                    all_success = false;
+                }
+            } else if (op.op == TXN_OP_XACK) {
+                std::vector<std::string> args;
+                if (!unpack_bytes_list(op.val_ptr, op.val_len, args) || args.size() < 2) {
+                    all_success = false;
+                    continue;
+                }
+                const std::string group_name = args[0];
+                bool allowed = false;
+                mako::Status s = stream_key_allowed(txn, user_key, result, allowed);
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                if (!allowed) {
+                    continue;
+                }
+                s = expire_stream_if_needed(txn, user_key);
+                RedisStreamMeta meta;
+                bool exists = false;
+                if (s.ok()) {
+                    s = read_stream_meta(txn, user_key, meta, exists);
+                }
+                RedisStreamGroup group;
+                bool group_exists = false;
+                if (s.ok() && exists) {
+                    s = read_stream_group(txn, user_key, group_name, group, group_exists);
+                }
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                int64_t acknowledged = 0;
+                if (group_exists) {
+                    for (size_t i = 1; i < args.size(); ++i) {
+                        RedisStreamId id;
+                        if (!stream_id_parse(args[i], id)) {
+                            continue;
+                        }
+                        RedisStreamNack nack;
+                        bool nack_exists = false;
+                        s = read_stream_nack(txn, user_key, group_name, id, nack, nack_exists);
+                        if (!s.ok()) {
+                            break;
+                        }
+                        if (!nack_exists) {
+                            continue;
+                        }
+                        s = remove_stream_nack(txn, user_key, group_name, group, id, nack);
+                        if (!s.ok()) {
+                            break;
+                        }
+                        acknowledged += 1;
+                    }
+                    if (s.ok() && acknowledged > 0) {
+                        s = write_stream_group(txn, user_key, group_name, group);
+                    }
+                }
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                result.success = true;
+                result.value_present = true;
+                result.int_value = acknowledged;
+            } else if (op.op == TXN_OP_XPENDING) {
+                std::vector<std::string> args;
+                if (!unpack_bytes_list(op.val_ptr, op.val_len, args) || args.size() < 2) {
+                    all_success = false;
+                    continue;
+                }
+                const std::string group_name = args[0];
+                const bool summary = args[1] == "SUMMARY";
+                bool allowed = false;
+                mako::Status s = stream_key_allowed(txn, user_key, result, allowed);
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                if (!allowed) {
+                    continue;
+                }
+                s = expire_stream_if_needed(txn, user_key);
+                RedisStreamMeta meta;
+                bool exists = false;
+                if (s.ok()) {
+                    s = read_stream_meta(txn, user_key, meta, exists);
+                }
+                RedisStreamGroup group;
+                bool group_exists = false;
+                if (s.ok() && exists) {
+                    s = read_stream_group(txn, user_key, group_name, group, group_exists);
+                }
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                if (!exists || !group_exists) {
+                    result.success = true;
+                    result.value_present = false;
+                    result.int_value = TXN_STREAM_ERR_NOGROUP;
+                    continue;
+                }
+                const int64_t now = now_unix_ms();
+                RedisStreamId min_id;
+                RedisStreamId max_id;
+                max_id.ms = std::numeric_limits<uint64_t>::max();
+                max_id.seq = std::numeric_limits<uint64_t>::max();
+                std::vector<std::string> payload;
+                if (summary) {
+                    std::vector<std::pair<RedisStreamId, RedisStreamNack>> pel;
+                    s = collect_stream_pel(txn, user_key, group_name, min_id, max_id, 0, pel);
+                    if (!s.ok()) {
+                        all_success = false;
+                        continue;
+                    }
+                    payload.push_back(std::to_string(pel.size()));
+                    payload.push_back(pel.empty() ? std::string() : stream_id_format(pel.front().first));
+                    payload.push_back(pel.empty() ? std::string() : stream_id_format(pel.back().first));
+                    std::map<std::string, int64_t> per_consumer;
+                    for (const auto& [id, nack] : pel) {
+                        (void)id;
+                        per_consumer[nack.consumer] += 1;
+                    }
+                    payload.push_back(std::to_string(per_consumer.size()));
+                    for (const auto& [name, owned] : per_consumer) {
+                        payload.push_back(name);
+                        payload.push_back(std::to_string(owned));
+                    }
+                } else {
+                    if (args.size() < 7) {
+                        all_success = false;
+                        continue;
+                    }
+                    int64_t min_idle = 0;
+                    parse_int64(args[2], min_idle);
+                    RedisStreamId start;
+                    RedisStreamId end;
+                    if (!stream_id_parse(args[3], start) || !stream_id_parse(args[4], end)) {
+                        all_success = false;
+                        continue;
+                    }
+                    int64_t count = 0;
+                    parse_int64(args[5], count);
+                    const std::string only_consumer = args[6];
+                    std::vector<std::pair<RedisStreamId, RedisStreamNack>> pel;
+                    s = collect_stream_pel(txn, user_key, group_name, start, end, 0, pel);
+                    if (!s.ok()) {
+                        all_success = false;
+                        continue;
+                    }
+                    std::vector<std::string> rows;
+                    int64_t shown = 0;
+                    for (const auto& [id, nack] : pel) {
+                        if (count > 0 && shown >= count) {
+                            break;
+                        }
+                        if (!only_consumer.empty() && nack.consumer != only_consumer) {
+                            continue;
+                        }
+                        const int64_t idle = std::max<int64_t>(0, now - nack.delivery_time_ms);
+                        if (min_idle > 0 && idle < min_idle) {
+                            continue;
+                        }
+                        rows.push_back(stream_id_format(id));
+                        rows.push_back(nack.consumer);
+                        rows.push_back(std::to_string(idle));
+                        rows.push_back(std::to_string(nack.delivery_count));
+                        shown += 1;
+                    }
+                    payload.push_back(std::to_string(shown));
+                    for (const auto& item : rows) {
+                        payload.push_back(item);
+                    }
+                }
+                result.success = true;
+                result.int_value = summary ? 1 : 0;
+                if (!copy_result_value(result, pack_bytes_list(payload))) {
+                    all_success = false;
+                }
+            } else if (op.op == TXN_OP_XCLAIM || op.op == TXN_OP_XAUTOCLAIM) {
+                const bool autoclaim = op.op == TXN_OP_XAUTOCLAIM;
+                std::vector<std::string> args;
+                if (!unpack_bytes_list(op.val_ptr, op.val_len, args)
+                    || args.size() < (autoclaim ? 6u : 10u)) {
+                    all_success = false;
+                    continue;
+                }
+                const std::string group_name = args[0];
+                const std::string consumer_name = args[1];
+                int64_t min_idle = 0;
+                parse_int64(args[2], min_idle);
+
+                bool allowed = false;
+                mako::Status s = stream_key_allowed(txn, user_key, result, allowed);
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                if (!allowed) {
+                    continue;
+                }
+                s = expire_stream_if_needed(txn, user_key);
+                RedisStreamMeta meta;
+                bool exists = false;
+                if (s.ok()) {
+                    s = read_stream_meta(txn, user_key, meta, exists);
+                }
+                RedisStreamGroup group;
+                bool group_exists = false;
+                if (s.ok() && exists) {
+                    s = read_stream_group(txn, user_key, group_name, group, group_exists);
+                }
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                if (!exists || !group_exists) {
+                    result.success = true;
+                    result.value_present = false;
+                    result.int_value = TXN_STREAM_ERR_NOGROUP;
+                    continue;
+                }
+
+                const int64_t now = now_unix_ms();
+                RedisStreamId min_id;
+                RedisStreamId max_id;
+                max_id.ms = std::numeric_limits<uint64_t>::max();
+                max_id.seq = std::numeric_limits<uint64_t>::max();
+                RedisStreamConsumer consumer;
+                bool created = false;
+                bool consumer_loaded = false;
+                std::vector<std::string> payload;
+                std::vector<std::string> claimed;
+                std::vector<std::string> deleted;
+
+                // Claiming one entry: the record moves to this consumer, both
+                // pending counts follow it, and the delivery clock is reset.
+                auto claim_one = [&](const RedisStreamId& id, RedisStreamNack& nack,
+                                     int64_t delivery_time, int64_t retrycount, bool justid) {
+                    if (nack.consumer != consumer_name) {
+                        RedisStreamConsumer previous;
+                        bool previous_exists = false;
+                        mako::Status cs = read_stream_consumer(
+                            txn, user_key, group_name, nack.consumer, previous, previous_exists);
+                        if (!cs.ok()) {
+                            return cs;
+                        }
+                        if (previous_exists) {
+                            if (previous.pending > 0) {
+                                previous.pending -= 1;
+                            }
+                            cs = write_stream_consumer(
+                                txn, user_key, group_name, nack.consumer, previous);
+                            if (!cs.ok()) {
+                                return cs;
+                            }
+                        }
+                        nack.consumer = consumer_name;
+                        consumer.pending += 1;
+                    }
+                    nack.delivery_time_ms = delivery_time;
+                    if (retrycount >= 0) {
+                        nack.delivery_count = static_cast<uint64_t>(retrycount);
+                    } else if (!justid) {
+                        nack.delivery_count += 1;
+                    }
+                    return write_stream_nack(txn, user_key, group_name, id, nack);
+                };
+
+                auto load_consumer = [&]() {
+                    if (consumer_loaded) {
+                        return mako::Status::OK();
+                    }
+                    consumer_loaded = true;
+                    return touch_stream_consumer(
+                        txn, user_key, group_name, group, consumer_name, true, consumer, created);
+                };
+
+                if (!autoclaim) {
+                    const bool justid = args[3] == "1";
+                    const bool force = args[4] == "1";
+                    int64_t delivery_time = now;
+                    if (!args[5].empty()) {
+                        int64_t idle = 0;
+                        parse_int64(args[5], idle);
+                        delivery_time = now - idle;
+                    } else if (!args[6].empty()) {
+                        parse_int64(args[6], delivery_time);
+                    }
+                    if (delivery_time < 0 || delivery_time > now) {
+                        delivery_time = now;
+                    }
+                    int64_t retrycount = -1;
+                    if (!args[7].empty()) {
+                        parse_int64(args[7], retrycount);
+                    }
+                    bool last_id_given = !args[8].empty();
+                    RedisStreamId last_id;
+                    if (last_id_given && !stream_id_parse(args[8], last_id)) {
+                        all_success = false;
+                        continue;
+                    }
+                    for (size_t i = 9; i < args.size(); ++i) {
+                        RedisStreamId id;
+                        if (!stream_id_parse(args[i], id)) {
+                            continue;
+                        }
+                        std::string fields;
+                        bool entry_exists = false;
+                        s = read_stream_entry(txn, user_key, id, fields, entry_exists);
+                        if (!s.ok()) {
+                            break;
+                        }
+                        RedisStreamNack nack;
+                        bool nack_exists = false;
+                        s = read_stream_nack(txn, user_key, group_name, id, nack, nack_exists);
+                        if (!s.ok()) {
+                            break;
+                        }
+                        if (!entry_exists) {
+                            // Redis 7 drops a pending entry whose stream entry
+                            // is gone and reports nothing for it.
+                            if (nack_exists) {
+                                s = remove_stream_nack(txn, user_key, group_name, group, id, nack);
+                                if (!s.ok()) {
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
+                        if (!nack_exists) {
+                            if (!force) {
+                                continue;
+                            }
+                            nack = RedisStreamNack{};
+                            nack.consumer.clear();
+                            nack.delivery_time_ms = now;
+                            nack.delivery_count = 1;
+                            group.pel += 1;
+                        } else if (min_idle > 0
+                                   && std::max<int64_t>(0, now - nack.delivery_time_ms) < min_idle) {
+                            continue;
+                        }
+                        s = load_consumer();
+                        if (!s.ok()) {
+                            break;
+                        }
+                        s = claim_one(id, nack, delivery_time, retrycount, justid);
+                        if (!s.ok()) {
+                            break;
+                        }
+                        claimed.push_back(stream_id_format(id));
+                        claimed.push_back(justid ? std::string() : fields);
+                    }
+                    if (s.ok() && last_id_given
+                        && stream_id_compare(last_id, group.last_id) > 0) {
+                        group.last_id = last_id;
+                    }
+                } else {
+                    RedisStreamId start;
+                    if (!stream_id_parse(args[3], start)) {
+                        all_success = false;
+                        continue;
+                    }
+                    int64_t count = 0;
+                    parse_int64(args[4], count);
+                    if (count <= 0) {
+                        count = 100;
+                    }
+                    const bool justid = args[5] == "1";
+                    std::vector<std::pair<RedisStreamId, RedisStreamNack>> pel;
+                    s = collect_stream_pel(txn, user_key, group_name, start, max_id, 0, pel);
+                    if (!s.ok()) {
+                        all_success = false;
+                        continue;
+                    }
+                    // Redis walks at most count*10 pending entries and claims or
+                    // drops at most count of them; the cursor is the next entry
+                    // it did not look at, or 0-0 once the list ran out.
+                    int64_t attempts = count * 10;
+                    int64_t remaining = count;
+                    size_t index = 0;
+                    for (; index < pel.size(); ++index) {
+                        if (attempts <= 0 || remaining <= 0) {
+                            break;
+                        }
+                        attempts -= 1;
+                        auto& [id, nack] = pel[index];
+                        if (min_idle > 0
+                            && std::max<int64_t>(0, now - nack.delivery_time_ms) < min_idle) {
+                            continue;
+                        }
+                        s = load_consumer();
+                        if (!s.ok()) {
+                            break;
+                        }
+                        std::string fields;
+                        bool entry_exists = false;
+                        s = read_stream_entry(txn, user_key, id, fields, entry_exists);
+                        if (!s.ok()) {
+                            break;
+                        }
+                        if (!entry_exists) {
+                            s = remove_stream_nack(txn, user_key, group_name, group, id, nack);
+                            if (!s.ok()) {
+                                break;
+                            }
+                            deleted.push_back(stream_id_format(id));
+                            remaining -= 1;
+                            continue;
+                        }
+                        s = claim_one(id, nack, now, -1, justid);
+                        if (!s.ok()) {
+                            break;
+                        }
+                        claimed.push_back(stream_id_format(id));
+                        claimed.push_back(justid ? std::string() : fields);
+                        remaining -= 1;
+                    }
+                    if (!s.ok()) {
+                        all_success = false;
+                        continue;
+                    }
+                    payload.push_back(index < pel.size()
+                        ? stream_id_format(pel[index].first)
+                        : stream_id_format(RedisStreamId{}));
+                }
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                if (consumer_loaded) {
+                    s = write_stream_consumer(txn, user_key, group_name, consumer_name, consumer);
+                }
+                if (s.ok()) {
+                    s = write_stream_group(txn, user_key, group_name, group);
+                }
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                payload.push_back(std::to_string(claimed.size() / 2));
+                for (const auto& item : claimed) {
+                    payload.push_back(item);
+                }
+                if (autoclaim) {
+                    payload.push_back(std::to_string(deleted.size()));
+                    for (const auto& item : deleted) {
+                        payload.push_back(item);
+                    }
+                }
+                result.success = true;
+                result.int_value = 0;
+                if (!copy_result_value(result, pack_bytes_list(payload))) {
+                    all_success = false;
                 }
             } else if (op.op == TXN_OP_XRESTORE) {
                 // RESTORE of a MAKO_STREAM_DUMP payload: replace whatever is at

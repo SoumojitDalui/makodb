@@ -32,8 +32,9 @@
  *   sorted-set internals under "\x01Z:" / "\x01ZS:" / "\x01Z#:", and stream
  *   internals under "\x01X#:" (one meta record per stream) / "\x01X:" (one per
  *   entry) / "\x01XG:" (one per consumer group) / "\x01XC:" (one per consumer)
- *   / "\x01XP:" (one per pending-entry-list entry). These records are hidden
- *   from Redis keyspace commands.
+ *   / "\x01XP:" (one per pending-entry-list entry). `X` is the family tag for
+ *   streams; every family above reserves its own letter after the 0x01 byte.
+ *   These records are hidden from Redis keyspace commands.
  *
  * Sorted-set score encoding:
  *   Sorted-set score indexes use order-preserving IEEE-754 double encoding:
@@ -266,6 +267,45 @@ typedef enum {
     TXN_OP_XSETID = 92,
     TXN_OP_XINFO = 93,
     TXN_OP_XRESTORE = 94,
+    // Consumer groups. Each is one atomic op, because each is a read of the
+    // group record followed by a write that depends on it.
+    //
+    // XGROUP: value = packed [subcommand, group, ...]:
+    //   ["CREATE", group, id or "$", MKSTREAM ("0"/"1"), ENTRIESREAD ("" when
+    //    absent or -1)], ["SETID", group, id or "$", ENTRIESREAD],
+    //   ["DESTROY", group], ["CREATECONSUMER", group, consumer],
+    //   ["DELCONSUMER", group, consumer]. int_value is the reply (0/1, or the
+    //   pending count DELCONSUMER removed) or one of the sentinels below.
+    // XREADGROUP: one op per stream, as XREAD is. value = packed
+    //   [group, consumer, mode, start id, COUNT ("0" for all),
+    //    NOACK ("0"/"1")] where mode is "NEW" (the ">" ID: hand over entries
+    //   after the group's last-delivered ID and record them in the PEL),
+    //   "HISTORY" (replay this consumer's pending entries from `start id`) or
+    //   "NONE" (nothing to replay, but still a reply for this stream). The
+    //   result data is packed [id, fields, ...]; an empty `fields` is a
+    //   pending entry whose stream entry has been deleted, which Redis answers
+    //   with a null field list.
+    // XACK: value = packed [group, id, ...]; int_value is the number removed
+    //   from the pending-entry list.
+    // XPENDING: value = packed [group, "SUMMARY"] or [group, "RANGE",
+    //   min-idle, start, end, COUNT, consumer ("" for every consumer)].
+    //   Read-only. The summary result is packed [count, smallest id, greatest
+    //   id, consumer count, (name, count)...]; the range result is packed
+    //   [row count, (id, consumer, idle, delivery count)...].
+    // XCLAIM: value = packed [group, consumer, min-idle, JUSTID ("0"/"1"),
+    //   FORCE ("0"/"1"), IDLE (""), TIME (""), RETRYCOUNT (""), LASTID (""),
+    //   id, ...] -- the five option slots carry "" when the option was absent.
+    // XAUTOCLAIM: value = packed [group, consumer, min-idle, start, COUNT,
+    //   JUSTID]. The result is packed [next cursor, claimed count,
+    //   (id, fields)..., deleted count, id...]; XCLAIM's result is the same
+    //   without the cursor and the deleted list. `fields` is empty under
+    //   JUSTID, which asks for the IDs alone.
+    TXN_OP_XGROUP = 95,
+    TXN_OP_XREADGROUP = 96,
+    TXN_OP_XACK = 97,
+    TXN_OP_XPENDING = 98,
+    TXN_OP_XCLAIM = 99,
+    TXN_OP_XAUTOCLAIM = 100,
 } TxnOpCode;
 
 /**
@@ -340,6 +380,9 @@ typedef enum {
 #define TXN_STREAM_ERR_SETID_SMALLER (-4)       /* "The ID specified in XSETID is smaller than the target stream top item" */
 #define TXN_STREAM_ERR_SETID_ENTRIES_ADDED (-5) /* "The entries_added specified in XSETID is smaller than the target stream length" */
 #define TXN_STREAM_ERR_SETID_TOMBSTONE (-6)     /* "The ID specified in XSETID is smaller than the provided max_deleted_entry_id" */
+#define TXN_STREAM_ERR_NOGROUP (-7)             /* no such key or no such consumer group -> NOGROUP */
+#define TXN_STREAM_ERR_BUSYGROUP (-8)           /* "BUSYGROUP Consumer Group name already exists" */
+#define TXN_STREAM_ERR_NO_KEY_FOR_GROUP (-9)    /* XGROUP CREATE without MKSTREAM on a missing key */
 
 typedef enum {
     TXN_FLAG_NONE = 0,

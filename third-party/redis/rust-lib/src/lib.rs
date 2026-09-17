@@ -178,6 +178,12 @@ const TXN_OP_XTRIM: u32 = 91;
 const TXN_OP_XSETID: u32 = 92;
 const TXN_OP_XINFO: u32 = 93;
 const TXN_OP_XRESTORE: u32 = 94;
+const TXN_OP_XGROUP: u32 = 95;
+const TXN_OP_XREADGROUP: u32 = 96;
+const TXN_OP_XACK: u32 = 97;
+const TXN_OP_XPENDING: u32 = 98;
+const TXN_OP_XCLAIM: u32 = 99;
+const TXN_OP_XAUTOCLAIM: u32 = 100;
 
 // Command-level failures a stream op reports in int_value; see the
 // TXN_STREAM_ERR_* block in include/transaction_ffi.h.
@@ -187,10 +193,15 @@ const TXN_STREAM_ERR_NO_SUCH_KEY: i64 = -3;
 const TXN_STREAM_ERR_SETID_SMALLER: i64 = -4;
 const TXN_STREAM_ERR_SETID_ENTRIES_ADDED: i64 = -5;
 const TXN_STREAM_ERR_SETID_TOMBSTONE: i64 = -6;
+const TXN_STREAM_ERR_NOGROUP: i64 = -7;
+const TXN_STREAM_ERR_BUSYGROUP: i64 = -8;
+const TXN_STREAM_ERR_NO_KEY_FOR_GROUP: i64 = -9;
 
 // Which XINFO reply shape a parsed command wants, carried in `restore_kind`.
 const STREAM_XINFO_STREAM: u8 = 0;
 const STREAM_XINFO_STREAM_FULL: u8 = 1;
+const STREAM_XINFO_GROUPS: u8 = 2;
+const STREAM_XINFO_CONSUMERS: u8 = 3;
 const STREAM_XINFO_HELP: u8 = 4;
 
 /// Redis stores a hash field's expiration in 46 bits of absolute Unix
@@ -843,6 +854,12 @@ enum OpCode {
     XSetId = 210,
     XInfo = 211,
     XRead = 212,
+    XGroup = 213,
+    XReadGroup = 214,
+    XAck = 215,
+    XPending = 216,
+    XClaim = 217,
+    XAutoClaim = 218,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -1076,15 +1093,40 @@ impl WorkerWake {
     }
 }
 
+/// Blocked commands fall into two classes, and only one of them needs a queue.
+/// A list or sorted-set pop hands one element to exactly one waiter, so those
+/// take their turns; a stream read takes nothing away, so several readers can
+/// be served from the same entries. A key holds one type at a time, so the two
+/// classes never compete for the same data -- and queueing them together lets a
+/// pop that can never be served (the key became a stream) hold the front
+/// forever and starve every reader behind it.
+fn blocked_command_class(op: OpCode) -> u8 {
+    match op {
+        OpCode::XRead | OpCode::XReadGroup => 1,
+        _ => 0,
+    }
+}
+
 #[derive(Default)]
 struct BlockedClientRegistry {
     key_queues: HashMap<Bytes, VecDeque<usize>>,
     client_keys: HashMap<usize, Vec<Bytes>>,
+    client_class: HashMap<usize, u8>,
+    /// The blocked clients whose command needs the key to exist before it can
+    /// be served, rather than merely to hold something. XREADGROUP is the only
+    /// one: a missing key or group answers NOGROUP instead of waiting. Redis
+    /// counts the keys they wait on separately, in INFO clients.
+    nokey_clients: HashSet<usize>,
 }
 
 impl BlockedClientRegistry {
     fn register(&mut self, client_id: usize, cmd: &Command) {
         self.unregister(client_id);
+        self.client_class
+            .insert(client_id, blocked_command_class(cmd.op));
+        if cmd.op == OpCode::XReadGroup {
+            self.nokey_clients.insert(client_id);
+        }
         let mut seen = HashSet::new();
         let keys: Vec<Bytes> = cmd
             .keys
@@ -1102,6 +1144,8 @@ impl BlockedClientRegistry {
     }
 
     fn unregister(&mut self, client_id: usize) {
+        self.nokey_clients.remove(&client_id);
+        self.client_class.remove(&client_id);
         let Some(keys) = self.client_keys.remove(&client_id) else {
             return;
         };
@@ -1118,50 +1162,79 @@ impl BlockedClientRegistry {
         }
     }
 
+    fn class_of(&self, client_id: usize) -> u8 {
+        self.client_class.get(&client_id).copied().unwrap_or(0)
+    }
+
+    /// The first client of `class` waiting on `key`, which is the one whose
+    /// turn it is among the waiters it actually competes with.
+    fn front_of_class(&self, key: &Bytes, class: u8) -> Option<usize> {
+        self.key_queues
+            .get(key)?
+            .iter()
+            .copied()
+            .find(|client_id| self.class_of(*client_id) == class)
+    }
+
+    /// How many keys have a blocked client waiting on them, and how many of
+    /// those have one waiting for the key itself to appear.
+    fn blocking_key_counts(&self) -> (usize, usize) {
+        let on_nokey = self
+            .key_queues
+            .iter()
+            .filter(|(_, queue)| {
+                queue
+                    .iter()
+                    .any(|client_id| self.nokey_clients.contains(client_id))
+            })
+            .count();
+        (self.key_queues.len(), on_nokey)
+    }
+
     fn has_turn(&self, client_id: usize) -> bool {
         let Some(keys) = self.client_keys.get(&client_id) else {
             return true;
         };
+        let class = self.class_of(client_id);
         keys.is_empty()
-            || keys.iter().any(|key| {
-                self.key_queues
-                    .get(key)
-                    .and_then(VecDeque::front)
-                    .is_some_and(|queued_id| *queued_id == client_id)
-            })
+            || keys
+                .iter()
+                .any(|key| self.front_of_class(key, class) == Some(client_id))
     }
 
-    fn fronts_for_keys(&self, keys: &[Bytes]) -> Vec<(Bytes, usize)> {
+    /// One entry per key and class, so a writer waits for every kind of waiter
+    /// on the key it just changed, not only the first one registered.
+    fn fronts_for_keys(&self, keys: &[Bytes]) -> Vec<(Bytes, u8, usize)> {
         let mut seen = HashSet::new();
-        keys.iter()
-            .filter(|key| seen.insert((*key).clone()))
-            .filter_map(|key| {
-                self.key_queues
-                    .get(key)
-                    .and_then(VecDeque::front)
-                    .map(|client_id| (key.clone(), *client_id))
-            })
-            .collect()
+        let mut fronts = Vec::new();
+        for key in keys {
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            for class in [0u8, 1u8] {
+                if let Some(front) = self.front_of_class(key, class) {
+                    fronts.push((key.clone(), class, front));
+                }
+            }
+        }
+        fronts
     }
 
     fn eligible_keys(&self, client_id: usize, keys: &[Bytes]) -> Vec<Bytes> {
+        let class = self.class_of(client_id);
         keys.iter()
             .filter(|key| {
-                self.key_queues
-                    .get(*key)
-                    .and_then(VecDeque::front)
-                    .is_none_or(|queued_id| *queued_id == client_id)
+                self.front_of_class(key, class)
+                    .is_none_or(|front| front == client_id)
             })
             .cloned()
             .collect()
     }
 
-    fn fronts_changed(&self, expected: &[(Bytes, usize)]) -> bool {
-        expected.iter().all(|(key, client_id)| {
-            self.key_queues
-                .get(key)
-                .and_then(VecDeque::front)
-                .is_none_or(|current| current != client_id)
+    fn fronts_changed(&self, expected: &[(Bytes, u8, usize)]) -> bool {
+        expected.iter().all(|(key, class, client_id)| {
+            self.front_of_class(key, *class)
+                .is_none_or(|current| current != *client_id)
         })
     }
 }
@@ -1185,6 +1258,14 @@ fn unregister_blocked_client(client_id: usize) {
     }
 }
 
+fn blocking_key_counts() -> (usize, usize) {
+    let (registry, _) = blocked_registry();
+    registry
+        .lock()
+        .map(|registry| registry.blocking_key_counts())
+        .unwrap_or((0, 0))
+}
+
 fn blocked_client_has_turn(client_id: usize) -> bool {
     let (registry, _) = blocked_registry();
     registry
@@ -1201,7 +1282,7 @@ fn eligible_blocked_keys(client_id: usize, keys: &[Bytes]) -> Vec<Bytes> {
         .unwrap_or_else(|_| keys.to_vec())
 }
 
-fn blocked_fronts_for_keys(keys: &[Bytes]) -> Vec<(Bytes, usize)> {
+fn blocked_fronts_for_keys(keys: &[Bytes]) -> Vec<(Bytes, u8, usize)> {
     let (registry, _) = blocked_registry();
     registry
         .lock()
@@ -1209,7 +1290,7 @@ fn blocked_fronts_for_keys(keys: &[Bytes]) -> Vec<(Bytes, usize)> {
         .unwrap_or_default()
 }
 
-fn wait_for_blocked_fronts(expected: &[(Bytes, usize)], timeout: Duration) {
+fn wait_for_blocked_fronts(expected: &[(Bytes, u8, usize)], timeout: Duration) {
     if expected.is_empty() {
         return;
     }
@@ -2022,6 +2103,18 @@ fn parse_opcode(name: &[u8]) -> Option<OpCode> {
         Some(OpCode::XInfo)
     } else if ascii_eq_ci(name, b"XREAD") {
         Some(OpCode::XRead)
+    } else if ascii_eq_ci(name, b"XGROUP") {
+        Some(OpCode::XGroup)
+    } else if ascii_eq_ci(name, b"XREADGROUP") {
+        Some(OpCode::XReadGroup)
+    } else if ascii_eq_ci(name, b"XACK") {
+        Some(OpCode::XAck)
+    } else if ascii_eq_ci(name, b"XPENDING") {
+        Some(OpCode::XPending)
+    } else if ascii_eq_ci(name, b"XCLAIM") {
+        Some(OpCode::XClaim)
+    } else if ascii_eq_ci(name, b"XAUTOCLAIM") {
+        Some(OpCode::XAutoClaim)
     } else if ascii_eq_ci(name, b"GEOSEARCH")
         || ascii_eq_ci(name, b"GEORADIUS")
         || ascii_eq_ci(name, b"GEORADIUS_RO")
@@ -4170,7 +4263,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             if parts.len() == 6 {
                 let option = part_to_bytes(&parts[4])?;
                 if !ascii_eq_ci(option.as_ref(), b"COUNT") {
-                    return Err(ParseError::Protocol("syntax error"));
+                    return Err(ParseError::Error("syntax error"));
                 }
                 count = parse_i64_error_arg(
                     part_to_bytes(&parts[5])?.as_ref(),
@@ -4198,12 +4291,18 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             ];
             Ok(cmd)
         }
-        OpCode::XRead => {
+        OpCode::XRead | OpCode::XReadGroup => {
+            let group_form = op == OpCode::XReadGroup;
+            let name = if group_form { "xreadgroup" } else { "xread" };
             if parts.len() < 4 {
-                return Err(wrong_arity("xread"));
+                return Err(wrong_arity(name));
             }
             let mut count = 0i64;
             let mut block_ms = -1i64;
+            let mut noack = false;
+            let mut group = Bytes::new();
+            let mut consumer = Bytes::new();
+            let mut have_group = false;
             let mut index = 1usize;
             let mut streams_at = None;
             while index < parts.len() {
@@ -4226,22 +4325,54 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                         return Err(ParseError::Error("timeout is negative"));
                     }
                     index += 2;
+                } else if ascii_eq_ci(arg.as_ref(), b"NOACK") {
+                    if !group_form {
+                        return Err(ParseError::Error(
+                            "The NOACK option is only supported by XREADGROUP. You called \
+                             XREAD instead.",
+                        ));
+                    }
+                    noack = true;
+                    index += 1;
+                } else if ascii_eq_ci(arg.as_ref(), b"GROUP") && index + 2 < parts.len() {
+                    if !group_form {
+                        return Err(ParseError::Error(
+                            "The GROUP option is only supported by XREADGROUP. You called \
+                             XREAD instead.",
+                        ));
+                    }
+                    group = part_to_bytes(&parts[index + 1])?;
+                    consumer = part_to_bytes(&parts[index + 2])?;
+                    have_group = true;
+                    index += 3;
                 } else if ascii_eq_ci(arg.as_ref(), b"STREAMS") {
                     streams_at = Some(index + 1);
                     break;
                 } else {
-                    return Err(ParseError::Protocol("syntax error"));
+                    return Err(ParseError::Error("syntax error"));
                 }
             }
+            if group_form && !have_group {
+                return Err(ParseError::Error(
+                    "Missing GROUP keyword or consumer/group name in XREADGROUP context",
+                ));
+            }
             let Some(streams_at) = streams_at else {
-                return Err(ParseError::Protocol("syntax error"));
+                return Err(ParseError::Error("syntax error"));
             };
             let rest = parts.len() - streams_at;
             if rest == 0 || rest % 2 != 0 {
-                return Err(ParseError::Error(
-                    "Unbalanced 'xread' list of streams: for each stream key an ID or '$' \
-                     must be specified.",
-                ));
+                return Err(if group_form {
+                    ParseError::Error(
+                        "Unbalanced 'xreadgroup' list of streams: for each stream key an ID \
+                         or '>' must be specified.",
+                    )
+                } else {
+                    ParseError::Error(
+                        "Unbalanced 'xread' list of streams: for each stream key an ID or '$' \
+                         must be specified.",
+                    )
+                });
             }
             let stream_count = rest / 2;
             let mut cmd = Command::new(
@@ -4255,24 +4386,378 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 let key = validate_user_key(&key)?;
                 cmd.keys.push(key);
             }
-            // One ID spec per key, in the same order. "$" and "+" name a
-            // position rather than an entry and are resolved once, when the
-            // command arrives; everything else is normalized here.
+            // The three fixed items every stream read carries, empty for
+            // XREAD, then one ID spec per key in the same order as the keys.
+            cmd.values.push(group);
+            cmd.values.push(consumer);
+            cmd.values.push(stream_bool_arg(noack));
             for part in &parts[streams_at + stream_count..] {
                 let raw = part_to_bytes(part)?;
-                if raw.as_ref() == b"$" || raw.as_ref() == b"+" {
+                if raw.as_ref() == b">" {
+                    if !group_form {
+                        return Err(ParseError::Error(
+                            "The > ID can be specified only when calling XREADGROUP using the \
+                             GROUP <group> <consumer> option.",
+                        ));
+                    }
                     cmd.values.push(raw);
-                } else if raw.as_ref() == b">" {
-                    return Err(ParseError::Error(
-                        "The > ID can be specified only when calling XREADGROUP using the \
-                         GROUP <group> <consumer> option.",
-                    ));
+                } else if raw.as_ref() == b"$" {
+                    if group_form {
+                        return Err(ParseError::Error(
+                            "The $ ID is meaningless in the context of XREADGROUP: you want \
+                             to read the history of this consumer by specifying a proper ID, \
+                             or use the > ID to get new messages. The $ ID would just return \
+                             an empty result set.",
+                        ));
+                    }
+                    cmd.values.push(raw);
+                } else if raw.as_ref() == b"+" && !group_form {
+                    cmd.values.push(raw);
                 } else {
                     cmd.values.push(parse_stream_id_strict(raw.as_ref(), 0)?.text());
                 }
             }
             cmd.scan_count = count;
             cmd.expire_at_ms = block_ms;
+            Ok(cmd)
+        }
+        OpCode::XGroup => {
+            if parts.len() < 2 {
+                return Err(wrong_arity("xgroup"));
+            }
+            let subcommand = part_to_bytes(&parts[1])?;
+            let args = command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?;
+            if ascii_eq_ci(subcommand.as_ref(), b"HELP") {
+                if parts.len() != 2 {
+                    return Err(wrong_arity("xgroup|help"));
+                }
+                let mut cmd = Command::new(op, Vec::new(), None, args);
+                cmd.restore_kind = STREAM_XGROUP_HELP;
+                return Ok(cmd);
+            }
+            let (kind, canonical, min_parts) = if ascii_eq_ci(subcommand.as_ref(), b"CREATE") {
+                (STREAM_XGROUP_CREATE, "CREATE", 5)
+            } else if ascii_eq_ci(subcommand.as_ref(), b"SETID") {
+                (STREAM_XGROUP_SETID, "SETID", 5)
+            } else if ascii_eq_ci(subcommand.as_ref(), b"DESTROY") {
+                (STREAM_XGROUP_DESTROY, "DESTROY", 4)
+            } else if ascii_eq_ci(subcommand.as_ref(), b"CREATECONSUMER") {
+                (STREAM_XGROUP_CREATECONSUMER, "CREATECONSUMER", 5)
+            } else if ascii_eq_ci(subcommand.as_ref(), b"DELCONSUMER") {
+                (STREAM_XGROUP_DELCONSUMER, "DELCONSUMER", 5)
+            } else {
+                return Err(ParseError::Owned(format!(
+                    "Unknown XGROUP subcommand or wrong number of arguments for '{}'",
+                    String::from_utf8_lossy(subcommand.as_ref())
+                )));
+            };
+            if parts.len() < min_parts {
+                return Err(wrong_arity("xgroup"));
+            }
+            let key = part_to_bytes(&parts[2])?;
+            let key = validate_user_key(&key)?;
+            let group = part_to_bytes(&parts[3])?;
+            let mut cmd = Command::new(op, vec![key], None, args);
+            cmd.restore_kind = kind;
+            cmd.values.push(Bytes::from_static(canonical.as_bytes()));
+            cmd.values.push(group);
+            match kind {
+                STREAM_XGROUP_CREATE | STREAM_XGROUP_SETID => {
+                    let raw = part_to_bytes(&parts[4])?;
+                    // XGROUP takes "$" for "wherever the stream is now", and
+                    // reads every other ID loosely, so `-` is 0-0.
+                    cmd.values.push(if raw.as_ref() == b"$" {
+                        raw
+                    } else {
+                        parse_stream_id_loose(raw.as_ref(), 0)?.text()
+                    });
+                    let mut mkstream = false;
+                    let mut entries_read = Bytes::new();
+                    let mut index = 5usize;
+                    while index < parts.len() {
+                        let arg = part_to_bytes(&parts[index])?;
+                        if kind == STREAM_XGROUP_CREATE
+                            && ascii_eq_ci(arg.as_ref(), b"MKSTREAM")
+                        {
+                            mkstream = true;
+                            index += 1;
+                        } else if ascii_eq_ci(arg.as_ref(), b"ENTRIESREAD")
+                            && index + 1 < parts.len()
+                        {
+                            let value = parse_i64_error_arg(
+                                part_to_bytes(&parts[index + 1])?.as_ref(),
+                                "value is not an integer or out of range",
+                            )?;
+                            if value < -1 {
+                                return Err(ParseError::Error(
+                                    "value for ENTRIESREAD must be positive or -1",
+                                ));
+                            }
+                            // -1 is Redis's "not known", which the executor
+                            // spells as an absent value.
+                            if value >= 0 {
+                                entries_read = Bytes::from(value.to_string());
+                            }
+                            index += 2;
+                        } else {
+                            return Err(ParseError::Error("syntax error"));
+                        }
+                    }
+                    if kind == STREAM_XGROUP_CREATE {
+                        cmd.values.push(stream_bool_arg(mkstream));
+                    }
+                    cmd.values.push(entries_read);
+                }
+                STREAM_XGROUP_DESTROY => {
+                    if parts.len() != 4 {
+                        return Err(wrong_arity("xgroup"));
+                    }
+                }
+                _ => {
+                    if parts.len() != 5 {
+                        return Err(wrong_arity("xgroup"));
+                    }
+                    cmd.values.push(part_to_bytes(&parts[4])?);
+                }
+            }
+            Ok(cmd)
+        }
+        OpCode::XAck => {
+            if parts.len() < 4 {
+                return Err(wrong_arity("xack"));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            let key = validate_user_key(&key)?;
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values.push(part_to_bytes(&parts[2])?);
+            for part in &parts[3..] {
+                cmd.values
+                    .push(parse_stream_id_strict(part_to_bytes(part)?.as_ref(), 0)?.text());
+            }
+            Ok(cmd)
+        }
+        OpCode::XPending => {
+            // XPENDING key group, or the range form with an optional IDLE
+            // filter in front of it and an optional consumer after it.
+            if !matches!(parts.len(), 3 | 6 | 7 | 8 | 9) {
+                return Err(if parts.len() < 3 {
+                    wrong_arity("xpending")
+                } else {
+                    ParseError::Error("syntax error")
+                });
+            }
+            let key = part_to_bytes(&parts[1])?;
+            let key = validate_user_key(&key)?;
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values.push(part_to_bytes(&parts[2])?);
+            if parts.len() == 3 {
+                cmd.values.push(Bytes::from_static(b"SUMMARY"));
+                cmd.restore_kind = STREAM_XPENDING_SUMMARY;
+                return Ok(cmd);
+            }
+            let mut index = 3usize;
+            let mut min_idle = 0i64;
+            if ascii_eq_ci(part_to_bytes(&parts[3])?.as_ref(), b"IDLE") {
+                if parts.len() < 8 {
+                    return Err(ParseError::Error("syntax error"));
+                }
+                min_idle = parse_i64_error_arg(
+                    part_to_bytes(&parts[4])?.as_ref(),
+                    "value is not an integer or out of range",
+                )?;
+                if min_idle < 0 {
+                    min_idle = 0;
+                }
+                index = 5;
+            } else if parts.len() > 7 {
+                return Err(ParseError::Error("syntax error"));
+            }
+            let start = parse_stream_range_start(part_to_bytes(&parts[index])?.as_ref())?;
+            let end = parse_stream_range_end(part_to_bytes(&parts[index + 1])?.as_ref())?;
+            let mut count = parse_i64_error_arg(
+                part_to_bytes(&parts[index + 2])?.as_ref(),
+                "value is not an integer or out of range",
+            )?;
+            if count < 0 {
+                count = 0;
+            }
+            let consumer = if parts.len() == index + 4 {
+                part_to_bytes(&parts[index + 3])?
+            } else if parts.len() == index + 3 {
+                Bytes::new()
+            } else {
+                return Err(ParseError::Error("syntax error"));
+            };
+            cmd.values.push(Bytes::from_static(b"RANGE"));
+            cmd.values.push(Bytes::from(min_idle.to_string()));
+            cmd.values.push(start.text());
+            cmd.values.push(end.text());
+            cmd.values.push(Bytes::from(count.to_string()));
+            cmd.values.push(consumer);
+            cmd.restore_kind = STREAM_XPENDING_RANGE;
+            Ok(cmd)
+        }
+        OpCode::XClaim => {
+            if parts.len() < 6 {
+                return Err(wrong_arity("xclaim"));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            let key = validate_user_key(&key)?;
+            let group = part_to_bytes(&parts[2])?;
+            let consumer = part_to_bytes(&parts[3])?;
+            let mut min_idle = parse_i64_error_arg(
+                part_to_bytes(&parts[4])?.as_ref(),
+                "Invalid min-idle-time argument for XCLAIM",
+            )?;
+            if min_idle < 0 {
+                min_idle = 0;
+            }
+            // The IDs run until the first argument that is not one; whatever
+            // follows is options, as Redis's own scan does.
+            let mut index = 5usize;
+            let mut ids = Vec::new();
+            while index < parts.len() {
+                let raw = part_to_bytes(&parts[index])?;
+                match parse_stream_id_generic(raw.as_ref(), 0, true, false) {
+                    Some((id, _)) => {
+                        ids.push(id.text());
+                        index += 1;
+                    }
+                    None => break,
+                }
+            }
+            if ids.is_empty() {
+                return Err(ParseError::Error(STREAM_ID_ERROR));
+            }
+            let mut justid = false;
+            let mut force = false;
+            let mut idle = Bytes::new();
+            let mut time = Bytes::new();
+            let mut retrycount = Bytes::new();
+            let mut last_id = Bytes::new();
+            while index < parts.len() {
+                let arg = part_to_bytes(&parts[index])?;
+                if ascii_eq_ci(arg.as_ref(), b"JUSTID") {
+                    justid = true;
+                    index += 1;
+                } else if ascii_eq_ci(arg.as_ref(), b"FORCE") {
+                    force = true;
+                    index += 1;
+                } else if ascii_eq_ci(arg.as_ref(), b"IDLE") && index + 1 < parts.len() {
+                    idle = Bytes::from(
+                        parse_i64_error_arg(
+                            part_to_bytes(&parts[index + 1])?.as_ref(),
+                            "Invalid IDLE option argument for XCLAIM",
+                        )?
+                        .to_string(),
+                    );
+                    index += 2;
+                } else if ascii_eq_ci(arg.as_ref(), b"TIME") && index + 1 < parts.len() {
+                    time = Bytes::from(
+                        parse_i64_error_arg(
+                            part_to_bytes(&parts[index + 1])?.as_ref(),
+                            "Invalid TIME option argument for XCLAIM",
+                        )?
+                        .to_string(),
+                    );
+                    index += 2;
+                } else if ascii_eq_ci(arg.as_ref(), b"RETRYCOUNT") && index + 1 < parts.len() {
+                    let value = parse_i64_error_arg(
+                        part_to_bytes(&parts[index + 1])?.as_ref(),
+                        "Invalid RETRYCOUNT option argument for XCLAIM",
+                    )?;
+                    retrycount = Bytes::from(value.max(0).to_string());
+                    index += 2;
+                } else if ascii_eq_ci(arg.as_ref(), b"LASTID") && index + 1 < parts.len() {
+                    last_id = parse_stream_id_loose(
+                        part_to_bytes(&parts[index + 1])?.as_ref(),
+                        0,
+                    )?
+                    .text();
+                    index += 2;
+                } else {
+                    return Err(ParseError::Error("syntax error"));
+                }
+            }
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values.push(group);
+            cmd.values.push(consumer);
+            cmd.values.push(Bytes::from(min_idle.to_string()));
+            cmd.values.push(stream_bool_arg(justid));
+            cmd.values.push(stream_bool_arg(force));
+            cmd.values.push(idle);
+            cmd.values.push(time);
+            cmd.values.push(retrycount);
+            cmd.values.push(last_id);
+            cmd.values.extend(ids);
+            Ok(cmd)
+        }
+        OpCode::XAutoClaim => {
+            if parts.len() < 6 {
+                return Err(wrong_arity("xautoclaim"));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            let key = validate_user_key(&key)?;
+            let group = part_to_bytes(&parts[2])?;
+            let consumer = part_to_bytes(&parts[3])?;
+            let mut min_idle = parse_i64_error_arg(
+                part_to_bytes(&parts[4])?.as_ref(),
+                "Invalid min-idle-time argument for XAUTOCLAIM",
+            )?;
+            if min_idle < 0 {
+                min_idle = 0;
+            }
+            let start = parse_stream_range_start(part_to_bytes(&parts[5])?.as_ref())?;
+            let mut count = 100i64;
+            let mut justid = false;
+            let mut index = 6usize;
+            while index < parts.len() {
+                let arg = part_to_bytes(&parts[index])?;
+                if ascii_eq_ci(arg.as_ref(), b"COUNT") && index + 1 < parts.len() {
+                    count = parse_i64_error_arg(
+                        part_to_bytes(&parts[index + 1])?.as_ref(),
+                        "COUNT must be > 0",
+                    )?;
+                    // Redis refuses a count that its attempt budget
+                    // (count * 10 entries) could not be expressed in.
+                    if count < 1 || count > i64::MAX / 16 {
+                        return Err(ParseError::Error("COUNT must be > 0"));
+                    }
+                    index += 2;
+                } else if ascii_eq_ci(arg.as_ref(), b"JUSTID") {
+                    justid = true;
+                    index += 1;
+                } else {
+                    return Err(ParseError::Error("syntax error"));
+                }
+            }
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values.push(group);
+            cmd.values.push(consumer);
+            cmd.values.push(Bytes::from(min_idle.to_string()));
+            cmd.values.push(start.text());
+            cmd.values.push(Bytes::from(count.to_string()));
+            cmd.values.push(stream_bool_arg(justid));
             Ok(cmd)
         }
         OpCode::XLen => {
@@ -4315,7 +4800,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             let mut trim = StreamTrimArgs::default();
             let index = parse_stream_trim_args(&parts, 2, &mut trim)?;
             if index != parts.len() {
-                return Err(ParseError::Protocol("syntax error"));
+                return Err(ParseError::Error("syntax error"));
             }
             let mut cmd = Command::new(
                 op,
@@ -4354,7 +4839,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                             .text();
                     index += 2;
                 } else {
-                    return Err(ParseError::Protocol("syntax error"));
+                    return Err(ParseError::Error("syntax error"));
                 }
             }
             let mut cmd = Command::new(
@@ -4380,6 +4865,36 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 cmd.restore_kind = STREAM_XINFO_HELP;
                 return Ok(cmd);
             }
+            if ascii_eq_ci(subcommand.as_ref(), b"GROUPS")
+                || ascii_eq_ci(subcommand.as_ref(), b"CONSUMERS")
+            {
+                let groups = ascii_eq_ci(subcommand.as_ref(), b"GROUPS");
+                let wanted = if groups { 3 } else { 4 };
+                if parts.len() != wanted {
+                    return Err(wrong_arity(if groups {
+                        "xinfo|groups"
+                    } else {
+                        "xinfo|consumers"
+                    }));
+                }
+                let key = part_to_bytes(&parts[2])?;
+                let key = validate_user_key(&key)?;
+                let mut cmd = Command::new(op, vec![key], None, args);
+                cmd.restore_kind = if groups {
+                    STREAM_XINFO_GROUPS
+                } else {
+                    STREAM_XINFO_CONSUMERS
+                };
+                cmd.values.push(Bytes::from_static(if groups {
+                    b"GROUPS"
+                } else {
+                    b"CONSUMERS"
+                }));
+                if !groups {
+                    cmd.values.push(part_to_bytes(&parts[3])?);
+                }
+                return Ok(cmd);
+            }
             if !ascii_eq_ci(subcommand.as_ref(), b"STREAM") {
                 return Err(ParseError::Owned(format!(
                     "Unknown XINFO subcommand or wrong number of arguments for '{}'",
@@ -4397,14 +4912,14 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
             if index < parts.len() {
                 let option = part_to_bytes(&parts[index])?;
                 if !ascii_eq_ci(option.as_ref(), b"FULL") {
-                    return Err(ParseError::Protocol("syntax error"));
+                    return Err(ParseError::Error("syntax error"));
                 }
                 full = true;
                 index += 1;
                 if index + 1 < parts.len() {
                     let option = part_to_bytes(&parts[index])?;
                     if !ascii_eq_ci(option.as_ref(), b"COUNT") {
-                        return Err(ParseError::Protocol("syntax error"));
+                        return Err(ParseError::Error("syntax error"));
                     }
                     count = parse_i64_error_arg(
                         part_to_bytes(&parts[index + 1])?.as_ref(),
@@ -4417,7 +4932,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 }
             }
             if index != parts.len() {
-                return Err(ParseError::Protocol("syntax error"));
+                return Err(ParseError::Error("syntax error"));
             }
             let mut cmd = Command::new(op, vec![key], None, args);
             cmd.restore_kind = if full {
@@ -6877,6 +7392,277 @@ fn write_xinfo_stream_full<W: Write>(
     Ok(())
 }
 
+
+/// Which XGROUP subcommand a parsed command carries, in `restore_kind`, and
+/// which XPENDING form it asked for.
+const STREAM_XGROUP_CREATE: u8 = 0;
+const STREAM_XGROUP_SETID: u8 = 1;
+const STREAM_XGROUP_DESTROY: u8 = 2;
+const STREAM_XGROUP_CREATECONSUMER: u8 = 3;
+const STREAM_XGROUP_DELCONSUMER: u8 = 4;
+const STREAM_XGROUP_HELP: u8 = 5;
+const STREAM_XPENDING_SUMMARY: u8 = 0;
+const STREAM_XPENDING_RANGE: u8 = 1;
+
+/// `Command::values` for a stream read is three fixed items -- the consumer
+/// group, the consumer and the NOACK flag, all empty for XREAD -- followed by
+/// one ID spec per key, in the same order as the keys.
+const STREAM_READ_VALUE_PREFIX: usize = 3;
+
+/// An error whose first word is its own code, as Redis writes NOGROUP and
+/// BUSYGROUP: write_err would put ERR in front of it.
+fn write_coded_err<W: Write>(w: &mut W, message: &str) -> std::io::Result<()> {
+    w.write_all(b"-")?;
+    w.write_all(message.as_bytes())?;
+    w.write_all(b"\r\n")
+}
+
+/// The Redis-visible name of one of a command's keys, for an error message
+/// that quotes it back.
+fn stream_reply_key_name(cmd: &Command, offset: usize) -> &[u8] {
+    match cmd.keys.get(offset) {
+        Some(key) => strip_db_key(current_db(), key),
+        None => &[],
+    }
+}
+
+/// The NOGROUP text XPENDING, XCLAIM and XAUTOCLAIM share: they all take the
+/// group as the first packed value and act on a single key.
+fn write_stream_nogroup<W: Write>(cmd: &Command, writer: &mut W) -> std::io::Result<()> {
+    write_coded_err(
+        writer,
+        &format!(
+            "NOGROUP No such key '{}' or consumer group '{}'",
+            String::from_utf8_lossy(stream_reply_key_name(cmd, 0)),
+            String::from_utf8_lossy(cmd.values.first().map(|g| g.as_ref()).unwrap_or(b"")),
+        ),
+    )
+}
+
+/// The `id, fields` pairs of an XREADGROUP result. Unlike a stream read, it
+/// carries no leading last-generated ID: a consumer group's position is its
+/// own, and the stream's says nothing about it.
+fn stream_group_entries(result: &TxnOpResult) -> Option<Vec<(Bytes, Bytes)>> {
+    let items = parse_list_payload(result_value_bytes(result))?;
+    if items.len() % 2 != 0 {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(items.len() / 2);
+    for pair in items.chunks_exact(2) {
+        entries.push((Bytes::from(pair[0].clone()), Bytes::from(pair[1].clone())));
+    }
+    Some(entries)
+}
+
+/// Whether a claim was asked for the IDs alone.
+fn stream_claim_justid(cmd: &Command) -> bool {
+    let index = if cmd.op == OpCode::XAutoClaim { 5 } else { 3 };
+    cmd.values
+        .get(index)
+        .map(|value| value.as_ref() == b"1")
+        .unwrap_or(false)
+}
+
+/// XPENDING's summary form: how many entries are pending, the ends of their ID
+/// range, and who holds how many.
+fn write_xpending_summary<W: Write>(
+    writer: &mut W,
+    items: &[Vec<u8>],
+    protocol_version: u8,
+) -> std::io::Result<()> {
+    if items.len() < 4 {
+        return write_err(writer, "operation failed");
+    }
+    let pending = parse_i64_lossy(&items[0]).unwrap_or(0);
+    write_array_header(writer, 4)?;
+    write_integer(writer, pending)?;
+    if pending == 0 {
+        write_null(writer, protocol_version)?;
+        write_null(writer, protocol_version)?;
+        if protocol_version >= 3 {
+            write_null(writer, protocol_version)?;
+        } else {
+            writer.write_all(b"*-1\r\n")?;
+        }
+        return Ok(());
+    }
+    write_bulk(writer, &items[1])?;
+    write_bulk(writer, &items[2])?;
+    let consumers = parse_i64_lossy(&items[3]).unwrap_or(0).max(0) as usize;
+    write_array_header(writer, consumers)?;
+    for index in 0..consumers {
+        let at = 4 + index * 2;
+        if at + 1 >= items.len() {
+            break;
+        }
+        write_array_header(writer, 2)?;
+        write_bulk(writer, &items[at])?;
+        // Redis reports each consumer's share as a string, not an integer.
+        write_bulk(writer, &items[at + 1])?;
+    }
+    Ok(())
+}
+
+/// XPENDING's extended form: one row per pending entry.
+fn write_xpending_range<W: Write>(writer: &mut W, items: &[Vec<u8>]) -> std::io::Result<()> {
+    if items.is_empty() {
+        return write_err(writer, "operation failed");
+    }
+    let rows = parse_i64_lossy(&items[0]).unwrap_or(0).max(0) as usize;
+    write_array_header(writer, rows)?;
+    for index in 0..rows {
+        let at = 1 + index * 4;
+        if at + 3 >= items.len() {
+            break;
+        }
+        write_array_header(writer, 4)?;
+        write_bulk(writer, &items[at])?;
+        write_bulk(writer, &items[at + 1])?;
+        write_integer(writer, parse_i64_lossy(&items[at + 2]).unwrap_or(0))?;
+        write_integer(writer, parse_i64_lossy(&items[at + 3]).unwrap_or(0))?;
+    }
+    Ok(())
+}
+
+/// XCLAIM's reply, and XAUTOCLAIM's, which wraps the same claimed list between
+/// the next cursor and the IDs it dropped from the pending-entry list.
+fn write_xclaim_result<W: Write>(
+    writer: &mut W,
+    items: &[Vec<u8>],
+    autoclaim: bool,
+    justid: bool,
+    protocol_version: u8,
+) -> std::io::Result<()> {
+    let mut at = 0usize;
+    if autoclaim {
+        if items.is_empty() {
+            return write_err(writer, "operation failed");
+        }
+        write_array_header(writer, 3)?;
+        write_bulk(writer, &items[0])?;
+        at = 1;
+    }
+    if at >= items.len() {
+        return write_err(writer, "operation failed");
+    }
+    let claimed = parse_i64_lossy(&items[at]).unwrap_or(0).max(0) as usize;
+    at += 1;
+    write_array_header(writer, claimed)?;
+    for _ in 0..claimed {
+        if at + 1 >= items.len() {
+            break;
+        }
+        if justid {
+            write_bulk(writer, &items[at])?;
+        } else {
+            write_stream_entry(writer, &items[at], &items[at + 1], protocol_version)?;
+        }
+        at += 2;
+    }
+    if !autoclaim {
+        return Ok(());
+    }
+    let deleted = items
+        .get(at)
+        .and_then(|item| parse_i64_lossy(item))
+        .unwrap_or(0)
+        .max(0) as usize;
+    at += 1;
+    write_array_header(writer, deleted)?;
+    for _ in 0..deleted {
+        if at >= items.len() {
+            break;
+        }
+        write_bulk(writer, &items[at])?;
+        at += 1;
+    }
+    Ok(())
+}
+
+/// XINFO GROUPS: one summary row per consumer group.
+fn write_xinfo_groups<W: Write>(
+    writer: &mut W,
+    items: &[Vec<u8>],
+    protocol_version: u8,
+) -> std::io::Result<()> {
+    if items.is_empty() {
+        return write_err(writer, "operation failed");
+    }
+    let groups = parse_i64_lossy(&items[0]).unwrap_or(0).max(0) as usize;
+    write_array_header(writer, groups)?;
+    for index in 0..groups {
+        let at = 1 + index * 6;
+        if at + 5 >= items.len() {
+            break;
+        }
+        write_stream_map_header(writer, 6, protocol_version)?;
+        write_bulk(writer, b"name")?;
+        write_bulk(writer, &items[at])?;
+        write_bulk(writer, b"consumers")?;
+        write_integer(writer, parse_i64_lossy(&items[at + 1]).unwrap_or(0))?;
+        write_bulk(writer, b"pending")?;
+        write_integer(writer, parse_i64_lossy(&items[at + 2]).unwrap_or(0))?;
+        write_bulk(writer, b"last-delivered-id")?;
+        write_bulk(writer, &items[at + 3])?;
+        write_bulk(writer, b"entries-read")?;
+        write_stream_optional_count(writer, &items[at + 4], protocol_version)?;
+        write_bulk(writer, b"lag")?;
+        write_stream_optional_count(writer, &items[at + 5], protocol_version)?;
+    }
+    Ok(())
+}
+
+/// XINFO CONSUMERS: one row per consumer of one group. `inactive` is -1 for a
+/// consumer that has never been handed an entry, as Redis 7.2 reports it.
+fn write_xinfo_consumers<W: Write>(
+    writer: &mut W,
+    items: &[Vec<u8>],
+    protocol_version: u8,
+) -> std::io::Result<()> {
+    if items.is_empty() {
+        return write_err(writer, "operation failed");
+    }
+    let consumers = parse_i64_lossy(&items[0]).unwrap_or(0).max(0) as usize;
+    write_array_header(writer, consumers)?;
+    for index in 0..consumers {
+        let at = 1 + index * 4;
+        if at + 3 >= items.len() {
+            break;
+        }
+        write_stream_map_header(writer, 4, protocol_version)?;
+        write_bulk(writer, b"name")?;
+        write_bulk(writer, &items[at])?;
+        write_bulk(writer, b"pending")?;
+        write_integer(writer, parse_i64_lossy(&items[at + 1]).unwrap_or(0))?;
+        write_bulk(writer, b"idle")?;
+        write_integer(writer, parse_i64_lossy(&items[at + 2]).unwrap_or(0))?;
+        write_bulk(writer, b"inactive")?;
+        write_integer(writer, parse_i64_lossy(&items[at + 3]).unwrap_or(0))?;
+    }
+    Ok(())
+}
+
+const XGROUP_HELP: &[&str] = &[
+    "XGROUP <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+    "CREATE <key> <groupname> <id|$> [option]",
+    "    Create a new consumer group.",
+    "    Options are:",
+    "    * MKSTREAM",
+    "      Create the empty stream if it does not exist.",
+    "    * ENTRIESREAD entries-read",
+    "      Set the group's entries-read counter (internal use).",
+    "CREATECONSUMER <key> <groupname> <consumer>",
+    "    Create a new consumer in the specified group.",
+    "DELCONSUMER <key> <groupname> <consumer>",
+    "    Remove the specified consumer.",
+    "DESTROY <key> <groupname>",
+    "    Remove the specified group.",
+    "SETID <key> <groupname> <id|$> [ENTRIESREAD entries-read]",
+    "    Set the current group ID.",
+    "HELP",
+    "    Print this help.",
+];
+
 const XINFO_HELP: &[&str] = &[
     "XINFO <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
     "CONSUMERS <key> <groupname>",
@@ -8616,45 +9402,78 @@ fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)
                     group_id: 0,
                 });
             }
-            OpCode::XRead => {
-                // One TXN_OP_XRANGE op per stream, in the order the command
-                // named them, each carrying the read mode its ID spec asks for.
+            OpCode::XRead | OpCode::XReadGroup => {
+                // One op per stream, in the order the command named them, each
+                // carrying the read mode its ID spec asks for.
+                let group_form = cmd.op == OpCode::XReadGroup;
                 for (index, key) in cmd.keys.iter().enumerate() {
-                    let spec = cmd.values.get(index).cloned().unwrap_or_default();
-                    let (start, end, count, mode) = if spec.as_ref() == b"$" {
-                        // Only entries added after the call, so nothing that is
-                        // already stored can qualify.
-                        (STREAM_ID_MIN, STREAM_ID_MIN, 0, STREAM_READ_NONE)
-                    } else if spec.as_ref() == b"+" {
-                        // The last entry, whatever it is; COUNT does not apply.
-                        (STREAM_ID_MIN, STREAM_ID_MAX, 1, STREAM_READ_REVERSE)
+                    let spec = cmd
+                        .values
+                        .get(STREAM_READ_VALUE_PREFIX + index)
+                        .cloned()
+                        .unwrap_or_default();
+                    let payload = if group_form {
+                        let (mode, start) = if spec.as_ref() == b">" {
+                            (&b"NEW"[..], STREAM_ID_MIN)
+                        } else {
+                            // An explicit ID replays this consumer's pending
+                            // entries after it, so the range starts one past it.
+                            match parse_stream_id_generic(spec.as_ref(), 0, true, false)
+                                .and_then(|(id, _)| id.incr())
+                            {
+                                Some(start) => (&b"HISTORY"[..], start),
+                                None => (&b"NONE"[..], STREAM_ID_MIN),
+                            }
+                        };
+                        pack_bytes_list(&[
+                            cmd.values.first().cloned().unwrap_or_default(),
+                            cmd.values.get(1).cloned().unwrap_or_default(),
+                            Bytes::from_static(mode),
+                            start.text(),
+                            Bytes::from(cmd.scan_count.to_string()),
+                            cmd.values.get(2).cloned().unwrap_or_default(),
+                        ])
                     } else {
-                        match parse_stream_id_generic(spec.as_ref(), 0, true, false)
-                            .and_then(|(id, _)| id.incr())
-                        {
-                            // XREAD's ID is exclusive, so the range starts at
-                            // the ID after it.
-                            Some(start) => (
-                                start,
-                                STREAM_ID_MAX,
-                                cmd.scan_count,
-                                STREAM_READ_FORWARD,
-                            ),
-                            // The client named the largest ID there is: nothing
-                            // can ever follow it.
-                            None => (STREAM_ID_MIN, STREAM_ID_MIN, 0, STREAM_READ_NONE),
-                        }
+                        let (start, end, count, mode) = if spec.as_ref() == b"$" {
+                            // Only entries added after the call, so nothing
+                            // that is already stored can qualify.
+                            (STREAM_ID_MIN, STREAM_ID_MIN, 0, STREAM_READ_NONE)
+                        } else if spec.as_ref() == b"+" {
+                            // The last entry, whatever it is; COUNT does not
+                            // apply.
+                            (STREAM_ID_MIN, STREAM_ID_MAX, 1, STREAM_READ_REVERSE)
+                        } else {
+                            match parse_stream_id_generic(spec.as_ref(), 0, true, false)
+                                .and_then(|(id, _)| id.incr())
+                            {
+                                // XREAD's ID is exclusive, so the range starts
+                                // at the ID after it.
+                                Some(start) => (
+                                    start,
+                                    STREAM_ID_MAX,
+                                    cmd.scan_count,
+                                    STREAM_READ_FORWARD,
+                                ),
+                                // The client named the largest ID there is:
+                                // nothing can ever follow it.
+                                None => (STREAM_ID_MIN, STREAM_ID_MIN, 0, STREAM_READ_NONE),
+                            }
+                        };
+                        pack_bytes_list(&[
+                            start.text(),
+                            end.text(),
+                            Bytes::from(count.to_string()),
+                            Bytes::from_static(mode),
+                        ])
                     };
-                    let payload = pack_bytes_list(&[
-                        start.text(),
-                        end.text(),
-                        Bytes::from(count.to_string()),
-                        Bytes::from_static(mode),
-                    ]);
                     payloads.push(payload);
                     let payload = payloads.last().unwrap();
                     ops.push(TxnOperation {
-                        op: TXN_OP_XRANGE,
+                        op: if group_form {
+                            TXN_OP_XREADGROUP
+                        } else {
+                            TXN_OP_XRANGE
+                        },
                         key_ptr: key.as_ptr(),
                         key_len: key.len(),
                         val_ptr: payload.as_ptr(),
@@ -8664,6 +9483,39 @@ fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)
                         group_id: 0,
                     });
                 }
+            }
+            OpCode::XGroup
+            | OpCode::XAck
+            | OpCode::XPending
+            | OpCode::XClaim
+            | OpCode::XAutoClaim => {
+                if cmd.op == OpCode::XGroup && cmd.restore_kind == STREAM_XGROUP_HELP {
+                    spans.push((start, 0));
+                    continue;
+                }
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                let payload = pack_bytes_list(&cmd.values);
+                payloads.push(payload);
+                let payload = payloads.last().unwrap();
+                ops.push(TxnOperation {
+                    op: match cmd.op {
+                        OpCode::XGroup => TXN_OP_XGROUP,
+                        OpCode::XAck => TXN_OP_XACK,
+                        OpCode::XPending => TXN_OP_XPENDING,
+                        OpCode::XClaim => TXN_OP_XCLAIM,
+                        _ => TXN_OP_XAUTOCLAIM,
+                    },
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr: payload.as_ptr(),
+                    val_len: payload.len(),
+                    flags: 0,
+                    expire_at_ms: -1,
+                    group_id: 0,
+                });
             }
             OpCode::XAdd
             | OpCode::XRange
@@ -9679,6 +10531,12 @@ fn command_needs_retry(cmd: &Command) -> bool {
             | OpCode::XSetId
             | OpCode::XInfo
             | OpCode::XRead
+            | OpCode::XGroup
+            | OpCode::XReadGroup
+            | OpCode::XAck
+            | OpCode::XPending
+            | OpCode::XClaim
+            | OpCode::XAutoClaim
     )
 }
 
@@ -11043,6 +11901,13 @@ fn write_command_result<W: Write>(
         }
         return Ok(());
     }
+    if cmd.op == OpCode::XGroup && cmd.restore_kind == STREAM_XGROUP_HELP {
+        write_array_header(writer, XGROUP_HELP.len())?;
+        for line in XGROUP_HELP {
+            write_simple_string(writer, line)?;
+        }
+        return Ok(());
+    }
     if matches!(cmd.op, OpCode::ReadOnly | OpCode::ReadWrite) {
         write_cluster_readonly_reply(cluster_mode(), writer)?;
         return Ok(());
@@ -11772,6 +12637,159 @@ fn write_command_result<W: Write>(
                 }
             }
         }
+        OpCode::XGroup => {
+            let group = cmd.values.get(1).cloned().unwrap_or_default();
+            if !first.success {
+                write_wrongtype(writer)?;
+            } else {
+                match first.int_value {
+                    TXN_STREAM_ERR_NO_KEY_FOR_GROUP => write_err(
+                        writer,
+                        "The XGROUP subcommand requires the key to exist. Note that for CREATE \
+                         you may want to use the MKSTREAM option to create an empty stream \
+                         automatically.",
+                    )?,
+                    TXN_STREAM_ERR_BUSYGROUP => {
+                        write_coded_err(writer, "BUSYGROUP Consumer Group name already exists")?
+                    }
+                    TXN_STREAM_ERR_NOGROUP => write_coded_err(
+                        writer,
+                        &format!(
+                            "NOGROUP No such consumer group '{}' for key name '{}'",
+                            String::from_utf8_lossy(&group),
+                            String::from_utf8_lossy(stream_reply_key_name(cmd, 0)),
+                        ),
+                    )?,
+                    // CREATE and SETID answer OK; the other three answer a
+                    // count.
+                    _ => {
+                        if matches!(
+                            cmd.restore_kind,
+                            STREAM_XGROUP_CREATE | STREAM_XGROUP_SETID
+                        ) {
+                            write_simple_ok(writer)?;
+                        } else {
+                            write_integer(writer, first.int_value)?;
+                        }
+                    }
+                }
+            }
+        }
+        OpCode::XReadGroup => {
+            // One op per stream. A stream read with ">" is left out when it
+            // had nothing to hand over, and a reply with no stream at all is a
+            // null; a replay of the consumer's own pending entries always
+            // reports its stream, even when the replay is empty.
+            let db = current_db();
+            let group = cmd.values.first().cloned().unwrap_or_default();
+            let mut served: Vec<(usize, Vec<(Bytes, Bytes)>)> = Vec::new();
+            let mut outcome = Ok(());
+            for offset in 0..len {
+                let result = unsafe { &*response.results.add(start + offset) };
+                if !result.success {
+                    outcome = Err(None);
+                    break;
+                }
+                if result.int_value == TXN_STREAM_ERR_NOGROUP {
+                    outcome = Err(Some(offset));
+                    break;
+                }
+                let Some(entries) = stream_group_entries(result) else {
+                    outcome = Err(None);
+                    break;
+                };
+                let new_entries = cmd
+                    .values
+                    .get(STREAM_READ_VALUE_PREFIX + offset)
+                    .map(|spec| spec.as_ref() == b">")
+                    .unwrap_or(false);
+                if !new_entries || !entries.is_empty() {
+                    served.push((offset, entries));
+                }
+            }
+            match outcome {
+                Err(Some(offset)) => write_coded_err(
+                    writer,
+                    &format!(
+                        "NOGROUP No such key '{}' or consumer group '{}' in XREADGROUP with \
+                         GROUP option",
+                        String::from_utf8_lossy(stream_reply_key_name(cmd, offset)),
+                        String::from_utf8_lossy(&group),
+                    ),
+                )?,
+                Err(None) => write_wrongtype(writer)?,
+                Ok(()) => {
+                    if served.is_empty() {
+                        if protocol_version >= 3 {
+                            write_null(writer, protocol_version)?;
+                        } else {
+                            writer.write_all(b"*-1\r\n")?;
+                        }
+                    } else {
+                        if protocol_version >= 3 {
+                            write_map_header(writer, served.len())?;
+                        } else {
+                            write_array_header(writer, served.len())?;
+                        }
+                        for (offset, entries) in &served {
+                            if protocol_version < 3 {
+                                write_array_header(writer, 2)?;
+                            }
+                            let key = cmd.keys.get(*offset).cloned().unwrap_or_default();
+                            write_bulk(writer, strip_db_key(db, &key))?;
+                            write_array_header(writer, entries.len())?;
+                            for (id, fields) in entries {
+                                write_stream_entry(writer, id, fields, protocol_version)?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        OpCode::XAck => {
+            if first.success {
+                write_integer(writer, first.int_value)?;
+            } else {
+                write_wrongtype(writer)?;
+            }
+        }
+        OpCode::XPending => {
+            if !first.success {
+                write_wrongtype(writer)?;
+            } else if first.int_value == TXN_STREAM_ERR_NOGROUP {
+                write_stream_nogroup(cmd, writer)?;
+            } else {
+                match parse_list_payload(result_value_bytes(first)) {
+                    Some(items) => {
+                        if cmd.restore_kind == STREAM_XPENDING_SUMMARY {
+                            write_xpending_summary(writer, &items, protocol_version)?;
+                        } else {
+                            write_xpending_range(writer, &items)?;
+                        }
+                    }
+                    None => write_err(writer, "operation failed")?,
+                }
+            }
+        }
+        OpCode::XClaim | OpCode::XAutoClaim => {
+            let autoclaim = cmd.op == OpCode::XAutoClaim;
+            if !first.success {
+                write_wrongtype(writer)?;
+            } else if first.int_value == TXN_STREAM_ERR_NOGROUP {
+                write_stream_nogroup(cmd, writer)?;
+            } else {
+                match parse_list_payload(result_value_bytes(first)) {
+                    Some(items) => write_xclaim_result(
+                        writer,
+                        &items,
+                        autoclaim,
+                        stream_claim_justid(cmd),
+                        protocol_version,
+                    )?,
+                    None => write_err(writer, "operation failed")?,
+                }
+            }
+        }
         OpCode::XLen | OpCode::XDel | OpCode::XTrim => {
             if first.success {
                 write_integer(writer, first.int_value)?;
@@ -11806,13 +12824,29 @@ fn write_command_result<W: Write>(
                 write_wrongtype(writer)?;
             } else if first.int_value == TXN_STREAM_ERR_NO_SUCH_KEY {
                 write_err(writer, "no such key")?;
+            } else if first.int_value == TXN_STREAM_ERR_NOGROUP {
+                write_coded_err(
+                    writer,
+                    &format!(
+                        "NOGROUP No such consumer group '{}' for key name '{}'",
+                        String::from_utf8_lossy(cmd.values.get(1).map(|g| g.as_ref()).unwrap_or(b"")),
+                        String::from_utf8_lossy(stream_reply_key_name(cmd, 0)),
+                    ),
+                )?;
             } else {
                 match parse_list_payload(result_value_bytes(first)) {
                     Some(items) => {
-                        if cmd.restore_kind == STREAM_XINFO_STREAM_FULL {
-                            write_xinfo_stream_full(writer, &items, protocol_version)?;
-                        } else {
-                            write_xinfo_stream(writer, &items, protocol_version)?;
+                        match cmd.restore_kind {
+                            STREAM_XINFO_STREAM_FULL => {
+                                write_xinfo_stream_full(writer, &items, protocol_version)?
+                            }
+                            STREAM_XINFO_GROUPS => {
+                                write_xinfo_groups(writer, &items, protocol_version)?
+                            }
+                            STREAM_XINFO_CONSUMERS => {
+                                write_xinfo_consumers(writer, &items, protocol_version)?
+                            }
+                            _ => write_xinfo_stream(writer, &items, protocol_version)?,
                         }
                     }
                     None => write_err(writer, "operation failed")?,
@@ -13223,7 +14257,8 @@ fn is_blocking_list_command(op: OpCode) -> bool {
 /// which is what `expire_at_ms` carries for it (-1 for no BLOCK, 0 for
 /// "forever", otherwise the timeout in milliseconds).
 fn command_blocks(cmd: &Command) -> bool {
-    is_blocking_list_command(cmd.op) || (cmd.op == OpCode::XRead && cmd.expire_at_ms >= 0)
+    is_blocking_list_command(cmd.op)
+        || (matches!(cmd.op, OpCode::XRead | OpCode::XReadGroup) && cmd.expire_at_ms >= 0)
 }
 
 /// Fix the position that "$" and "+" name, once, when a blocking stream read
@@ -13244,6 +14279,7 @@ fn resolve_stream_read_positions(cmd: &Command) -> Option<(Command, Command)> {
     if !cmd
         .values
         .iter()
+        .skip(STREAM_READ_VALUE_PREFIX)
         .any(|spec| spec.as_ref() == b"$" || spec.as_ref() == b"+")
     {
         return None;
@@ -13289,8 +14325,8 @@ fn resolve_stream_read_positions(cmd: &Command) -> Option<(Command, Command)> {
     }
     let mut attempt = cmd.clone();
     let mut parked = cmd.clone();
-    for (index, spec) in cmd.values.iter().enumerate() {
-        let Some(last_id) = last_ids.get(index) else {
+    for (index, spec) in cmd.values.iter().enumerate().skip(STREAM_READ_VALUE_PREFIX) {
+        let Some(last_id) = last_ids.get(index - STREAM_READ_VALUE_PREFIX) else {
             continue;
         };
         if spec.as_ref() == b"$" {
@@ -13417,6 +14453,13 @@ fn is_dirty_command(op: OpCode) -> bool {
             | OpCode::XDel
             | OpCode::XTrim
             | OpCode::XSetId
+            // XREADGROUP records what it handed over, XACK and the claims move
+            // it, and XGROUP rewrites the group itself.
+            | OpCode::XGroup
+            | OpCode::XReadGroup
+            | OpCode::XAck
+            | OpCode::XClaim
+            | OpCode::XAutoClaim
     )
 }
 
@@ -16412,6 +17455,13 @@ fn append_clients_info(out: &mut String) {
     out.push_str("blocked_clients:");
     out.push_str(&BLOCKED_CLIENTS.load(Ordering::Relaxed).to_string());
     out.push_str("\r\n");
+    let (blocking_keys, blocking_keys_on_nokey) = blocking_key_counts();
+    out.push_str("total_blocking_keys:");
+    out.push_str(&blocking_keys.to_string());
+    out.push_str("\r\n");
+    out.push_str("total_blocking_keys_on_nokey:");
+    out.push_str(&blocking_keys_on_nokey.to_string());
+    out.push_str("\r\n");
     out.push_str("monitor_clients:");
     out.push_str(&monitor_count().to_string());
     out.push_str("\r\n");
@@ -17061,7 +18111,13 @@ fn handle_command<W: Write>(
         | OpCode::XTrim
         | OpCode::XSetId
         | OpCode::XInfo
-        | OpCode::XRead => {
+        | OpCode::XRead
+        | OpCode::XGroup
+        | OpCode::XReadGroup
+        | OpCode::XAck
+        | OpCode::XPending
+        | OpCode::XClaim
+        | OpCode::XAutoClaim => {
             if txn_state.in_multi {
                 // Queue command for later execution
                 txn_state.queue_command(cmd.clone());
@@ -18228,7 +19284,7 @@ mod tests {
         registry.register(12, &cmd);
         assert!(registry.has_turn(11));
         assert!(!registry.has_turn(12));
-        assert_eq!(registry.fronts_for_keys(&[key.clone()]), vec![(key, 11)]);
+        assert_eq!(registry.fronts_for_keys(&[key.clone()]), vec![(key, 0, 11)]);
 
         registry.unregister(11);
         assert!(registry.has_turn(12));
@@ -18258,6 +19314,36 @@ mod tests {
         );
         registry.unregister(21);
         assert_eq!(registry.eligible_keys(22, &second.keys), second.keys);
+    }
+
+    #[test]
+    fn a_blocked_stream_reader_does_not_queue_behind_a_blocked_list_popper() {
+        // A key holds one type at a time, so a pop and a stream read on the
+        // same key never compete for the same data. Queueing them together let
+        // a pop that can never be served hold the front forever.
+        let key = Bytes::from_static(b"k");
+        let pop = Command::new(OpCode::BLPop, vec![key.clone()], None, Vec::new());
+        let read = Command::new(OpCode::XReadGroup, vec![key.clone()], None, Vec::new());
+        let mut registry = BlockedClientRegistry::default();
+
+        registry.register(31, &pop);
+        registry.register(32, &read);
+        assert!(registry.has_turn(31));
+        assert!(registry.has_turn(32));
+        assert_eq!(registry.eligible_keys(32, &read.keys), read.keys);
+        assert_eq!(
+            registry.fronts_for_keys(&[key.clone()]),
+            vec![(key.clone(), 0, 31), (key.clone(), 1, 32)]
+        );
+        // Only XREADGROUP waits for the key itself to appear.
+        assert_eq!(registry.blocking_key_counts(), (1, 1));
+
+        // Within a class the queue still hands out turns in arrival order.
+        registry.register(33, &read);
+        assert!(registry.has_turn(32));
+        assert!(!registry.has_turn(33));
+        registry.unregister(32);
+        assert!(registry.has_turn(33));
     }
 
     #[test]
@@ -18593,7 +19679,13 @@ mod tests {
         );
         assert_eq!(
             cmd.values,
-            vec![Bytes::from_static(b"0-0"), Bytes::from_static(b"$")]
+            vec![
+                Bytes::new(),
+                Bytes::new(),
+                Bytes::from_static(b"0"),
+                Bytes::from_static(b"0-0"),
+                Bytes::from_static(b"$"),
+            ]
         );
         assert_eq!(cmd.scan_count, 2);
         assert_eq!(cmd.expire_at_ms, 100);
@@ -19397,11 +20489,13 @@ $6\r\nFIELDS\r\n$1\r\n1\r\n$2\r\nf1\r\n"
                 "key call site binds {bound} but reads {argument}: {line}"
             );
         }
-        // 107: the 99 from package 8 plus one for each stream command that
-        // names a key (XADD, XRANGE, XREVRANGE, XLEN, XDEL, XTRIM, XSETID,
-        // XINFO STREAM and XREAD's key list -- XINFO HELP names none).
+        // 113: the 99 from package 8 plus one for each stream parse arm that
+        // names a key -- XADD, XRANGE/XREVRANGE, XLEN, XDEL, XTRIM, XSETID,
+        // XINFO STREAM, XINFO GROUPS/CONSUMERS, the shared XREAD/XREADGROUP
+        // key list, XGROUP, XACK, XPENDING, XCLAIM and XAUTOCLAIM. XINFO HELP
+        // and XGROUP HELP name none.
         assert_eq!(
-            sites, 107,
+            sites, 113,
             "the number of Redis-visible key call sites changed; audit the new one"
         );
     }

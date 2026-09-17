@@ -1626,6 +1626,379 @@ def check_streams_read(host, port, c):
     for key in ("xr1", "xr2", "xr3", "xr4", "xrplain"):
         c.cmd("DEL", key)
 
+def check_streams_groups(host, port, c):
+    """XGROUP, XREADGROUP, XACK, XPENDING, XCLAIM, XAUTOCLAIM, XINFO GROUPS."""
+    # ----- XGROUP CREATE and friends -----
+    c.cmd("DEL", "cg")
+    check("XGROUP CREATE on a missing key without MKSTREAM",
+          c.cmd("XGROUP", "CREATE", "cg", "g1", "$"),
+          pred=lambda g: is_err(g, "ERR The XGROUP subcommand requires the key to exist. "
+                                   "Note that for CREATE you may want to use the MKSTREAM "
+                                   "option to create an empty stream automatically."))
+    check("the refused XGROUP CREATE created no key", c.cmd("EXISTS", "cg"), 0)
+    check("XGROUP CREATE MKSTREAM", c.cmd("XGROUP", "CREATE", "cg", "g1", "$", "MKSTREAM"), "OK")
+    check("MKSTREAM left an existing stream", c.cmd("EXISTS", "cg"), 1)
+    check("the stream it left is empty", c.cmd("XLEN", "cg"), 0)
+    check("and it is typed stream", c.cmd("TYPE", "cg"), "stream")
+    check("XGROUP CREATE twice is BUSYGROUP", c.cmd("XGROUP", "CREATE", "cg", "g1", "$"),
+          pred=lambda g: is_err(g, "BUSYGROUP Consumer Group name already exists"))
+    check("XINFO STREAM counts the group",
+          as_map(c.cmd("XINFO", "STREAM", "cg"))[b"groups"], 1)
+    check("XGROUP CREATE rejects a negative ENTRIESREAD",
+          c.cmd("XGROUP", "CREATE", "cg", "gbad", "$", "ENTRIESREAD", "-3"),
+          pred=lambda g: is_err(g, "ERR value for ENTRIESREAD must be positive or -1"))
+    check("XGROUP CREATE accepts ENTRIESREAD",
+          c.cmd("XGROUP", "CREATE", "cg", "g2", "$", "ENTRIESREAD", "3"), "OK")
+    groups = {g[b"name"]: g for g in (as_map(row) for row in c.cmd("XINFO", "GROUPS", "cg"))}
+    check("XINFO GROUPS reports the ENTRIESREAD it was given",
+          groups[b"g2"][b"entries-read"], 3)
+    check("XINFO GROUPS reports an unknown read counter as nil",
+          groups[b"g1"][b"entries-read"], None)
+    check("XGROUP DESTROY removes it", c.cmd("XGROUP", "DESTROY", "cg", "g2"), 1)
+    check("XGROUP DESTROY of a gone group", c.cmd("XGROUP", "DESTROY", "cg", "g2"), 0)
+    check("XGROUP DESTROY on a missing key", c.cmd("XGROUP", "DESTROY", "cg-missing", "g"), 0)
+    check("XGROUP SETID on a missing group", c.cmd("XGROUP", "SETID", "cg", "gone", "0"),
+          pred=lambda g: is_err(g, "NOGROUP No such consumer group 'gone' for key name 'cg'"))
+    check("XGROUP CREATECONSUMER on a missing group",
+          c.cmd("XGROUP", "CREATECONSUMER", "cg", "gone", "alice"),
+          pred=lambda g: is_err(g, "NOGROUP No such consumer group 'gone' for key name 'cg'"))
+    check("XGROUP HELP lists its subcommands", c.cmd("XGROUP", "HELP"),
+          pred=lambda g: isinstance(g, list) and any("CREATECONSUMER" in line for line in g))
+    check("XGROUP HELP takes no argument", c.cmd("XGROUP", "HELP", "xxx"),
+          pred=lambda g: is_err(g, "ERR wrong number of arguments for 'xgroup|help' command"))
+    check("XGROUP rejects an unknown subcommand", c.cmd("XGROUP", "NOPE", "cg", "g"),
+          pred=lambda g: is_err(g, "ERR Unknown XGROUP subcommand"))
+
+    # ----- the consumer-group flow -----
+    c.cmd("DEL", "cg")
+    for spec, value in (("1-1", "a"), ("1-2", "b"), ("1-3", "c"), ("1-4", "d")):
+        c.cmd("XADD", "cg", spec, "f", value)
+    check("XGROUP CREATE from the start", c.cmd("XGROUP", "CREATE", "cg", "g1", "0"), "OK")
+    check("XREADGROUP > hands the first entries to the first consumer",
+          c.cmd("XREADGROUP", "GROUP", "g1", "alice", "COUNT", "2", "STREAMS", "cg", ">"),
+          [[b"cg", [[b"1-1", [b"f", b"a"]], [b"1-2", [b"f", b"b"]]]]])
+    check("XREADGROUP > hands the next entries to the second consumer",
+          c.cmd("XREADGROUP", "GROUP", "g1", "bob", "COUNT", "2", "STREAMS", "cg", ">"),
+          [[b"cg", [[b"1-3", [b"f", b"c"]], [b"1-4", [b"f", b"d"]]]]])
+    check("XREADGROUP > has nothing left to hand over",
+          c.cmd("XREADGROUP", "GROUP", "g1", "alice", "STREAMS", "cg", ">"), None)
+    check("XPENDING summary counts every pending entry",
+          c.cmd("XPENDING", "cg", "g1"),
+          [4, b"1-1", b"1-4", [[b"alice", b"2"], [b"bob", b"2"]]])
+    check("XPENDING extended reports one row per entry",
+          [[row[0], row[1], row[3]] for row in c.cmd("XPENDING", "cg", "g1", "-", "+", "10")],
+          [[b"1-1", b"alice", 1], [b"1-2", b"alice", 1],
+           [b"1-3", b"bob", 1], [b"1-4", b"bob", 1]])
+    check("XPENDING extended can name one consumer",
+          [row[0] for row in c.cmd("XPENDING", "cg", "g1", "-", "+", "10", "bob")],
+          [b"1-3", b"1-4"])
+    check("XPENDING extended honours COUNT",
+          [row[0] for row in c.cmd("XPENDING", "cg", "g1", "-", "+", "2")], [b"1-1", b"1-2"])
+    check("XPENDING extended honours an exclusive range",
+          [row[0] for row in c.cmd("XPENDING", "cg", "g1", "(1-1", "(1-4", "10")],
+          [b"1-2", b"1-3"])
+    check("XPENDING IDLE filters out entries younger than the threshold",
+          c.cmd("XPENDING", "cg", "g1", "IDLE", "99999999", "-", "+", "10"), [])
+    check("XPENDING IDLE 0 keeps them all",
+          len(c.cmd("XPENDING", "cg", "g1", "IDLE", "0", "-", "+", "10")), 4)
+    check("XREADGROUP with an explicit ID replays what this consumer holds",
+          c.cmd("XREADGROUP", "GROUP", "g1", "alice", "STREAMS", "cg", "0"),
+          [[b"cg", [[b"1-1", [b"f", b"a"]], [b"1-2", [b"f", b"b"]]]]])
+    check("the replay starts after the ID it was given",
+          c.cmd("XREADGROUP", "GROUP", "g1", "alice", "STREAMS", "cg", "1-1"),
+          [[b"cg", [[b"1-2", [b"f", b"b"]]]]])
+    check("a replay past the last pending entry still reports the stream",
+          c.cmd("XREADGROUP", "GROUP", "g1", "alice", "STREAMS", "cg", "9-9"),
+          [[b"cg", []]])
+    check("a replay never blocks, even with BLOCK 0",
+          c.cmd("XREADGROUP", "GROUP", "g1", "alice", "BLOCK", "0", "STREAMS", "cg", "9-9"),
+          [[b"cg", []]])
+    check("XACK removes an entry from the pending list",
+          c.cmd("XACK", "cg", "g1", "1-1"), 1)
+    check("XACK cannot remove the same entry twice", c.cmd("XACK", "cg", "g1", "1-1"), 0)
+    check("XACK counts only what it removed", c.cmd("XACK", "cg", "g1", "1-1", "1-2"), 1)
+    check("the pending list shrank", c.cmd("XPENDING", "cg", "g1")[0], 2)
+    check("XACK rejects a malformed ID", c.cmd("XACK", "cg", "g1", "1-3", "nope"),
+          pred=lambda g: is_err(g, "ERR Invalid stream ID specified as stream command argument"))
+    check("XACK on a missing group is 0", c.cmd("XACK", "cg", "gone", "1-3"), 0)
+    check("XPENDING on a missing group", c.cmd("XPENDING", "cg", "gone"),
+          pred=lambda g: is_err(g, "NOGROUP No such key 'cg' or consumer group 'gone'"))
+
+    # NOACK hands entries over without recording them
+    c.cmd("DEL", "cg2")
+    c.cmd("XADD", "cg2", "1-0", "f", "v")
+    c.cmd("XGROUP", "CREATE", "cg2", "g", "0")
+    check("XREADGROUP NOACK still delivers",
+          c.cmd("XREADGROUP", "GROUP", "g", "alice", "NOACK", "STREAMS", "cg2", ">"),
+          [[b"cg2", [[b"1-0", [b"f", b"v"]]]]])
+    check("XREADGROUP NOACK recorded nothing", c.cmd("XPENDING", "cg2", "g")[0], 0)
+    check("but it did create the consumer",
+          [as_map(row)[b"name"] for row in c.cmd("XINFO", "CONSUMERS", "cg2", "g")], [b"alice"])
+
+    # XGROUP SETID rewinds the group, XGROUP DELCONSUMER drops what it held
+    check("XGROUP SETID rewinds to the beginning", c.cmd("XGROUP", "SETID", "cg2", "g", "0"), "OK")
+    check("the rewound group hands the entry over again",
+          c.cmd("XREADGROUP", "GROUP", "g", "bob", "STREAMS", "cg2", ">"),
+          [[b"cg2", [[b"1-0", [b"f", b"v"]]]]])
+    check("XGROUP CREATECONSUMER on an existing consumer",
+          c.cmd("XGROUP", "CREATECONSUMER", "cg2", "g", "bob"), 0)
+    check("XGROUP CREATECONSUMER on a new one",
+          c.cmd("XGROUP", "CREATECONSUMER", "cg2", "g", "carol"), 1)
+    check("XINFO GROUPS counts the consumers",
+          as_map(c.cmd("XINFO", "GROUPS", "cg2")[0])[b"consumers"], 3)
+    check("XGROUP DELCONSUMER returns what it was holding",
+          c.cmd("XGROUP", "DELCONSUMER", "cg2", "g", "bob"), 1)
+    check("the group's pending list shrank with it", c.cmd("XPENDING", "cg2", "g")[0], 0)
+    check("XGROUP DELCONSUMER of a gone consumer",
+          c.cmd("XGROUP", "DELCONSUMER", "cg2", "g", "bob"), 0)
+
+    # ----- XREADGROUP history reports deleted entries as a nil field list ----
+    c.cmd("DEL", "cg3")
+    c.cmd("XGROUP", "CREATE", "cg3", "g", "$", "MKSTREAM")
+    c.cmd("XADD", "cg3", "1-0", "field1", "A")
+    c.cmd("XREADGROUP", "GROUP", "g", "alice", "STREAMS", "cg3", ">")
+    c.cmd("XADD", "cg3", "MAXLEN", "1", "2-0", "field1", "B")
+    c.cmd("XREADGROUP", "GROUP", "g", "alice", "STREAMS", "cg3", ">")
+    check("a pending entry that was trimmed away replays with no fields",
+          c.cmd("XREADGROUP", "GROUP", "g", "alice", "STREAMS", "cg3", "0"),
+          [[b"cg3", [[b"1-0", None], [b"2-0", [b"field1", b"B"]]]]])
+
+    # ----- XCLAIM -----
+    c.cmd("DEL", "cl")
+    for spec in ("1-0", "2-0", "3-0"):
+        c.cmd("XADD", "cl", spec, "f", "v")
+    c.cmd("XGROUP", "CREATE", "cl", "g", "0")
+    c.cmd("XREADGROUP", "GROUP", "g", "alice", "STREAMS", "cl", ">")
+    check("XCLAIM moves an entry to another consumer",
+          c.cmd("XCLAIM", "cl", "g", "bob", "0", "1-0"), [[b"1-0", [b"f", b"v"]]])
+    check("the entry is now bob's",
+          [row[1] for row in c.cmd("XPENDING", "cl", "g", "-", "+", "10")],
+          [b"bob", b"alice", b"alice"])
+    check("XCLAIM incremented the delivery count",
+          c.cmd("XPENDING", "cl", "g", "-", "+", "10")[0][3], 2)
+    check("XCLAIM with a min-idle-time nothing meets claims nothing",
+          c.cmd("XCLAIM", "cl", "g", "carol", "99999999", "2-0"), [])
+    check("XCLAIM JUSTID answers the IDs alone",
+          c.cmd("XCLAIM", "cl", "g", "carol", "0", "2-0", "JUSTID"), [b"2-0"])
+    check("XCLAIM JUSTID left the delivery count alone",
+          [row[3] for row in c.cmd("XPENDING", "cl", "g", "-", "+", "10", "carol")], [1])
+    check("XCLAIM RETRYCOUNT sets the counter",
+          c.cmd("XCLAIM", "cl", "g", "carol", "0", "2-0", "RETRYCOUNT", "7", "JUSTID"), [b"2-0"])
+    check("the counter is what RETRYCOUNT said",
+          [row[3] for row in c.cmd("XPENDING", "cl", "g", "-", "+", "10", "carol")], [7])
+    check("XCLAIM IDLE backdates the delivery time",
+          c.cmd("XCLAIM", "cl", "g", "carol", "0", "2-0", "IDLE", "5000", "JUSTID"), [b"2-0"])
+    check("the entry now looks idle",
+          c.cmd("XPENDING", "cl", "g", "-", "+", "10", "carol")[0][2],
+          pred=lambda g: g >= 5000)
+    check("XCLAIM TIME sets the delivery time outright",
+          c.cmd("XCLAIM", "cl", "g", "carol", "0", "2-0", "TIME", "1", "JUSTID"), [b"2-0"])
+    check("the entry is as idle as that time is old",
+          c.cmd("XPENDING", "cl", "g", "-", "+", "10", "carol")[0][2],
+          pred=lambda g: g > 1000000000)
+    check("XCLAIM of an entry no consumer holds claims nothing without FORCE",
+          c.cmd("XACK", "cl", "g", "3-0"), 1)
+    check("and really claims nothing", c.cmd("XCLAIM", "cl", "g", "carol", "0", "3-0"), [])
+    check("XCLAIM FORCE creates the pending entry",
+          c.cmd("XCLAIM", "cl", "g", "carol", "0", "3-0", "FORCE"), [[b"3-0", [b"f", b"v"]]])
+    check("the forced entry is in the pending list",
+          [row[0] for row in c.cmd("XPENDING", "cl", "g", "-", "+", "10", "carol")],
+          [b"2-0", b"3-0"])
+    check("XCLAIM LASTID advances the group",
+          c.cmd("XCLAIM", "cl", "g", "carol", "0", "3-0", "LASTID", "9-9", "JUSTID"), [b"3-0"])
+    check("the group's last-delivered-id moved",
+          as_map(c.cmd("XINFO", "GROUPS", "cl")[0])[b"last-delivered-id"], b"9-9")
+    check("XCLAIM drops a pending entry whose stream entry is gone",
+          c.cmd("XDEL", "cl", "2-0"), 1)
+    check("and reports nothing for it", c.cmd("XCLAIM", "cl", "g", "dave", "0", "2-0"), [])
+    check("the pending entry went with it",
+          [row[0] for row in c.cmd("XPENDING", "cl", "g", "-", "+", "10")], [b"1-0", b"3-0"])
+    check("XCLAIM on a missing group", c.cmd("XCLAIM", "cl", "gone", "x", "0", "1-0"),
+          pred=lambda g: is_err(g, "NOGROUP No such key 'cl' or consumer group 'gone'"))
+
+    # ----- XAUTOCLAIM -----
+    c.cmd("DEL", "ac")
+    ids = [c.cmd("XADD", "ac", "%d-0" % j, "f", str(j)) for j in range(1, 6)]
+    c.cmd("XGROUP", "CREATE", "ac", "g", "0")
+    c.cmd("XREADGROUP", "GROUP", "g", "alice", "COUNT", "90", "STREAMS", "ac", ">")
+    reply = c.cmd("XAUTOCLAIM", "ac", "g", "bob", "0", "-", "COUNT", "2")
+    check("XAUTOCLAIM answers a cursor, the claims and the dropped IDs",
+          [reply[0], [row[0] for row in reply[1]], reply[2]],
+          [b"3-0", [b"1-0", b"2-0"], []])
+    reply = c.cmd("XAUTOCLAIM", "ac", "g", "bob", "0", reply[0], "COUNT", "2")
+    check("the cursor continues the walk",
+          [reply[0], [row[0] for row in reply[1]]], [b"5-0", [b"3-0", b"4-0"]])
+    reply = c.cmd("XAUTOCLAIM", "ac", "g", "bob", "0", reply[0], "COUNT", "2")
+    check("the walk ends with a zero cursor",
+          [reply[0], [row[0] for row in reply[1]]], [b"0-0", [b"5-0"]])
+    check("XAUTOCLAIM claimed everything for bob",
+          len(c.cmd("XPENDING", "ac", "g", "-", "+", "10", "bob")), 5)
+    check("XAUTOCLAIM JUSTID answers IDs alone",
+          c.cmd("XAUTOCLAIM", "ac", "g", "carol", "0", "-", "JUSTID")[1],
+          [b"1-0", b"2-0", b"3-0", b"4-0", b"5-0"])
+    c.cmd("XDEL", "ac", "1-0")
+    c.cmd("XDEL", "ac", "2-0")
+    reply = c.cmd("XAUTOCLAIM", "ac", "g", "dave", "0", "-")
+    check("XAUTOCLAIM reports the pending entries whose entries are gone",
+          [reply[0], [row[0] for row in reply[1]], reply[2]],
+          [b"0-0", [b"3-0", b"4-0", b"5-0"], [b"1-0", b"2-0"]])
+    check("and it dropped them from the pending list",
+          len(c.cmd("XPENDING", "ac", "g", "-", "+", "10")), 3)
+    check("XAUTOCLAIM refuses COUNT 0",
+          c.cmd("XAUTOCLAIM", "ac", "g", "x", "0", "-", "COUNT", "0"),
+          pred=lambda g: is_err(g, "ERR COUNT must be > 0"))
+    check("XAUTOCLAIM refuses an out-of-range COUNT",
+          c.cmd("XAUTOCLAIM", "ac", "g", "x", "0", "-", "COUNT", "8070450532247928833"),
+          pred=lambda g: is_err(g, "ERR COUNT"))
+    check("XAUTOCLAIM on a missing group", c.cmd("XAUTOCLAIM", "ac", "gone", "x", "0", "-"),
+          pred=lambda g: is_err(g, "NOGROUP No such key 'ac' or consumer group 'gone'"))
+
+    # ----- XINFO GROUPS, XINFO CONSUMERS and the lag arithmetic -----
+    c.cmd("DEL", "lg")
+    for j in range(1, 6):
+        c.cmd("XADD", "lg", "%d-0" % j, "data", str(j))
+    c.cmd("XGROUP", "CREATE", "lg", "g1", "0")
+    info = as_map(c.cmd("XINFO", "GROUPS", "lg")[0])
+    check("XINFO GROUPS has every documented field", sorted(info.keys()),
+          sorted([b"name", b"consumers", b"pending", b"last-delivered-id",
+                  b"entries-read", b"lag"]))
+    check("a fresh group has read nothing", info[b"entries-read"], None)
+    check("and its lag is the whole stream", info[b"lag"], 5)
+    c.cmd("XREADGROUP", "GROUP", "g1", "c11", "COUNT", "1", "STREAMS", "lg", ">")
+    info = as_map(c.cmd("XINFO", "GROUPS", "lg")[0])
+    check("reading one entry makes the read counter knowable", info[b"entries-read"], 1)
+    check("and drops the lag by one", info[b"lag"], 4)
+    c.cmd("XREADGROUP", "GROUP", "g1", "c12", "COUNT", "10", "STREAMS", "lg", ">")
+    info = as_map(c.cmd("XINFO", "GROUPS", "lg")[0])
+    check("reading the rest catches the group up", [info[b"entries-read"], info[b"lag"]], [5, 0])
+    c.cmd("XADD", "lg", "6-0", "data", "6")
+    info = as_map(c.cmd("XINFO", "GROUPS", "lg")[0])
+    check("a new entry is one entry of lag", [info[b"entries-read"], info[b"lag"]], [5, 1])
+
+    # A tombstone in front of the group makes both counters unknowable, exactly
+    # as it does in Redis.
+    c.cmd("DEL", "lg2")
+    for j in range(1, 6):
+        c.cmd("XADD", "lg2", "%d-0" % j, "data", str(j))
+    c.cmd("XDEL", "lg2", "3-0")
+    c.cmd("XGROUP", "CREATE", "lg2", "g1", "0")
+    c.cmd("XGROUP", "CREATE", "lg2", "g2", "0")
+    info = as_map(c.cmd("XINFO", "GROUPS", "lg2")[0])
+    check("a group behind a tombstone has no knowable lag",
+          [info[b"entries-read"], info[b"lag"]], [None, None])
+    for _ in range(4):
+        c.cmd("XREADGROUP", "GROUP", "g1", "c11", "COUNT", "1", "STREAMS", "lg2", ">")
+    info = as_map(c.cmd("XINFO", "GROUPS", "lg2")[0])
+    check("reaching the end of the stream makes it knowable again",
+          [info[b"entries-read"], info[b"lag"]], [5, 0])
+    c.cmd("XTRIM", "lg2", "MINID", "=", "3-0")
+    rows = {as_map(row)[b"name"]: as_map(row) for row in c.cmd("XINFO", "GROUPS", "lg2")}
+    check("trimming past the tombstone makes the untouched group's lag knowable",
+          [rows[b"g2"][b"entries-read"], rows[b"g2"][b"lag"]], [None, 2])
+
+    check("XINFO CONSUMERS has every documented field",
+          sorted(as_map(c.cmd("XINFO", "CONSUMERS", "lg", "g1")[0]).keys()),
+          sorted([b"name", b"pending", b"idle", b"inactive"]))
+    c.cmd("DEL", "cs")
+    c.cmd("XGROUP", "CREATE", "cs", "g", "$", "MKSTREAM")
+    c.cmd("XREADGROUP", "GROUP", "g", "alice", "COUNT", "1", "STREAMS", "cs", ">")
+    row = as_map(c.cmd("XINFO", "CONSUMERS", "cs", "g")[0])
+    check("a consumer that has never been handed an entry reports inactive -1",
+          row[b"inactive"], -1)
+    c.cmd("XADD", "cs", "1-0", "f", "v")
+    c.cmd("XREADGROUP", "GROUP", "g", "alice", "COUNT", "1", "STREAMS", "cs", ">")
+    row = as_map(c.cmd("XINFO", "CONSUMERS", "cs", "g")[0])
+    check("once it has, inactive is a real age", row[b"inactive"],
+          pred=lambda g: 0 <= g < 5000)
+    check("and it holds the entry it was handed", row[b"pending"], 1)
+    check("XINFO CONSUMERS on a missing group", c.cmd("XINFO", "CONSUMERS", "cs", "gone"),
+          pred=lambda g: is_err(g, "NOGROUP No such consumer group 'gone' for key name 'cs'"))
+    check("XINFO GROUPS on a missing key", c.cmd("XINFO", "GROUPS", "cs-missing"),
+          pred=lambda g: is_err(g, "ERR no such key"))
+
+    # XINFO STREAM FULL carries the groups, their pending lists and consumers
+    full = as_map(c.cmd("XINFO", "STREAM", "cs", "FULL"))
+    check("XINFO STREAM FULL lists the groups", len(full[b"groups"]), 1)
+    group = as_map(full[b"groups"][0])
+    check("the group row names itself", group[b"name"], b"g")
+    check("the group row carries its pending list",
+          [row[0] for row in group[b"pending"]], [b"1-0"])
+    consumer = as_map(group[b"consumers"][0])
+    check("the consumer row names itself", consumer[b"name"], b"alice")
+    check("the consumer row carries its own pending list",
+          [row[0] for row in consumer[b"pending"]], [b"1-0"])
+
+    # ----- XREADGROUP errors -----
+    check("XREADGROUP on a missing group",
+          c.cmd("XREADGROUP", "GROUP", "gone", "x", "STREAMS", "cs", ">"),
+          pred=lambda g: is_err(g, "NOGROUP No such key 'cs' or consumer group 'gone' "
+                                   "in XREADGROUP with GROUP option"))
+    check("XREADGROUP refuses $",
+          c.cmd("XREADGROUP", "GROUP", "g", "x", "STREAMS", "cs", "$"),
+          pred=lambda g: is_err(g, "ERR The $ ID is meaningless in the context of "
+                                   "XREADGROUP: you want to read the history of this "
+                                   "consumer by specifying a proper ID, or use the > ID "
+                                   "to get new messages. The $ ID would just return an "
+                                   "empty result set."))
+    check("XREADGROUP needs the GROUP option",
+          c.cmd("XREADGROUP", "STREAMS", "cs", ">"),
+          pred=lambda g: is_err(g, "ERR Missing GROUP keyword or consumer/group name in "
+                                   "XREADGROUP context"))
+    check("XREADGROUP needs one ID per key",
+          c.cmd("XREADGROUP", "GROUP", "g", "x", "COUNT", "1", "STREAMS", "cs"),
+          pred=lambda g: is_err(g, "ERR Unbalanced 'xreadgroup' list of streams: for each "
+                                   "stream key an ID or '>' must be specified."))
+    check("XREAD refuses the GROUP option",
+          c.cmd("XREAD", "GROUP", "g", "x", "STREAMS", "cs", "0"),
+          pred=lambda g: is_err(g, "ERR The GROUP option is only supported by XREADGROUP. "
+                                   "You called XREAD instead."))
+    check("XREAD refuses the NOACK option",
+          c.cmd("XREAD", "NOACK", "STREAMS", "cs", "0"),
+          pred=lambda g: is_err(g, "ERR The NOACK option is only supported by XREADGROUP. "
+                                   "You called XREAD instead."))
+    c.cmd("SET", "cgplain", "x")
+    for name, args in (("XREADGROUP", ("XREADGROUP", "GROUP", "g", "x", "STREAMS", "cgplain", ">")),
+                       ("XGROUP", ("XGROUP", "CREATE", "cgplain", "g", "$")),
+                       ("XACK", ("XACK", "cgplain", "g", "1-1")),
+                       ("XPENDING", ("XPENDING", "cgplain", "g")),
+                       ("XCLAIM", ("XCLAIM", "cgplain", "g", "x", "0", "1-1")),
+                       ("XAUTOCLAIM", ("XAUTOCLAIM", "cgplain", "g", "x", "0", "-")),
+                       ("XINFO GROUPS", ("XINFO", "GROUPS", "cgplain"))):
+        check("%s on a string is WRONGTYPE" % name, c.cmd(*args),
+              pred=lambda g: is_err(g, "WRONGTYPE"))
+
+    # ----- blocking XREADGROUP -----
+    reader = Resp(host, port)
+    writer = Resp(host, port)
+    c.cmd("DEL", "bg")
+    c.cmd("XGROUP", "CREATE", "bg", "g", "$", "MKSTREAM")
+    started = time.time()
+    check("a blocking XREADGROUP with nothing to hand over times out with nil",
+          reader.cmd("XREADGROUP", "GROUP", "g", "alice", "BLOCK", "400", "STREAMS", "bg", ">"),
+          None)
+    check("and it waited roughly as long as it was asked to", time.time() - started,
+          pred=lambda g: 0.3 <= g < 5.0)
+    reader.send("XREADGROUP", "GROUP", "g", "alice", "BLOCK", "10000", "STREAMS", "bg", ">")
+    time.sleep(0.4)
+    started = time.time()
+    writer.cmd("XADD", "bg", "1-0", "woken", "yes")
+    check("an XADD wakes a blocked XREADGROUP", reader.read(),
+          [[b"bg", [[b"1-0", [b"woken", b"yes"]]]]])
+    check("the wake arrived well inside the BLOCK timeout", time.time() - started,
+          pred=lambda g: g < 3.0)
+    check("the woken read recorded the entry it was handed",
+          c.cmd("XPENDING", "bg", "g")[0], 1)
+    reader.send("XREADGROUP", "GROUP", "g", "alice", "BLOCK", "10000", "STREAMS", "bg", ">")
+    time.sleep(0.4)
+    writer.cmd("XGROUP", "DESTROY", "bg", "g")
+    check("destroying the group unblocks the reader with NOGROUP", reader.read(),
+          pred=lambda g: is_err(g, "NOGROUP"))
+    reader.sock.close()
+    writer.sock.close()
+
+    for key in ("cg", "cg2", "cg3", "cl", "ac", "lg", "lg2", "cs", "cgplain", "bg"):
+        c.cmd("DEL", key)
+
 def stream_id_tuple(raw):
     ms, _, seq = raw.decode().partition("-")
     return (int(ms), int(seq))
@@ -3071,6 +3444,7 @@ def main():
     # ----- Streams -----
     check_streams_basic(host, port, c)
     check_streams_read(host, port, c)
+    check_streams_groups(host, port, c)
 
     c.cmd("SET", "t1", "v")
     c.cmd("SADD", "s1", "a")
