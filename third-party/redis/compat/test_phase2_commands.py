@@ -3670,6 +3670,36 @@ def main():
     check_streams_read(host, port, c)
     check_streams_groups(host, port, c)
 
+    # ----- MODULE shim -----
+    # There is no Redis module ABI below this adapter, so LIST is truthfully
+    # empty and every loading form answers with Redis's own failure text.
+    check("MODULE LIST is empty", c.cmd("MODULE", "LIST"), [])
+    check("MODULE LOAD fails", c.cmd("MODULE", "LOAD", "/tmp/whatever.so"),
+          pred=lambda g: is_err(g, "ERR Error loading the extension. Please check the server logs."))
+    check("MODULE LOAD with arguments fails",
+          c.cmd("MODULE", "LOAD", "/tmp/whatever.so", "arg1", "arg2"),
+          pred=lambda g: is_err(g, "ERR Error loading the extension. Please check the server logs."))
+    check("MODULE LOADEX fails",
+          c.cmd("MODULE", "LOADEX", "/tmp/whatever.so", "CONFIG", "k", "v", "ARGS", "a"),
+          pred=lambda g: is_err(g, "ERR Error loading the extension. Please check the server logs."))
+    check("MODULE UNLOAD has nothing to unload", c.cmd("MODULE", "UNLOAD", "mymodule"),
+          pred=lambda g: is_err(g, "ERR Error unloading module: no such module with that name"))
+    module_help = c.cmd("MODULE", "HELP")
+    check("MODULE HELP shape", module_help,
+          pred=lambda g: isinstance(g, list) and len(g) == 11
+          and g[0].startswith(b"MODULE <subcommand>")
+          and b"LIST" in g and b"UNLOAD <name>" in g
+          and g[-1] == b"    Print this help.")
+    check("MODULE unknown subcommand", c.cmd("MODULE", "NOSUCHTHING"),
+          pred=lambda g: is_err(g, "ERR unknown subcommand 'NOSUCHTHING'. Try MODULE HELP."))
+    check("MODULE with no subcommand", c.cmd("MODULE"),
+          pred=lambda g: is_err(g, "ERR wrong number of arguments for 'module' command"))
+    check("MODULE LIST is still empty after the failed load", c.cmd("MODULE", "LIST"), [])
+    # Queued inside MULTI like the other container commands.
+    c.cmd("MULTI")
+    check("MODULE LIST is queued", c.cmd("MODULE", "LIST"), "QUEUED")
+    check("EXEC answers MODULE LIST", c.cmd("EXEC"), [[]])
+
     c.cmd("SET", "t1", "v")
     c.cmd("SADD", "s1", "a")
 

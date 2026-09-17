@@ -861,6 +861,7 @@ enum OpCode {
     XClaim = 217,
     XAutoClaim = 218,
     GeoSearchStore = 219,
+    Module = 220,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -2129,6 +2130,8 @@ fn parse_opcode(name: &[u8]) -> Option<OpCode> {
     {
         // The parse arm re-reads the name to pick the argument syntax.
         Some(OpCode::GeoSearch)
+    } else if ascii_eq_ci(name, b"MODULE") {
+        Some(OpCode::Module)
     } else if ascii_eq_ci(name, b"GEOSEARCHSTORE") {
         // GEORADIUS and GEORADIUSBYMEMBER also become this opcode, but only
         // once their option loop has seen a STORE or STOREDIST destination.
@@ -6657,6 +6660,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
         | OpCode::Memory
         | OpCode::SlowLog
         | OpCode::Latency
+        | OpCode::Module
         | OpCode::Cluster
         | OpCode::ReadOnly
         | OpCode::ReadWrite
@@ -6693,6 +6697,7 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 OpCode::Info if parts.len() > 2 => Some("info"),
                 OpCode::Memory if parts.len() < 2 => Some("memory"),
                 OpCode::SlowLog if parts.len() < 2 => Some("slowlog"),
+                OpCode::Module if parts.len() < 2 => Some("module"),
                 OpCode::Latency if parts.len() < 2 => Some("latency"),
                 OpCode::Cluster if parts.len() < 2 => Some("cluster"),
                 OpCode::ReadOnly if parts.len() != 1 => Some("readonly"),
@@ -12031,6 +12036,10 @@ fn write_command_result<W: Write>(
     }
     if matches!(cmd.op, OpCode::ReadOnly | OpCode::ReadWrite) {
         write_cluster_readonly_reply(cluster_mode(), writer)?;
+        return Ok(());
+    }
+    if cmd.op == OpCode::Module {
+        handle_module_command(cmd, writer)?;
         return Ok(());
     }
     if cmd.op == OpCode::Config {
@@ -17407,6 +17416,57 @@ fn handle_slowlog_command<W: Write>(cmd: &Command, writer: &mut W) -> std::io::R
     }
 }
 
+/// Redis's own `MODULE HELP` lines, with the header and footer
+/// `addReplyHelp` puts around every container command's help.
+const MODULE_HELP: &[&str] = &[
+    "MODULE <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+    "LIST",
+    "    Return a list of loaded modules.",
+    "LOAD <path> [<arg> [<arg> ...]]",
+    "    Load a module library from <path>, passing to it any optional arguments.",
+    "LOADEX <path> [[CONFIG NAME VALUE] [CONFIG NAME VALUE]] [ARGS ...]",
+    "    Load a module library from <path>, while passing to it module configurations and optional arguments.",
+    "UNLOAD <name>",
+    "    Unload a module.",
+    "HELP",
+    "    Print this help.",
+];
+
+/// MODULE, answered locally. There is no Redis module ABI below this adapter,
+/// so nothing is emulated: LIST is an empty array because no module is loaded,
+/// which is the truth, and the two loading forms and UNLOAD answer with the
+/// errors Redis itself gives when the load fails or the name is unknown. That
+/// is what a client library probing for a module needs in order to conclude it
+/// is not there and move on. Recorded in known_divergences.txt.
+fn handle_module_command<W: Write>(cmd: &Command, writer: &mut W) -> std::io::Result<()> {
+    let subcommand = cmd.args.first().map(|arg| arg.as_ref()).unwrap_or(b"");
+    let argc = cmd.args.len();
+    if ascii_eq_ci(subcommand, b"LIST") && argc == 1 {
+        write_array_header(writer, 0)
+    } else if (ascii_eq_ci(subcommand, b"LOAD") || ascii_eq_ci(subcommand, b"LOADEX")) && argc >= 2
+    {
+        write_err(
+            writer,
+            "Error loading the extension. Please check the server logs.",
+        )
+    } else if ascii_eq_ci(subcommand, b"UNLOAD") && argc == 2 {
+        write_err(
+            writer,
+            "Error unloading module: no such module with that name",
+        )
+    } else if ascii_eq_ci(subcommand, b"HELP") && argc == 1 {
+        write_string_array(writer, MODULE_HELP)
+    } else {
+        write_err(
+            writer,
+            &format!(
+                "unknown subcommand '{}'. Try MODULE HELP.",
+                String::from_utf8_lossy(subcommand)
+            ),
+        )
+    }
+}
+
 fn handle_latency_command<W: Write>(cmd: &Command, writer: &mut W) -> std::io::Result<()> {
     let subcommand = cmd.args.first().map(|arg| arg.as_ref()).unwrap_or(b"");
     if ascii_eq_ci(subcommand, b"LATEST") {
@@ -18356,6 +18416,16 @@ fn handle_command<W: Write>(
         }
         OpCode::SlowLog => {
             handle_slowlog_command(cmd, writer)?;
+        }
+        OpCode::Module => {
+            // Queued inside MULTI like CONFIG, and answered at EXEC from
+            // `write_command_result`, because it touches no storage.
+            if txn_state.in_multi {
+                txn_state.queue_command(cmd.clone());
+                write_queued(writer)?;
+            } else {
+                handle_module_command(cmd, writer)?;
+            }
         }
         OpCode::Latency => {
             handle_latency_command(cmd, writer)?;
@@ -20879,6 +20949,57 @@ $3\r\n200\r\n$2\r\nkm\r\n$9\r\nSTOREDIST\r\n$4\r\ndest\r\n",
                 ],
             ),
             "-ERR syntax error"
+        );
+    }
+
+    /// MODULE answers locally. Nothing is emulated: there is no module ABI
+    /// below this adapter, so LIST is truthfully empty and the loading forms
+    /// give Redis's own failure texts.
+    #[test]
+    fn module_reports_no_modules_and_refuses_to_load_one() {
+        assert!(parse_opcode(b"MODULE") == Some(OpCode::Module));
+        assert_eq!(run_raw(b"*2\r\n$6\r\nMODULE\r\n$4\r\nLIST\r\n"), b"*0\r\n");
+        assert_eq!(
+            run_raw(b"*3\r\n$6\r\nMODULE\r\n$4\r\nLOAD\r\n$9\r\n/tmp/x.so\r\n"),
+            b"-ERR Error loading the extension. Please check the server logs.\r\n"
+        );
+        assert_eq!(
+            run_raw(
+                b"*5\r\n$6\r\nMODULE\r\n$4\r\nLOAD\r\n$9\r\n/tmp/x.so\r\n$1\r\na\r\n$1\r\nb\r\n"
+            ),
+            b"-ERR Error loading the extension. Please check the server logs.\r\n"
+        );
+        assert_eq!(
+            run_raw(
+                b"*7\r\n$6\r\nMODULE\r\n$6\r\nLOADEX\r\n$9\r\n/tmp/x.so\r\n$6\r\nCONFIG\r\n\
+$1\r\nk\r\n$1\r\nv\r\n$4\r\nARGS\r\n"
+            ),
+            b"-ERR Error loading the extension. Please check the server logs.\r\n"
+        );
+        assert_eq!(
+            run_raw(b"*3\r\n$6\r\nMODULE\r\n$6\r\nUNLOAD\r\n$2\r\nmy\r\n"),
+            b"-ERR Error unloading module: no such module with that name\r\n"
+        );
+        // The help is Redis's list inside addReplyHelp's header and footer.
+        let help = run_raw(b"*2\r\n$6\r\nMODULE\r\n$4\r\nHELP\r\n");
+        assert!(help.starts_with(b"*11\r\n"));
+        assert!(help
+            .windows(MODULE_HELP[0].len())
+            .any(|window| window == MODULE_HELP[0].as_bytes()));
+        assert!(help.ends_with(b"$20\r\n    Print this help.\r\n"));
+        // An unknown subcommand, and a known one with the wrong arity, both
+        // take the shape the other container commands use.
+        assert_eq!(
+            run_raw(b"*2\r\n$6\r\nMODULE\r\n$7\r\nnosuchx\r\n"),
+            b"-ERR unknown subcommand 'nosuchx'. Try MODULE HELP.\r\n"
+        );
+        assert_eq!(
+            run_raw(b"*2\r\n$6\r\nMODULE\r\n$6\r\nUNLOAD\r\n"),
+            b"-ERR unknown subcommand 'UNLOAD'. Try MODULE HELP.\r\n"
+        );
+        assert_eq!(
+            run_raw(b"*1\r\n$6\r\nMODULE\r\n"),
+            b"-ERR wrong number of arguments for 'module' command\r\n"
         );
     }
 
