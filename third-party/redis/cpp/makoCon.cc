@@ -692,6 +692,330 @@ static int bitfield_unsigned_overflow(
     return direction;
 }
 
+// ===== Redis Streams =====
+//
+// A stream lives in five hidden key families (documented in
+// include/transaction_ffi.h): "\x01X#:" one meta record per stream, "\x01X:"
+// one record per entry, "\x01XG:" one per consumer group, "\x01XC:" one per
+// consumer and "\x01XP:" one per pending-entry-list entry. Entry and PEL keys
+// end in the 128-bit stream ID written big-endian, so a prefix range scan of
+// either family walks the records in ID order and an XRANGE start/end pair is
+// a plain key range.
+//
+// Every ID crosses the FFI as decimal "ms-seq" text; both halves are unsigned
+// 64-bit, as in Redis, so they are parsed and formatted here rather than
+// squeezed into the signed int64 of a TxnOpResult.
+struct RedisStreamId {
+    uint64_t ms = 0;
+    uint64_t seq = 0;
+};
+
+static int stream_id_compare(const RedisStreamId& lhs, const RedisStreamId& rhs) {
+    if (lhs.ms != rhs.ms) {
+        return lhs.ms < rhs.ms ? -1 : 1;
+    }
+    if (lhs.seq != rhs.seq) {
+        return lhs.seq < rhs.seq ? -1 : 1;
+    }
+    return 0;
+}
+
+static bool stream_id_is_zero(const RedisStreamId& id) {
+    return id.ms == 0 && id.seq == 0;
+}
+
+static bool stream_parse_u64(const char* data, size_t len, uint64_t& out) {
+    if (len == 0 || len > 20) {
+        return false;
+    }
+    uint64_t value = 0;
+    for (size_t i = 0; i < len; ++i) {
+        const unsigned char c = static_cast<unsigned char>(data[i]);
+        if (c < '0' || c > '9') {
+            return false;
+        }
+        const uint64_t digit = static_cast<uint64_t>(c - '0');
+        if (value > (std::numeric_limits<uint64_t>::max() - digit) / 10) {
+            return false;
+        }
+        value = value * 10 + digit;
+    }
+    out = value;
+    return true;
+}
+
+/// Parse the "<ms>-<seq>" spelling every stream ID crosses the FFI as. Rust has
+/// already expanded "-", "+", a bare "<ms>" and the "(" exclusive forms, so the
+/// executor only ever sees both halves written out.
+static bool stream_id_parse(const std::string& text, RedisStreamId& out) {
+    const size_t dash = text.find('-');
+    if (dash == std::string::npos || dash == 0 || dash + 1 == text.size()) {
+        return false;
+    }
+    RedisStreamId parsed;
+    if (!stream_parse_u64(text.data(), dash, parsed.ms)) {
+        return false;
+    }
+    if (!stream_parse_u64(text.data() + dash + 1, text.size() - dash - 1, parsed.seq)) {
+        return false;
+    }
+    out = parsed;
+    return true;
+}
+
+static std::string stream_id_format(const RedisStreamId& id) {
+    std::string out = std::to_string(id.ms);
+    out.push_back('-');
+    out.append(std::to_string(id.seq));
+    return out;
+}
+
+/// The ID immediately after `id`, false when there is none (Redis's
+/// streamIncrID).
+static bool stream_id_incr(RedisStreamId& id) {
+    if (id.seq == std::numeric_limits<uint64_t>::max()) {
+        if (id.ms == std::numeric_limits<uint64_t>::max()) {
+            return false;
+        }
+        id.ms += 1;
+        id.seq = 0;
+    } else {
+        id.seq += 1;
+    }
+    return true;
+}
+
+static void stream_put_u64_be(std::string& out, uint64_t value) {
+    for (int shift = 56; shift >= 0; shift -= 8) {
+        out.push_back(static_cast<char>((value >> shift) & 0xff));
+    }
+}
+
+static void stream_put_u64_le(std::string& out, uint64_t value) {
+    for (int shift = 0; shift < 64; shift += 8) {
+        out.push_back(static_cast<char>((value >> shift) & 0xff));
+    }
+}
+
+static uint64_t stream_get_u64_le(const std::string& raw, size_t pos) {
+    uint64_t value = 0;
+    for (int i = 0; i < 8; ++i) {
+        value |= static_cast<uint64_t>(static_cast<unsigned char>(raw[pos + i]))
+            << (8 * i);
+    }
+    return value;
+}
+
+/// The stream's own record: everything XINFO STREAM reports that is not an
+/// entry, kept beside the entries so XLEN and the ID checks are one read.
+struct RedisStreamMeta {
+    uint64_t length = 0;
+    RedisStreamId last_id;
+    // recorded-first-entry-id: 0-0 while the stream holds no entry.
+    RedisStreamId first_id;
+    uint64_t entries_added = 0;
+    RedisStreamId max_deleted_id;
+    uint64_t groups = 0;
+};
+
+static constexpr size_t kStreamMetaSize = 9 * 8;
+
+static std::string stream_pack_meta(const RedisStreamMeta& meta) {
+    std::string raw;
+    raw.reserve(kStreamMetaSize);
+    stream_put_u64_le(raw, meta.length);
+    stream_put_u64_le(raw, meta.last_id.ms);
+    stream_put_u64_le(raw, meta.last_id.seq);
+    stream_put_u64_le(raw, meta.first_id.ms);
+    stream_put_u64_le(raw, meta.first_id.seq);
+    stream_put_u64_le(raw, meta.entries_added);
+    stream_put_u64_le(raw, meta.max_deleted_id.ms);
+    stream_put_u64_le(raw, meta.max_deleted_id.seq);
+    stream_put_u64_le(raw, meta.groups);
+    return raw;
+}
+
+static bool stream_unpack_meta(const std::string& raw, RedisStreamMeta& meta) {
+    if (raw.size() != kStreamMetaSize) {
+        return false;
+    }
+    meta.length = stream_get_u64_le(raw, 0);
+    meta.last_id.ms = stream_get_u64_le(raw, 8);
+    meta.last_id.seq = stream_get_u64_le(raw, 16);
+    meta.first_id.ms = stream_get_u64_le(raw, 24);
+    meta.first_id.seq = stream_get_u64_le(raw, 32);
+    meta.entries_added = stream_get_u64_le(raw, 40);
+    meta.max_deleted_id.ms = stream_get_u64_le(raw, 48);
+    meta.max_deleted_id.seq = stream_get_u64_le(raw, 56);
+    meta.groups = stream_get_u64_le(raw, 64);
+    return true;
+}
+
+/// A consumer group. `entries_read` is Redis's logical read counter, and -1 is
+/// its SCG_INVALID_ENTRIES_READ: the counter cannot be known for a group whose
+/// position sits behind a tombstone.
+struct RedisStreamGroup {
+    RedisStreamId last_id;
+    int64_t entries_read = -1;
+    uint64_t consumers = 0;
+    uint64_t pel = 0;
+};
+
+static constexpr size_t kStreamGroupSize = 5 * 8;
+
+static std::string stream_pack_group(const RedisStreamGroup& group) {
+    std::string raw;
+    raw.reserve(kStreamGroupSize);
+    stream_put_u64_le(raw, group.last_id.ms);
+    stream_put_u64_le(raw, group.last_id.seq);
+    stream_put_u64_le(raw, static_cast<uint64_t>(group.entries_read));
+    stream_put_u64_le(raw, group.consumers);
+    stream_put_u64_le(raw, group.pel);
+    return raw;
+}
+
+static bool stream_unpack_group(const std::string& raw, RedisStreamGroup& group) {
+    if (raw.size() != kStreamGroupSize) {
+        return false;
+    }
+    group.last_id.ms = stream_get_u64_le(raw, 0);
+    group.last_id.seq = stream_get_u64_le(raw, 8);
+    group.entries_read = static_cast<int64_t>(stream_get_u64_le(raw, 16));
+    group.consumers = stream_get_u64_le(raw, 24);
+    group.pel = stream_get_u64_le(raw, 32);
+    return true;
+}
+
+/// Redis 7.2 keeps two clocks per consumer: seen-time moves on every command
+/// the consumer issues, active-time only when it was actually handed an entry,
+/// and a consumer that has never been handed one reports inactive -1.
+struct RedisStreamConsumer {
+    int64_t seen_time_ms = 0;
+    int64_t active_time_ms = -1;
+    uint64_t pending = 0;
+};
+
+static constexpr size_t kStreamConsumerSize = 3 * 8;
+
+static std::string stream_pack_consumer(const RedisStreamConsumer& consumer) {
+    std::string raw;
+    raw.reserve(kStreamConsumerSize);
+    stream_put_u64_le(raw, static_cast<uint64_t>(consumer.seen_time_ms));
+    stream_put_u64_le(raw, static_cast<uint64_t>(consumer.active_time_ms));
+    stream_put_u64_le(raw, consumer.pending);
+    return raw;
+}
+
+static bool stream_unpack_consumer(const std::string& raw, RedisStreamConsumer& consumer) {
+    if (raw.size() != kStreamConsumerSize) {
+        return false;
+    }
+    consumer.seen_time_ms = static_cast<int64_t>(stream_get_u64_le(raw, 0));
+    consumer.active_time_ms = static_cast<int64_t>(stream_get_u64_le(raw, 8));
+    consumer.pending = stream_get_u64_le(raw, 16);
+    return true;
+}
+
+/// One pending-entry-list record: who holds the entry and for how long.
+struct RedisStreamNack {
+    std::string consumer;
+    int64_t delivery_time_ms = 0;
+    uint64_t delivery_count = 1;
+};
+
+static std::string stream_pack_nack(const RedisStreamNack& nack) {
+    std::string raw;
+    raw.reserve(16 + nack.consumer.size());
+    stream_put_u64_le(raw, static_cast<uint64_t>(nack.delivery_time_ms));
+    stream_put_u64_le(raw, nack.delivery_count);
+    raw.append(nack.consumer);
+    return raw;
+}
+
+static bool stream_unpack_nack(const std::string& raw, RedisStreamNack& nack) {
+    if (raw.size() < 16) {
+        return false;
+    }
+    nack.delivery_time_ms = static_cast<int64_t>(stream_get_u64_le(raw, 0));
+    nack.delivery_count = stream_get_u64_le(raw, 8);
+    nack.consumer.assign(raw, 16, raw.size() - 16);
+    return true;
+}
+
+/// Redis's streamRangeHasTombstones: could an XDEL have removed an entry at or
+/// after `start`? The answer drives whether a group's read counter can still be
+/// advanced by simple addition.
+static bool stream_range_has_tombstones(const RedisStreamMeta& meta, const RedisStreamId& start) {
+    if (meta.length == 0 || stream_id_is_zero(meta.max_deleted_id)) {
+        return false;
+    }
+    if (stream_id_compare(meta.first_id, meta.max_deleted_id) > 0) {
+        return false;
+    }
+    return stream_id_compare(start, meta.max_deleted_id) <= 0;
+}
+
+/// Redis's streamEstimateDistanceFromFirstEverEntry: how many entries were ever
+/// added to the stream at or before `id`. False when the answer cannot be known
+/// because a tombstone sits between the first entry and `id`.
+static bool stream_estimate_entries_read(
+    const RedisStreamMeta& meta,
+    const RedisStreamId& id,
+    int64_t& entries_read) {
+    if (meta.entries_added == 0) {
+        entries_read = 0;
+        return true;
+    }
+    if (meta.length == 0 && stream_id_compare(id, meta.last_id) <= 0) {
+        entries_read = static_cast<int64_t>(meta.entries_added);
+        return true;
+    }
+    const int cmp_last = stream_id_compare(id, meta.last_id);
+    if (cmp_last == 0) {
+        entries_read = static_cast<int64_t>(meta.entries_added);
+        return true;
+    }
+    if (cmp_last > 0) {
+        return false;
+    }
+    const int cmp_first = stream_id_compare(id, meta.first_id);
+    const bool no_fragmentation = stream_id_is_zero(meta.max_deleted_id)
+        || stream_id_compare(meta.max_deleted_id, meta.first_id) < 0;
+    if (no_fragmentation) {
+        if (cmp_first < 0) {
+            entries_read = static_cast<int64_t>(meta.entries_added - meta.length);
+            return true;
+        }
+        if (cmp_first == 0) {
+            entries_read = static_cast<int64_t>(meta.entries_added - meta.length + 1);
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Redis's streamCGLag. False when the lag cannot be determined, which XINFO
+/// reports as a null.
+static bool stream_group_lag(
+    const RedisStreamMeta& meta,
+    const RedisStreamGroup& group,
+    int64_t& lag) {
+    if (meta.entries_added == 0) {
+        lag = 0;
+        return true;
+    }
+    if (group.entries_read >= 0 && !stream_range_has_tombstones(meta, group.last_id)) {
+        lag = static_cast<int64_t>(meta.entries_added) - group.entries_read;
+        return true;
+    }
+    int64_t entries_read = 0;
+    if (stream_estimate_entries_read(meta, group.last_id, entries_read)) {
+        lag = static_cast<int64_t>(meta.entries_added) - entries_read;
+        return true;
+    }
+    return false;
+}
+
 static bool redis_op_is_read_only(const TxnOperation& op) {
     switch (op.op) {
         case TXN_OP_GET:
@@ -735,6 +1059,11 @@ static bool redis_op_is_read_only(const TxnOperation& op) {
         case TXN_OP_ZLEXCOUNT:
         case TXN_OP_ZRANDMEMBER:
         case TXN_OP_HLL_COUNT:
+        // Stream reads. TXN_OP_XRANGE serves XRANGE, XREVRANGE and each stream
+        // of an XREAD; XLEN and XINFO only report.
+        case TXN_OP_XRANGE:
+        case TXN_OP_XLEN:
+        case TXN_OP_XINFO:
             return true;
         case TXN_OP_SET_ALGEBRA:
             return (op.flags & TXN_FLAG_SET_ALGEBRA_STORE) == 0;
@@ -1851,6 +2180,95 @@ static bool execute_ops_impl(
         return true;
     };
 
+    // ----- Stream storage keys -----
+    //
+    // Every family is "<tag>" + u64le(len(stream key)) + stream key, so one
+    // stream's records are a contiguous prefix range and no key can be spelled
+    // by another. Entry and PEL records then carry the 128-bit ID big-endian,
+    // which makes lexicographic order the same as ID order.
+    auto make_stream_family_prefix = [](const char* tag, size_t tag_len, const std::string& stream_key) {
+        std::string prefix;
+        prefix.reserve(tag_len + 8 + stream_key.size());
+        prefix.append(tag, tag_len);
+        stream_put_u64_le(prefix, static_cast<uint64_t>(stream_key.size()));
+        prefix.append(stream_key);
+        return prefix;
+    };
+
+    auto make_stream_meta_key = [&](const std::string& stream_key) {
+        return make_stream_family_prefix("\x01X#:", sizeof("\x01X#:") - 1, stream_key);
+    };
+
+    auto make_stream_entry_prefix = [&](const std::string& stream_key) {
+        return make_stream_family_prefix("\x01X:", sizeof("\x01X:") - 1, stream_key);
+    };
+
+    auto make_stream_entry_key = [&](const std::string& stream_key, const RedisStreamId& id) {
+        std::string key = make_stream_entry_prefix(stream_key);
+        stream_put_u64_be(key, id.ms);
+        stream_put_u64_be(key, id.seq);
+        return key;
+    };
+
+    auto make_stream_group_prefix = [&](const std::string& stream_key) {
+        return make_stream_family_prefix("\x01XG:", sizeof("\x01XG:") - 1, stream_key);
+    };
+
+    auto make_stream_group_key = [&](const std::string& stream_key, const std::string& group) {
+        std::string key = make_stream_group_prefix(stream_key);
+        stream_put_u64_le(key, static_cast<uint64_t>(group.size()));
+        key.append(group);
+        return key;
+    };
+
+    auto make_stream_consumer_prefix = [&](const std::string& stream_key, const std::string& group) {
+        std::string key = make_stream_family_prefix("\x01XC:", sizeof("\x01XC:") - 1, stream_key);
+        stream_put_u64_le(key, static_cast<uint64_t>(group.size()));
+        key.append(group);
+        return key;
+    };
+
+    auto make_stream_consumer_key = [&](const std::string& stream_key,
+                                        const std::string& group,
+                                        const std::string& consumer) {
+        std::string key = make_stream_consumer_prefix(stream_key, group);
+        key.append(consumer);
+        return key;
+    };
+
+    auto make_stream_pel_prefix = [&](const std::string& stream_key, const std::string& group) {
+        std::string key = make_stream_family_prefix("\x01XP:", sizeof("\x01XP:") - 1, stream_key);
+        stream_put_u64_le(key, static_cast<uint64_t>(group.size()));
+        key.append(group);
+        return key;
+    };
+
+    auto make_stream_pel_key = [&](const std::string& stream_key,
+                                   const std::string& group,
+                                   const RedisStreamId& id) {
+        std::string key = make_stream_pel_prefix(stream_key, group);
+        stream_put_u64_be(key, id.ms);
+        stream_put_u64_be(key, id.seq);
+        return key;
+    };
+
+    // The ID a 16-byte big-endian suffix spells, used to read an entry or PEL
+    // key back after a scan.
+    auto stream_id_from_key_suffix = [](const std::string& storage_key, size_t prefix_len, RedisStreamId& id) {
+        if (storage_key.size() != prefix_len + 16) {
+            return false;
+        }
+        uint64_t ms = 0;
+        uint64_t seq = 0;
+        for (size_t i = 0; i < 8; ++i) {
+            ms = (ms << 8) | static_cast<unsigned char>(storage_key[prefix_len + i]);
+            seq = (seq << 8) | static_cast<unsigned char>(storage_key[prefix_len + 8 + i]);
+        }
+        id.ms = ms;
+        id.seq = seq;
+        return true;
+    };
+
     auto read_raw = [&](void* txn, const std::string& key, std::string& value, bool& exists) {
         value.clear();
         // The write buffer is this transaction's own view of storage, so it
@@ -2952,6 +3370,750 @@ static bool execute_ops_impl(
         return write_zset_cardinality(txn, zset_key, static_cast<int64_t>(values.size()));
     };
 
+    // ----- Stream storage access -----
+    //
+    // Every family is walked the same way: one ordered range scan of storage
+    // followed by a merge of this transaction's own buffered writes and
+    // deferred deletes, exactly as collect_zset_values does, so a stream reads
+    // back what the same transaction just wrote. `limit` stops the storage walk
+    // early once that many records are in hand, after allowing for the deletes
+    // that will drop out of the range; a limit of 0 collects the whole range.
+    auto collect_stream_range = [&](void* txn,
+                                    const std::string& prefix,
+                                    const std::string& scan_start,
+                                    const std::string& scan_end,
+                                    size_t limit,
+                                    std::vector<std::pair<std::string, std::string>>& out) {
+        out.clear();
+        auto key_in_range = [&](const std::string& storage_key) {
+            return storage_key.size() >= prefix.size()
+                && storage_key.compare(0, prefix.size(), prefix) == 0
+                && storage_key >= scan_start
+                && (scan_end.empty() || storage_key < scan_end);
+        };
+
+        size_t scan_limit = 0;
+        if (limit != 0) {
+            size_t deletes_in_range = 0;
+            for (const auto& storage_key : pending_deletes) {
+                if (key_in_range(storage_key)) {
+                    ++deletes_in_range;
+                }
+            }
+            scan_limit = limit + deletes_in_range;
+        }
+
+        std::map<std::string, std::string> merged;
+
+        class StreamRangeScanCallback : public oi_scan_callback {
+        public:
+            StreamRangeScanCallback(
+                std::map<std::string, std::string>& merged,
+                std::string_view prefix,
+                const std::string& scan_end,
+                size_t limit)
+                : merged_(merged), prefix_(prefix), scan_end_(scan_end), limit_(limit) {}
+
+            bool invoke(const char* keyp, size_t keylen, const std::string& value) override {
+                std::string storage_key(keyp, keylen);
+                if (storage_key.rfind(prefix_, 0) != 0) {
+                    return false;
+                }
+                if (!scan_end_.empty() && storage_key >= scan_end_) {
+                    return false;
+                }
+                merged_.emplace(std::move(storage_key), value);
+                return limit_ == 0 || merged_.size() < limit_;
+            }
+
+        private:
+            std::map<std::string, std::string>& merged_;
+            std::string_view prefix_;
+            const std::string& scan_end_;
+            size_t limit_;
+        };
+
+        StreamRangeScanCallback callback(merged, prefix, scan_end, scan_limit);
+        const std::string* scan_end_ptr = scan_end.empty() ? nullptr : &scan_end;
+        tx_scan(g_table, txn, scan_start, scan_end_ptr, callback, tl_arena);
+
+        // The transaction's own view wins over what storage returned. A key the
+        // transaction wrote is inserted even if the limited walk stopped before
+        // it, and one it deleted is dropped.
+        for (const auto& [storage_key, exists] : batch_exists) {
+            if (!key_in_range(storage_key)) {
+                continue;
+            }
+            if (!exists) {
+                merged.erase(storage_key);
+                continue;
+            }
+            auto value_it = batch_values.find(storage_key);
+            if (value_it == batch_values.end()) {
+                continue;
+            }
+            merged[storage_key] = value_it->second;
+        }
+
+        out.reserve(limit != 0 ? std::min(limit, merged.size()) : merged.size());
+        for (auto& entry : merged) {
+            out.emplace_back(entry.first, entry.second);
+            if (limit != 0 && out.size() >= limit) {
+                break;
+            }
+        }
+        return mako::Status::OK();
+    };
+
+    auto read_stream_meta = [&](void* txn, const std::string& stream_key, RedisStreamMeta& meta, bool& exists) {
+        meta = RedisStreamMeta{};
+        std::string value;
+        exists = false;
+        mako::Status s = read_internal_current(txn, make_stream_meta_key(stream_key), value, exists);
+        if (!s.ok() || !exists) {
+            return s;
+        }
+        if (!stream_unpack_meta(value, meta)) {
+            meta = RedisStreamMeta{};
+        }
+        return mako::Status::OK();
+    };
+
+    auto write_stream_meta = [&](void* txn, const std::string& stream_key, const RedisStreamMeta& meta) {
+        return put_raw(txn, make_stream_meta_key(stream_key), stream_pack_meta(meta));
+    };
+
+    // A stream exists exactly while its meta record does: XADD MAXLEN 0 and
+    // XGROUP CREATE MKSTREAM both leave a stream with no entries, and Redis
+    // reports that key as existing and typed `stream`.
+    auto stream_exists = [&](void* txn, const std::string& stream_key, bool& exists) {
+        std::string value;
+        exists = false;
+        return read_internal_current(txn, make_stream_meta_key(stream_key), value, exists);
+    };
+
+    auto read_stream_entry = [&](void* txn,
+                                 const std::string& stream_key,
+                                 const RedisStreamId& id,
+                                 std::string& fields,
+                                 bool& exists) {
+        return read_internal_current(txn, make_stream_entry_key(stream_key, id), fields, exists);
+    };
+
+    // The smallest ID still stored, which is what XINFO reports as
+    // recorded-first-entry-id and what the lag arithmetic calls first_id.
+    auto read_stream_first_id = [&](void* txn, const std::string& stream_key, RedisStreamId& id, bool& found) {
+        const std::string prefix = make_stream_entry_prefix(stream_key);
+        std::optional<std::string> upper = storage_prefix_upper(prefix);
+        std::vector<std::pair<std::string, std::string>> records;
+        mako::Status s = collect_stream_range(
+            txn, prefix, prefix, upper ? *upper : std::string(), 1, records);
+        if (!s.ok()) {
+            return s;
+        }
+        found = !records.empty() && stream_id_from_key_suffix(records[0].first, prefix.size(), id);
+        if (!found) {
+            id = RedisStreamId{};
+        }
+        return mako::Status::OK();
+    };
+
+    // XRANGE/XREVRANGE/XREAD in one call: the inclusive [start, end] ID range
+    // becomes a storage key range, so COUNT on a forward read stops the walk
+    // instead of filtering afterwards. A reverse read has to see the whole
+    // range before it knows which records are the last `count`, because the
+    // ordered index only walks forward.
+    auto collect_stream_entries = [&](void* txn,
+                                      const std::string& stream_key,
+                                      const RedisStreamId& start,
+                                      const RedisStreamId& end,
+                                      size_t count,
+                                      bool reverse,
+                                      std::vector<std::pair<RedisStreamId, std::string>>& out) {
+        out.clear();
+        if (stream_id_compare(start, end) > 0) {
+            return mako::Status::OK();
+        }
+        const std::string prefix = make_stream_entry_prefix(stream_key);
+        const std::string scan_start = make_stream_entry_key(stream_key, start);
+        std::string scan_end = make_stream_entry_key(stream_key, end);
+        scan_end.push_back('\0');
+        std::vector<std::pair<std::string, std::string>> records;
+        mako::Status s = collect_stream_range(
+            txn, prefix, scan_start, scan_end, reverse ? 0 : count, records);
+        if (!s.ok()) {
+            return s;
+        }
+        size_t first = 0;
+        if (reverse && count != 0 && records.size() > count) {
+            first = records.size() - count;
+        }
+        out.reserve(records.size() - first);
+        for (size_t i = first; i < records.size(); ++i) {
+            RedisStreamId id;
+            if (!stream_id_from_key_suffix(records[i].first, prefix.size(), id)) {
+                continue;
+            }
+            out.emplace_back(id, records[i].second);
+        }
+        if (reverse) {
+            std::reverse(out.begin(), out.end());
+        }
+        return mako::Status::OK();
+    };
+
+    auto collect_stream_group_names = [&](void* txn, const std::string& stream_key, std::vector<std::string>& names) {
+        names.clear();
+        const std::string prefix = make_stream_group_prefix(stream_key);
+        std::optional<std::string> upper = storage_prefix_upper(prefix);
+        std::vector<std::pair<std::string, std::string>> records;
+        mako::Status s = collect_stream_range(
+            txn, prefix, prefix, upper ? *upper : std::string(), 0, records);
+        if (!s.ok()) {
+            return s;
+        }
+        for (const auto& [storage_key, value] : records) {
+            if (storage_key.size() < prefix.size() + 8) {
+                continue;
+            }
+            const uint64_t name_len = stream_get_u64_le(storage_key, prefix.size());
+            if (storage_key.size() != prefix.size() + 8 + name_len) {
+                continue;
+            }
+            names.emplace_back(storage_key, prefix.size() + 8, static_cast<size_t>(name_len));
+        }
+        return mako::Status::OK();
+    };
+
+    auto read_stream_group = [&](void* txn,
+                                 const std::string& stream_key,
+                                 const std::string& group_name,
+                                 RedisStreamGroup& group,
+                                 bool& exists) {
+        group = RedisStreamGroup{};
+        std::string value;
+        exists = false;
+        mako::Status s = read_internal_current(
+            txn, make_stream_group_key(stream_key, group_name), value, exists);
+        if (!s.ok() || !exists) {
+            return s;
+        }
+        if (!stream_unpack_group(value, group)) {
+            group = RedisStreamGroup{};
+        }
+        return mako::Status::OK();
+    };
+
+    auto write_stream_group = [&](void* txn,
+                                  const std::string& stream_key,
+                                  const std::string& group_name,
+                                  const RedisStreamGroup& group) {
+        return put_raw(txn, make_stream_group_key(stream_key, group_name), stream_pack_group(group));
+    };
+
+    auto collect_stream_consumer_names = [&](void* txn,
+                                             const std::string& stream_key,
+                                             const std::string& group_name,
+                                             std::vector<std::pair<std::string, RedisStreamConsumer>>& consumers) {
+        consumers.clear();
+        const std::string prefix = make_stream_consumer_prefix(stream_key, group_name);
+        std::optional<std::string> upper = storage_prefix_upper(prefix);
+        std::vector<std::pair<std::string, std::string>> records;
+        mako::Status s = collect_stream_range(
+            txn, prefix, prefix, upper ? *upper : std::string(), 0, records);
+        if (!s.ok()) {
+            return s;
+        }
+        for (const auto& [storage_key, value] : records) {
+            RedisStreamConsumer consumer;
+            if (!stream_unpack_consumer(value, consumer)) {
+                continue;
+            }
+            consumers.emplace_back(
+                std::string(storage_key, prefix.size(), storage_key.size() - prefix.size()),
+                consumer);
+        }
+        return mako::Status::OK();
+    };
+
+    auto read_stream_consumer = [&](void* txn,
+                                    const std::string& stream_key,
+                                    const std::string& group_name,
+                                    const std::string& consumer_name,
+                                    RedisStreamConsumer& consumer,
+                                    bool& exists) {
+        consumer = RedisStreamConsumer{};
+        std::string value;
+        exists = false;
+        mako::Status s = read_internal_current(
+            txn, make_stream_consumer_key(stream_key, group_name, consumer_name), value, exists);
+        if (!s.ok() || !exists) {
+            return s;
+        }
+        if (!stream_unpack_consumer(value, consumer)) {
+            consumer = RedisStreamConsumer{};
+        }
+        return mako::Status::OK();
+    };
+
+    auto write_stream_consumer = [&](void* txn,
+                                     const std::string& stream_key,
+                                     const std::string& group_name,
+                                     const std::string& consumer_name,
+                                     const RedisStreamConsumer& consumer) {
+        return put_raw(
+            txn,
+            make_stream_consumer_key(stream_key, group_name, consumer_name),
+            stream_pack_consumer(consumer));
+    };
+
+    auto read_stream_nack = [&](void* txn,
+                                const std::string& stream_key,
+                                const std::string& group_name,
+                                const RedisStreamId& id,
+                                RedisStreamNack& nack,
+                                bool& exists) {
+        nack = RedisStreamNack{};
+        std::string value;
+        exists = false;
+        mako::Status s = read_internal_current(
+            txn, make_stream_pel_key(stream_key, group_name, id), value, exists);
+        if (!s.ok() || !exists) {
+            return s;
+        }
+        if (!stream_unpack_nack(value, nack)) {
+            exists = false;
+        }
+        return mako::Status::OK();
+    };
+
+    auto write_stream_nack = [&](void* txn,
+                                 const std::string& stream_key,
+                                 const std::string& group_name,
+                                 const RedisStreamId& id,
+                                 const RedisStreamNack& nack) {
+        return put_raw(txn, make_stream_pel_key(stream_key, group_name, id), stream_pack_nack(nack));
+    };
+
+    // The group PEL in ID order. A per-consumer view is this list filtered by
+    // owner, which is what Redis's per-consumer PEL is a materialized copy of.
+    auto collect_stream_pel = [&](void* txn,
+                                  const std::string& stream_key,
+                                  const std::string& group_name,
+                                  const RedisStreamId& start,
+                                  const RedisStreamId& end,
+                                  size_t count,
+                                  std::vector<std::pair<RedisStreamId, RedisStreamNack>>& out) {
+        out.clear();
+        if (stream_id_compare(start, end) > 0) {
+            return mako::Status::OK();
+        }
+        const std::string prefix = make_stream_pel_prefix(stream_key, group_name);
+        const std::string scan_start = make_stream_pel_key(stream_key, group_name, start);
+        std::string scan_end = make_stream_pel_key(stream_key, group_name, end);
+        scan_end.push_back('\0');
+        std::vector<std::pair<std::string, std::string>> records;
+        mako::Status s = collect_stream_range(txn, prefix, scan_start, scan_end, count, records);
+        if (!s.ok()) {
+            return s;
+        }
+        out.reserve(records.size());
+        for (const auto& [storage_key, value] : records) {
+            RedisStreamId id;
+            RedisStreamNack nack;
+            if (!stream_id_from_key_suffix(storage_key, prefix.size(), id)
+                || !stream_unpack_nack(value, nack)) {
+                continue;
+            }
+            out.emplace_back(id, nack);
+        }
+        return mako::Status::OK();
+    };
+
+    // Drop one PEL record and decrement both counters that track it.
+    auto remove_stream_nack = [&](void* txn,
+                                  const std::string& stream_key,
+                                  const std::string& group_name,
+                                  RedisStreamGroup& group,
+                                  const RedisStreamId& id,
+                                  const RedisStreamNack& nack) {
+        mako::Status s = delete_raw_if_exists(txn, make_stream_pel_key(stream_key, group_name, id));
+        if (!s.ok()) {
+            return s;
+        }
+        if (group.pel > 0) {
+            group.pel -= 1;
+        }
+        RedisStreamConsumer owner;
+        bool owner_exists = false;
+        s = read_stream_consumer(txn, stream_key, group_name, nack.consumer, owner, owner_exists);
+        if (!s.ok() || !owner_exists) {
+            return s;
+        }
+        if (owner.pending > 0) {
+            owner.pending -= 1;
+        }
+        return write_stream_consumer(txn, stream_key, group_name, nack.consumer, owner);
+    };
+
+    // Redis creates a consumer on first mention and keeps two clocks on it:
+    // seen-time on every command it issues, active-time only when it is handed
+    // an entry.
+    auto touch_stream_consumer = [&](void* txn,
+                                     const std::string& stream_key,
+                                     const std::string& group_name,
+                                     RedisStreamGroup& group,
+                                     const std::string& consumer_name,
+                                     bool delivered,
+                                     RedisStreamConsumer& consumer,
+                                     bool& created) {
+        bool exists = false;
+        mako::Status s = read_stream_consumer(txn, stream_key, group_name, consumer_name, consumer, exists);
+        if (!s.ok()) {
+            return s;
+        }
+        created = !exists;
+        const int64_t now = now_unix_ms();
+        if (!exists) {
+            consumer = RedisStreamConsumer{};
+            consumer.active_time_ms = -1;
+            group.consumers += 1;
+        }
+        consumer.seen_time_ms = now;
+        if (delivered) {
+            consumer.active_time_ms = now;
+        }
+        return write_stream_consumer(txn, stream_key, group_name, consumer_name, consumer);
+    };
+
+    // Everything a group owns: the PEL, the consumers and the group record.
+    auto delete_stream_group_records = [&](void* txn, const std::string& stream_key, const std::string& group_name) {
+        const std::string pel_prefix = make_stream_pel_prefix(stream_key, group_name);
+        std::optional<std::string> pel_upper = storage_prefix_upper(pel_prefix);
+        std::vector<std::pair<std::string, std::string>> records;
+        mako::Status s = collect_stream_range(
+            txn, pel_prefix, pel_prefix, pel_upper ? *pel_upper : std::string(), 0, records);
+        if (!s.ok()) {
+            return s;
+        }
+        for (const auto& [storage_key, value] : records) {
+            (void)value;
+            s = delete_raw_if_exists(txn, storage_key);
+            if (!s.ok()) {
+                return s;
+            }
+        }
+        const std::string consumer_prefix = make_stream_consumer_prefix(stream_key, group_name);
+        std::optional<std::string> consumer_upper = storage_prefix_upper(consumer_prefix);
+        s = collect_stream_range(
+            txn, consumer_prefix, consumer_prefix,
+            consumer_upper ? *consumer_upper : std::string(), 0, records);
+        if (!s.ok()) {
+            return s;
+        }
+        for (const auto& [storage_key, value] : records) {
+            (void)value;
+            s = delete_raw_if_exists(txn, storage_key);
+            if (!s.ok()) {
+                return s;
+            }
+        }
+        return delete_raw_if_exists(txn, make_stream_group_key(stream_key, group_name));
+    };
+
+    // DEL/expiry/RENAME of the key: every record of every family goes.
+    auto delete_stream = [&](void* txn, const std::string& stream_key) {
+        bool exists = false;
+        mako::Status s = stream_exists(txn, stream_key, exists);
+        if (!s.ok() || !exists) {
+            return s;
+        }
+        std::vector<std::string> group_names;
+        s = collect_stream_group_names(txn, stream_key, group_names);
+        if (!s.ok()) {
+            return s;
+        }
+        for (const auto& group_name : group_names) {
+            s = delete_stream_group_records(txn, stream_key, group_name);
+            if (!s.ok()) {
+                return s;
+            }
+        }
+        const std::string entry_prefix = make_stream_entry_prefix(stream_key);
+        std::optional<std::string> entry_upper = storage_prefix_upper(entry_prefix);
+        std::vector<std::pair<std::string, std::string>> records;
+        s = collect_stream_range(
+            txn, entry_prefix, entry_prefix, entry_upper ? *entry_upper : std::string(), 0, records);
+        if (!s.ok()) {
+            return s;
+        }
+        for (const auto& [storage_key, value] : records) {
+            (void)value;
+            s = delete_raw_if_exists(txn, storage_key);
+            if (!s.ok()) {
+                return s;
+            }
+        }
+        return delete_raw_if_exists(txn, make_stream_meta_key(stream_key));
+    };
+
+    // XTRIM, and the trailing half of an XADD that carried MAXLEN/MINID.
+    // `limit` is Redis's LIMIT: the most entries one call may remove.
+    auto trim_stream = [&](void* txn,
+                           const std::string& stream_key,
+                           RedisStreamMeta& meta,
+                           const std::string& strategy,
+                           const std::string& threshold,
+                           int64_t limit,
+                           int64_t& removed) {
+        removed = 0;
+        if (strategy.empty()) {
+            return mako::Status::OK();
+        }
+        const std::string prefix = make_stream_entry_prefix(stream_key);
+        std::vector<std::pair<std::string, std::string>> records;
+        mako::Status s = mako::Status::OK();
+        if (strategy == "MAXLEN") {
+            uint64_t target = 0;
+            if (!stream_parse_u64(threshold.data(), threshold.size(), target)
+                || meta.length <= target) {
+                return mako::Status::OK();
+            }
+            uint64_t to_remove = meta.length - target;
+            if (limit > 0 && static_cast<uint64_t>(limit) < to_remove) {
+                to_remove = static_cast<uint64_t>(limit);
+            }
+            std::optional<std::string> upper = storage_prefix_upper(prefix);
+            s = collect_stream_range(
+                txn, prefix, prefix, upper ? *upper : std::string(),
+                static_cast<size_t>(to_remove), records);
+        } else {
+            RedisStreamId minid;
+            if (!stream_id_parse(threshold, minid)) {
+                return mako::Status::OK();
+            }
+            const std::string scan_end = make_stream_entry_key(stream_key, minid);
+            s = collect_stream_range(
+                txn, prefix, prefix, scan_end,
+                limit > 0 ? static_cast<size_t>(limit) : 0, records);
+        }
+        if (!s.ok()) {
+            return s;
+        }
+        for (const auto& [storage_key, value] : records) {
+            (void)value;
+            s = delete_raw_if_exists(txn, storage_key);
+            if (!s.ok()) {
+                return s;
+            }
+        }
+        removed = static_cast<int64_t>(records.size());
+        if (removed == 0) {
+            return mako::Status::OK();
+        }
+        meta.length -= static_cast<uint64_t>(removed);
+        bool found_first = false;
+        s = read_stream_first_id(txn, stream_key, meta.first_id, found_first);
+        if (!s.ok()) {
+            return s;
+        }
+        if (!found_first) {
+            meta.first_id = RedisStreamId{};
+        }
+        return mako::Status::OK();
+    };
+
+    // The group half of an XINFO reply, flattened into `payload` so Rust can
+    // walk it with a cursor. `full` selects XINFO STREAM FULL's shape (every
+    // group with its PEL and its consumers); otherwise it is XINFO GROUPS' one
+    // summary row per group. `only_group`, when set, restricts the walk to that
+    // one group, which is how XINFO CONSUMERS reads it.
+    auto append_stream_group_info = [&](void* txn,
+                                        const std::string& stream_key,
+                                        const RedisStreamMeta& meta,
+                                        const std::string& only_group,
+                                        size_t pel_limit,
+                                        bool full,
+                                        std::vector<std::string>& payload) {
+        std::vector<std::string> group_names;
+        mako::Status s = collect_stream_group_names(txn, stream_key, group_names);
+        if (!s.ok()) {
+            return s;
+        }
+        if (!only_group.empty()) {
+            std::vector<std::string> filtered;
+            for (const auto& name : group_names) {
+                if (name == only_group) {
+                    filtered.push_back(name);
+                }
+            }
+            group_names.swap(filtered);
+        }
+        RedisStreamId min_id;
+        RedisStreamId max_id;
+        max_id.ms = std::numeric_limits<uint64_t>::max();
+        max_id.seq = std::numeric_limits<uint64_t>::max();
+        payload.push_back(std::to_string(group_names.size()));
+        for (const auto& group_name : group_names) {
+            RedisStreamGroup group;
+            bool group_exists = false;
+            s = read_stream_group(txn, stream_key, group_name, group, group_exists);
+            if (!s.ok()) {
+                return s;
+            }
+            int64_t lag = 0;
+            const bool lag_known = stream_group_lag(meta, group, lag);
+            payload.push_back(group_name);
+            if (!full) {
+                payload.push_back(std::to_string(group.consumers));
+                payload.push_back(std::to_string(group.pel));
+                payload.push_back(stream_id_format(group.last_id));
+                payload.push_back(group.entries_read >= 0 ? std::to_string(group.entries_read) : std::string());
+                payload.push_back(lag_known ? std::to_string(lag) : std::string());
+                continue;
+            }
+            payload.push_back(stream_id_format(group.last_id));
+            payload.push_back(group.entries_read >= 0 ? std::to_string(group.entries_read) : std::string());
+            payload.push_back(lag_known ? std::to_string(lag) : std::string());
+            payload.push_back(std::to_string(group.pel));
+            std::vector<std::pair<RedisStreamId, RedisStreamNack>> pel;
+            s = collect_stream_pel(txn, stream_key, group_name, min_id, max_id, pel_limit, pel);
+            if (!s.ok()) {
+                return s;
+            }
+            payload.push_back(std::to_string(pel.size()));
+            for (const auto& [id, nack] : pel) {
+                payload.push_back(stream_id_format(id));
+                payload.push_back(nack.consumer);
+                payload.push_back(std::to_string(nack.delivery_time_ms));
+                payload.push_back(std::to_string(nack.delivery_count));
+            }
+            std::vector<std::pair<std::string, RedisStreamConsumer>> consumers;
+            s = collect_stream_consumer_names(txn, stream_key, group_name, consumers);
+            if (!s.ok()) {
+                return s;
+            }
+            payload.push_back(std::to_string(consumers.size()));
+            for (const auto& [consumer_name, consumer] : consumers) {
+                payload.push_back(consumer_name);
+                payload.push_back(std::to_string(consumer.seen_time_ms));
+                payload.push_back(std::to_string(consumer.active_time_ms));
+                payload.push_back(std::to_string(consumer.pending));
+                // A consumer's PEL view is the group's PEL filtered by owner.
+                std::vector<std::string> own;
+                size_t shown = 0;
+                for (const auto& [id, nack] : pel) {
+                    if (nack.consumer != consumer_name) {
+                        continue;
+                    }
+                    own.push_back(stream_id_format(id));
+                    own.push_back(std::to_string(nack.delivery_time_ms));
+                    own.push_back(std::to_string(nack.delivery_count));
+                    shown += 1;
+                    if (pel_limit != 0 && shown >= pel_limit) {
+                        break;
+                    }
+                }
+                payload.push_back(std::to_string(shown));
+                for (const auto& item : own) {
+                    payload.push_back(item);
+                }
+            }
+        }
+        return mako::Status::OK();
+    };
+
+    // XINFO CONSUMERS: one row per consumer of one group.
+    auto append_stream_consumer_info = [&](void* txn,
+                                           const std::string& stream_key,
+                                           const std::string& group_name,
+                                           std::vector<std::string>& payload) {
+        std::vector<std::pair<std::string, RedisStreamConsumer>> consumers;
+        mako::Status s = collect_stream_consumer_names(txn, stream_key, group_name, consumers);
+        if (!s.ok()) {
+            return s;
+        }
+        const int64_t now = now_unix_ms();
+        payload.push_back(std::to_string(consumers.size()));
+        for (const auto& [consumer_name, consumer] : consumers) {
+            payload.push_back(consumer_name);
+            payload.push_back(std::to_string(consumer.pending));
+            payload.push_back(std::to_string(std::max<int64_t>(0, now - consumer.seen_time_ms)));
+            payload.push_back(consumer.active_time_ms < 0
+                ? std::string("-1")
+                : std::to_string(std::max<int64_t>(0, now - consumer.active_time_ms)));
+        }
+        return mako::Status::OK();
+    };
+
+    // Every stream family is <tag> + u64le(len(stream key)) + stream key +
+    // <suffix>, and the suffix carries everything that identifies the record
+    // inside the stream: the entry or PEL ID, the group name, the consumer
+    // name. Reading each record's family letter, suffix and value is therefore
+    // the whole stream, and writing them back under another name rebuilds it.
+    // RENAME, COPY, MOVE and DUMP/RESTORE all go through this pair, so a stream
+    // carries its groups, consumers and pending-entry lists wherever it goes.
+    auto stream_family_tag = [](char letter, size_t& tag_len) -> const char* {
+        switch (letter) {
+            case 'M': tag_len = sizeof("\x01X#:") - 1; return "\x01X#:";
+            case 'E': tag_len = sizeof("\x01X:") - 1; return "\x01X:";
+            case 'G': tag_len = sizeof("\x01XG:") - 1; return "\x01XG:";
+            case 'C': tag_len = sizeof("\x01XC:") - 1; return "\x01XC:";
+            case 'P': tag_len = sizeof("\x01XP:") - 1; return "\x01XP:";
+            default: tag_len = 0; return nullptr;
+        }
+    };
+
+    auto collect_stream_records = [&](void* txn,
+                                      const std::string& stream_key,
+                                      std::vector<std::string>& out) {
+        out.clear();
+        static const char kFamilies[] = {'M', 'E', 'G', 'C', 'P'};
+        for (const char letter : kFamilies) {
+            size_t tag_len = 0;
+            const char* tag = stream_family_tag(letter, tag_len);
+            const std::string prefix = make_stream_family_prefix(tag, tag_len, stream_key);
+            std::optional<std::string> upper = storage_prefix_upper(prefix);
+            std::vector<std::pair<std::string, std::string>> records;
+            mako::Status s = collect_stream_range(
+                txn, prefix, prefix, upper ? *upper : std::string(), 0, records);
+            if (!s.ok()) {
+                return s;
+            }
+            for (const auto& [storage_key, value] : records) {
+                out.emplace_back(1, letter);
+                out.emplace_back(storage_key, prefix.size(), storage_key.size() - prefix.size());
+                out.push_back(value);
+            }
+        }
+        return mako::Status::OK();
+    };
+
+    auto write_stream_records = [&](void* txn,
+                                    const std::string& stream_key,
+                                    const std::vector<std::string>& records) {
+        if (records.size() % 3 != 0) {
+            return mako::Status::InvalidArgument("malformed stream record list");
+        }
+        for (size_t i = 0; i + 2 < records.size(); i += 3) {
+            if (records[i].size() != 1) {
+                return mako::Status::InvalidArgument("malformed stream record list");
+            }
+            size_t tag_len = 0;
+            const char* tag = stream_family_tag(records[i][0], tag_len);
+            if (tag == nullptr) {
+                return mako::Status::InvalidArgument("malformed stream record list");
+            }
+            std::string storage_key = make_stream_family_prefix(tag, tag_len, stream_key);
+            storage_key.append(records[i + 1]);
+            mako::Status s = put_raw(txn, storage_key, records[i + 2]);
+            if (!s.ok()) {
+                return s;
+            }
+        }
+        return mako::Status::OK();
+    };
+
     auto collect_set_members = [&](void* txn, const std::string& set_key, std::vector<std::string>& members) {
         members.clear();
         const std::string user_prefix = make_set_member_prefix(set_key);
@@ -3432,6 +4594,20 @@ static bool execute_ops_impl(
         return s;
     };
 
+    auto expire_stream_if_needed = [&](void* txn, const std::string& stream_key) {
+        int64_t expire_at_ms = 0;
+        bool ttl_exists = false;
+        mako::Status s = read_ttl_meta(txn, stream_key, expire_at_ms, ttl_exists);
+        if (!s.ok() || !ttl_exists || expire_at_ms > now_unix_ms()) {
+            return s;
+        }
+        s = delete_stream(txn, stream_key);
+        if (s.ok()) {
+            s = clear_ttl_meta(txn, stream_key);
+        }
+        return s;
+    };
+
     auto expire_logical_key_if_needed = [&](void* txn, const std::string& user_key, const std::string& storage_key) {
         int64_t expire_at_ms = 0;
         bool ttl_exists = false;
@@ -3454,6 +4630,9 @@ static bool execute_ops_impl(
         }
         if (s.ok()) {
             s = delete_hash(txn, user_key);
+        }
+        if (s.ok()) {
+            s = delete_stream(txn, user_key);
         }
         if (s.ok()) {
             s = clear_ttl_meta(txn, user_key);
@@ -3513,8 +4692,14 @@ static bool execute_ops_impl(
         }
         int64_t zset_count = 0;
         s = read_zset_cardinality(txn, user_key, zset_count);
-        exists = zset_count > 0;
-        return s;
+        if (!s.ok() || zset_count > 0) {
+            exists = zset_count > 0;
+            return s;
+        }
+        // A stream exists for as long as its meta record does, even with no
+        // entries at all: XADD MAXLEN 0 and XGROUP CREATE MKSTREAM both leave
+        // one behind and Redis reports that key as existing.
+        return stream_exists(txn, user_key, exists);
     };
 
     auto read_set_member_exists = [&](void* txn, const std::string& set_key, const std::string& member, bool& exists) {
@@ -3558,7 +4743,13 @@ static bool execute_ops_impl(
         if (!s.ok()) {
             return s;
         }
+        bool stream_here = false;
+        s = stream_exists(txn, set_key, stream_here);
+        if (!s.ok()) {
+            return s;
+        }
         allowed = !string_exists && list_length == 0 && zset_count == 0 && hash_count == 0;
+        allowed = allowed && !stream_here;
         if (!allowed) {
             result.success = false;
         }
@@ -3591,7 +4782,13 @@ static bool execute_ops_impl(
         if (!s.ok()) {
             return s;
         }
+        bool stream_here = false;
+        s = stream_exists(txn, list_key, stream_here);
+        if (!s.ok()) {
+            return s;
+        }
         allowed = !string_exists && set_cardinality == 0 && zset_count == 0 && hash_count == 0;
+        allowed = allowed && !stream_here;
         if (!allowed) {
             result.success = false;
         }
@@ -3624,7 +4821,13 @@ static bool execute_ops_impl(
         if (!s.ok()) {
             return s;
         }
+        bool stream_here = false;
+        s = stream_exists(txn, zset_key, stream_here);
+        if (!s.ok()) {
+            return s;
+        }
         allowed = !string_exists && set_cardinality == 0 && list_length == 0 && hash_count == 0;
+        allowed = allowed && !stream_here;
         if (!allowed) {
             result.success = false;
         }
@@ -3657,7 +4860,13 @@ static bool execute_ops_impl(
         if (!s.ok()) {
             return s;
         }
-        allowed = !string_exists && set_cardinality == 0 && list_length == 0 && zset_count == 0;
+        bool stream_here = false;
+        s = stream_exists(txn, hash_key, stream_here);
+        if (!s.ok()) {
+            return s;
+        }
+        allowed = !string_exists && set_cardinality == 0 && list_length == 0 && zset_count == 0
+            && !stream_here;
         if (!allowed) {
             result.success = false;
         }
@@ -3699,7 +4908,52 @@ static bool execute_ops_impl(
         if (!s.ok()) {
             return s;
         }
-        allowed = set_cardinality == 0 && list_length == 0 && zset_count == 0 && hash_count == 0;
+        bool stream_here = false;
+        s = stream_exists(txn, user_key, stream_here);
+        if (!s.ok()) {
+            return s;
+        }
+        allowed = set_cardinality == 0 && list_length == 0 && zset_count == 0 && hash_count == 0
+            && !stream_here;
+        if (!allowed) {
+            result.success = false;
+        }
+        return mako::Status::OK();
+    };
+
+    auto stream_key_allowed = [&](void* txn, const std::string& stream_key, TxnOpResult& result, bool& allowed) {
+        std::string string_storage_key = "table_key_" + stream_key;
+        mako::Status s = expire_logical_key_if_needed(txn, stream_key, string_storage_key);
+        if (!s.ok()) {
+            return s;
+        }
+        bool string_exists = false;
+        s = read_string_exists_no_expire(txn, string_storage_key, string_exists);
+        if (!s.ok()) {
+            return s;
+        }
+        int64_t set_cardinality = 0;
+        s = read_set_cardinality(txn, stream_key, set_cardinality);
+        if (!s.ok()) {
+            return s;
+        }
+        int64_t list_length = 0;
+        s = read_list_length(txn, stream_key, list_length);
+        if (!s.ok()) {
+            return s;
+        }
+        int64_t zset_count = 0;
+        s = read_zset_cardinality(txn, stream_key, zset_count);
+        if (!s.ok()) {
+            return s;
+        }
+        int64_t hash_count = 0;
+        s = read_hash_cardinality(txn, stream_key, hash_count);
+        if (!s.ok()) {
+            return s;
+        }
+        allowed = !string_exists && set_cardinality == 0 && list_length == 0
+            && zset_count == 0 && hash_count == 0;
         if (!allowed) {
             result.success = false;
         }
@@ -4142,6 +5396,12 @@ static bool execute_ops_impl(
                     continue;
                 }
                 bool hash_exists = hash_count > 0;
+                bool stream_here = false;
+                mako::Status stream_status = stream_exists(txn, user_key, stream_here);
+                if (!stream_status.ok()) {
+                    all_success = false;
+                    continue;
+                }
                 mako::Status s = mako::Status::OK();
                 if (set_exists) {
                     s = delete_set(txn, user_key);
@@ -4154,6 +5414,9 @@ static bool execute_ops_impl(
                 }
                 if (s.ok() && hash_exists) {
                     s = delete_hash(txn, user_key);
+                }
+                if (s.ok() && stream_here) {
+                    s = delete_stream(txn, user_key);
                 }
                 if (s.ok() && string_exists) {
                     s = delete_raw_if_exists(txn, tl_key_buf);
@@ -4688,13 +5951,18 @@ static bool execute_ops_impl(
                 }
                 int64_t hash_count = 0;
                 s = read_hash_cardinality_live(txn, user_key, hash_count);
+                bool stream_here = false;
+                if (s.ok()) {
+                    s = stream_exists(txn, user_key, stream_here);
+                }
                 result.success = s.ok();
                 result.value_present = true;
                 result.int_value = string_exists ? 1
                     : (set_count > 0 ? 2
                     : (list_length > 0 ? 3
                     : (zset_count > 0 ? 4
-                    : (hash_count > 0 ? 5 : 0))));
+                    : (hash_count > 0 ? 5
+                    : (stream_here ? 6 : 0)))));
                 if (!s.ok()) {
                     all_success = false;
                 }
@@ -4732,8 +6000,15 @@ static bool execute_ops_impl(
                     all_success = false;
                     continue;
                 }
+                bool source_stream = false;
+                s = stream_exists(txn, user_key, source_stream);
+                if (!s.ok()) {
+                    result.success = false;
+                    all_success = false;
+                    continue;
+                }
                 if (!string_exists && set_cardinality == 0 && list_length == 0
-                    && zset_count == 0 && hash_count == 0) {
+                    && zset_count == 0 && hash_count == 0 && !source_stream) {
                     result.success = false;
                     result.int_value = -1;
                     continue;
@@ -4767,6 +6042,10 @@ static bool execute_ops_impl(
                     if (ds.ok()) {
                         ds = read_hash_cardinality(txn, destination, destination_hash_count);
                     }
+                    bool destination_stream = false;
+                    if (ds.ok()) {
+                        ds = stream_exists(txn, destination, destination_stream);
+                    }
                     if (!ds.ok()) {
                         result.success = false;
                         all_success = false;
@@ -4774,7 +6053,7 @@ static bool execute_ops_impl(
                     }
                     if (destination_string_exists || destination_set_cardinality > 0
                         || destination_list_length > 0 || destination_zset_count > 0
-                        || destination_hash_count > 0) {
+                        || destination_hash_count > 0 || destination_stream) {
                         result.success = true;
                         result.value_present = true;
                         result.int_value = 0;
@@ -4788,8 +6067,10 @@ static bool execute_ops_impl(
                 std::map<std::string, double> zset_values;
                 std::map<std::string, std::string> hash_entries;
                 // RENAME and COPY move the whole object, so the per-field
-                // expirations travel with the fields.
+                // expirations travel with the fields, and a stream carries its
+                // groups, consumers and pending-entry lists.
                 std::map<std::string, int64_t> hash_field_ttls;
+                std::vector<std::string> stream_records;
                 if (string_exists) {
                     bool exists = false;
                     s = read_internal_current(txn, source_storage_key, string_value, exists);
@@ -4804,6 +6085,8 @@ static bool execute_ops_impl(
                     s = read_list_values(txn, user_key, list_values);
                 } else if (zset_count > 0) {
                     s = collect_zset_values(txn, user_key, zset_values);
+                } else if (source_stream) {
+                    s = collect_stream_records(txn, user_key, stream_records);
                 } else {
                     s = collect_hash_entries(txn, user_key, hash_entries);
                     if (s.ok()) {
@@ -4843,6 +6126,9 @@ static bool execute_ops_impl(
                         ds = delete_hash(txn, logical_key);
                     }
                     if (ds.ok()) {
+                        ds = delete_stream(txn, logical_key);
+                    }
+                    if (ds.ok()) {
                         ds = clear_ttl_meta(txn, logical_key);
                     }
                     return ds;
@@ -4878,6 +6164,8 @@ static bool execute_ops_impl(
                     // every other path stores "1", so ZSCORE answered a
                     // different string after a RENAME than before it.
                     s = rewrite_zset_values(txn, destination, zset_values);
+                } else if (s.ok() && !stream_records.empty()) {
+                    s = write_stream_records(txn, destination, stream_records);
                 } else if (s.ok()) {
                     for (const auto& [field, value] : hash_entries) {
                         std::string field_key = hash_field_storage_key(destination, field);
@@ -4969,8 +6257,15 @@ static bool execute_ops_impl(
                     all_success = false;
                     continue;
                 }
+                bool source_stream = false;
+                s = stream_exists(txn, user_key, source_stream);
+                if (!s.ok()) {
+                    result.success = false;
+                    all_success = false;
+                    continue;
+                }
                 if (!string_exists && set_cardinality == 0 && list_length == 0
-                    && zset_count == 0 && hash_count == 0) {
+                    && zset_count == 0 && hash_count == 0 && !source_stream) {
                     result.success = true;
                     result.value_present = true;
                     result.int_value = 0;
@@ -5005,6 +6300,10 @@ static bool execute_ops_impl(
                 if (ds.ok()) {
                     ds = read_hash_cardinality(txn, destination, destination_hash_count);
                 }
+                bool destination_stream = false;
+                if (ds.ok()) {
+                    ds = stream_exists(txn, destination, destination_stream);
+                }
                 if (!ds.ok()) {
                     result.success = false;
                     all_success = false;
@@ -5012,7 +6311,8 @@ static bool execute_ops_impl(
                 }
                 const bool destination_exists = destination_string_exists
                     || destination_set_cardinality > 0 || destination_list_length > 0
-                    || destination_zset_count > 0 || destination_hash_count > 0;
+                    || destination_zset_count > 0 || destination_hash_count > 0
+                    || destination_stream;
                 if (destination_exists && !replace) {
                     result.success = true;
                     result.value_present = true;
@@ -5026,8 +6326,10 @@ static bool execute_ops_impl(
                 std::map<std::string, double> zset_values;
                 std::map<std::string, std::string> hash_entries;
                 // RENAME and COPY move the whole object, so the per-field
-                // expirations travel with the fields.
+                // expirations travel with the fields, and a stream carries its
+                // groups, consumers and pending-entry lists.
                 std::map<std::string, int64_t> hash_field_ttls;
+                std::vector<std::string> stream_records;
                 if (string_exists) {
                     bool exists = false;
                     s = read_internal_current(txn, source_storage_key, string_value, exists);
@@ -5043,6 +6345,8 @@ static bool execute_ops_impl(
                     s = read_list_values(txn, user_key, list_values);
                 } else if (zset_count > 0) {
                     s = collect_zset_values(txn, user_key, zset_values);
+                } else if (source_stream) {
+                    s = collect_stream_records(txn, user_key, stream_records);
                 } else {
                     s = collect_hash_entries(txn, user_key, hash_entries);
                     if (s.ok()) {
@@ -5082,6 +6386,9 @@ static bool execute_ops_impl(
                         delete_status = delete_hash(txn, logical_key);
                     }
                     if (delete_status.ok()) {
+                        delete_status = delete_stream(txn, logical_key);
+                    }
+                    if (delete_status.ok()) {
                         delete_status = clear_ttl_meta(txn, logical_key);
                     }
                     return delete_status;
@@ -5111,6 +6418,8 @@ static bool execute_ops_impl(
                     s = rewrite_list_values(txn, destination, list_values);
                 } else if (s.ok() && !zset_values.empty()) {
                     s = rewrite_zset_values(txn, destination, zset_values);
+                } else if (s.ok() && !stream_records.empty()) {
+                    s = write_stream_records(txn, destination, stream_records);
                 } else if (s.ok()) {
                     for (const auto& [field, value] : hash_entries) {
                         std::string field_key = hash_field_storage_key(destination, field);
@@ -5176,6 +6485,10 @@ static bool execute_ops_impl(
                 if (s.ok()) {
                     s = read_zset_cardinality(txn, user_key, zset_count);
                 }
+                bool stream_here = false;
+                if (s.ok()) {
+                    s = stream_exists(txn, user_key, stream_here);
+                }
                 if (!s.ok()) {
                     result.success = false;
                     all_success = false;
@@ -5226,6 +6539,15 @@ static bool execute_ops_impl(
                             fields.push_back(member);
                         }
                         payload = std::string("MAKO_ZSET_DUMP\0", 15) + pack_bytes_list(fields);
+                    }
+                } else if (stream_here) {
+                    // The whole stream, family letter by family letter, so a
+                    // RESTORE brings back the entries and the consumer groups
+                    // with their pending-entry lists.
+                    std::vector<std::string> records;
+                    s = collect_stream_records(txn, user_key, records);
+                    if (s.ok()) {
+                        payload = std::string("MAKO_STREAM_DUMP\0", 17) + pack_bytes_list(records);
                     }
                 }
                 if (!s.ok()) {
@@ -5746,6 +7068,539 @@ static bool execute_ops_impl(
                     all_success = false;
                     continue;
                 }
+            } else if (op.op == TXN_OP_XADD) {
+                // One op: the insert and the MAXLEN/MINID trim that follows it
+                // have to be the same transaction, and a request's op list is
+                // built before the executor sees it.
+                std::vector<std::string> args;
+                if (!unpack_bytes_list(op.val_ptr, op.val_len, args)
+                    || args.size() < 7 || (args.size() - 5) % 2 != 0) {
+                    all_success = false;
+                    continue;
+                }
+                const std::string id_spec = args[0];
+                const bool nomkstream = args[1] == "1";
+                const std::string trim_strategy = args[2];
+                const std::string trim_threshold = args[3];
+                int64_t trim_limit = 0;
+                parse_int64(args[4], trim_limit);
+
+                bool allowed = false;
+                mako::Status s = stream_key_allowed(txn, user_key, result, allowed);
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                if (!allowed) {
+                    continue;
+                }
+                s = expire_stream_if_needed(txn, user_key);
+                RedisStreamMeta meta;
+                bool exists = false;
+                if (s.ok()) {
+                    s = read_stream_meta(txn, user_key, meta, exists);
+                }
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                if (!exists && nomkstream) {
+                    result.success = true;
+                    result.value_present = false;
+                    result.int_value = TXN_STREAM_ERR_NOMKSTREAM;
+                    continue;
+                }
+
+                RedisStreamId id;
+                bool id_ok = true;
+                if (id_spec == "*") {
+                    const uint64_t now = static_cast<uint64_t>(now_unix_ms());
+                    if (now > meta.last_id.ms) {
+                        id.ms = now;
+                        id.seq = 0;
+                    } else {
+                        id = meta.last_id;
+                        id_ok = stream_id_incr(id);
+                    }
+                } else if (id_spec.size() > 2
+                           && id_spec.compare(id_spec.size() - 2, 2, "-*") == 0) {
+                    // "<ms>-*": the sequence continues the last ID when the
+                    // milliseconds match and restarts at zero otherwise.
+                    uint64_t ms = 0;
+                    if (!stream_parse_u64(id_spec.data(), id_spec.size() - 2, ms)) {
+                        all_success = false;
+                        continue;
+                    }
+                    if (ms == meta.last_id.ms) {
+                        id = meta.last_id;
+                        id_ok = stream_id_incr(id) && id.ms == ms;
+                    } else {
+                        id.ms = ms;
+                        id.seq = 0;
+                    }
+                } else if (!stream_id_parse(id_spec, id)) {
+                    all_success = false;
+                    continue;
+                }
+                if (!id_ok || stream_id_compare(id, meta.last_id) <= 0) {
+                    result.success = true;
+                    result.value_present = false;
+                    result.int_value = TXN_STREAM_ERR_SMALLER_ID;
+                    continue;
+                }
+
+                std::vector<std::string> fields(args.begin() + 5, args.end());
+                s = put_raw(txn, make_stream_entry_key(user_key, id), pack_bytes_list(fields));
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                meta.length += 1;
+                meta.entries_added += 1;
+                meta.last_id = id;
+                if (meta.length == 1) {
+                    meta.first_id = id;
+                }
+                int64_t trimmed = 0;
+                s = trim_stream(txn, user_key, meta, trim_strategy, trim_threshold, trim_limit, trimmed);
+                if (s.ok()) {
+                    s = write_stream_meta(txn, user_key, meta);
+                }
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                result.success = true;
+                result.int_value = 0;
+                if (!copy_result_value(result, stream_id_format(id))) {
+                    all_success = false;
+                }
+            } else if (op.op == TXN_OP_XRANGE) {
+                // XRANGE, XREVRANGE and one stream of an XREAD. Rust has
+                // already turned "-", "+", the bare "<ms>" forms and the "("
+                // exclusive markers into an inclusive [start, end] pair.
+                std::vector<std::string> args;
+                RedisStreamId start;
+                RedisStreamId end;
+                if (!unpack_bytes_list(op.val_ptr, op.val_len, args) || args.size() != 4
+                    || !stream_id_parse(args[0], start) || !stream_id_parse(args[1], end)) {
+                    all_success = false;
+                    continue;
+                }
+                int64_t count = 0;
+                parse_int64(args[2], count);
+                const bool reverse = args[3] == "1";
+
+                bool allowed = false;
+                mako::Status s = stream_key_allowed(txn, user_key, result, allowed);
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                if (!allowed) {
+                    continue;
+                }
+                s = expire_stream_if_needed(txn, user_key);
+                RedisStreamMeta meta;
+                bool exists = false;
+                if (s.ok()) {
+                    s = read_stream_meta(txn, user_key, meta, exists);
+                }
+                std::vector<std::pair<RedisStreamId, std::string>> entries;
+                if (s.ok() && exists && meta.length > 0) {
+                    s = collect_stream_entries(
+                        txn, user_key, start, end,
+                        count > 0 ? static_cast<size_t>(count) : 0, reverse, entries);
+                }
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                // Item 0 is the stream's last-generated ID, which is what a
+                // blocking XREAD resolves "$" and "+" to when the first attempt
+                // found nothing.
+                std::vector<std::string> payload;
+                payload.reserve(1 + entries.size() * 2);
+                payload.push_back(stream_id_format(meta.last_id));
+                for (const auto& [entry_id, entry_fields] : entries) {
+                    payload.push_back(stream_id_format(entry_id));
+                    payload.push_back(entry_fields);
+                }
+                result.success = true;
+                result.int_value = exists ? 1 : 0;
+                if (!copy_result_value(result, pack_bytes_list(payload))) {
+                    all_success = false;
+                }
+            } else if (op.op == TXN_OP_XLEN) {
+                bool allowed = false;
+                mako::Status s = stream_key_allowed(txn, user_key, result, allowed);
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                if (!allowed) {
+                    continue;
+                }
+                s = expire_stream_if_needed(txn, user_key);
+                RedisStreamMeta meta;
+                bool exists = false;
+                if (s.ok()) {
+                    s = read_stream_meta(txn, user_key, meta, exists);
+                }
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                result.success = true;
+                result.value_present = true;
+                result.int_value = static_cast<int64_t>(meta.length);
+            } else if (op.op == TXN_OP_XDEL) {
+                std::vector<std::string> ids;
+                if (!unpack_bytes_list(op.val_ptr, op.val_len, ids) || ids.empty()) {
+                    all_success = false;
+                    continue;
+                }
+                bool allowed = false;
+                mako::Status s = stream_key_allowed(txn, user_key, result, allowed);
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                if (!allowed) {
+                    continue;
+                }
+                s = expire_stream_if_needed(txn, user_key);
+                RedisStreamMeta meta;
+                bool exists = false;
+                if (s.ok()) {
+                    s = read_stream_meta(txn, user_key, meta, exists);
+                }
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                int64_t deleted = 0;
+                if (exists) {
+                    for (const auto& id_text : ids) {
+                        RedisStreamId id;
+                        if (!stream_id_parse(id_text, id)) {
+                            continue;
+                        }
+                        std::string fields;
+                        bool entry_exists = false;
+                        s = read_stream_entry(txn, user_key, id, fields, entry_exists);
+                        if (!s.ok()) {
+                            break;
+                        }
+                        if (!entry_exists) {
+                            continue;
+                        }
+                        s = delete_raw_if_exists(txn, make_stream_entry_key(user_key, id));
+                        if (!s.ok()) {
+                            break;
+                        }
+                        deleted += 1;
+                        if (meta.length > 0) {
+                            meta.length -= 1;
+                        }
+                        // Redis records the largest ID ever deleted, and never
+                        // lowers it: XTRIM does not touch it at all.
+                        if (stream_id_compare(id, meta.max_deleted_id) > 0) {
+                            meta.max_deleted_id = id;
+                        }
+                    }
+                }
+                if (s.ok() && deleted > 0) {
+                    bool found_first = false;
+                    s = read_stream_first_id(txn, user_key, meta.first_id, found_first);
+                    if (s.ok() && !found_first) {
+                        meta.first_id = RedisStreamId{};
+                    }
+                    if (s.ok()) {
+                        s = write_stream_meta(txn, user_key, meta);
+                    }
+                }
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                result.success = true;
+                result.value_present = true;
+                result.int_value = deleted;
+            } else if (op.op == TXN_OP_XTRIM) {
+                std::vector<std::string> args;
+                if (!unpack_bytes_list(op.val_ptr, op.val_len, args) || args.size() != 3) {
+                    all_success = false;
+                    continue;
+                }
+                int64_t trim_limit = 0;
+                parse_int64(args[2], trim_limit);
+                bool allowed = false;
+                mako::Status s = stream_key_allowed(txn, user_key, result, allowed);
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                if (!allowed) {
+                    continue;
+                }
+                s = expire_stream_if_needed(txn, user_key);
+                RedisStreamMeta meta;
+                bool exists = false;
+                if (s.ok()) {
+                    s = read_stream_meta(txn, user_key, meta, exists);
+                }
+                int64_t trimmed = 0;
+                if (s.ok() && exists) {
+                    s = trim_stream(txn, user_key, meta, args[0], args[1], trim_limit, trimmed);
+                    if (s.ok() && trimmed > 0) {
+                        s = write_stream_meta(txn, user_key, meta);
+                    }
+                }
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                result.success = true;
+                result.value_present = true;
+                result.int_value = trimmed;
+            } else if (op.op == TXN_OP_XSETID) {
+                std::vector<std::string> args;
+                RedisStreamId id;
+                if (!unpack_bytes_list(op.val_ptr, op.val_len, args) || args.size() != 3
+                    || !stream_id_parse(args[0], id)) {
+                    all_success = false;
+                    continue;
+                }
+                bool allowed = false;
+                mako::Status s = stream_key_allowed(txn, user_key, result, allowed);
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                if (!allowed) {
+                    continue;
+                }
+                s = expire_stream_if_needed(txn, user_key);
+                RedisStreamMeta meta;
+                bool exists = false;
+                if (s.ok()) {
+                    s = read_stream_meta(txn, user_key, meta, exists);
+                }
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                if (!exists) {
+                    result.success = true;
+                    result.value_present = false;
+                    result.int_value = TXN_STREAM_ERR_NO_SUCH_KEY;
+                    continue;
+                }
+                bool max_deleted_given = false;
+                RedisStreamId max_deleted = meta.max_deleted_id;
+                if (!args[2].empty()) {
+                    if (!stream_id_parse(args[2], max_deleted)) {
+                        all_success = false;
+                        continue;
+                    }
+                    max_deleted_given = true;
+                }
+                if (max_deleted_given && stream_id_compare(id, max_deleted) < 0) {
+                    result.success = true;
+                    result.value_present = false;
+                    result.int_value = TXN_STREAM_ERR_SETID_TOMBSTONE;
+                    continue;
+                }
+                int64_t entries_added = -1;
+                if (!args[1].empty() && !parse_int64(args[1], entries_added)) {
+                    all_success = false;
+                    continue;
+                }
+                if (meta.length > 0) {
+                    // The check is against the largest ID still stored, not the
+                    // last generated one, which may name a deleted entry.
+                    std::vector<std::pair<RedisStreamId, std::string>> last_entry;
+                    RedisStreamId max_id;
+                    RedisStreamId min_id;
+                    max_id.ms = std::numeric_limits<uint64_t>::max();
+                    max_id.seq = std::numeric_limits<uint64_t>::max();
+                    s = collect_stream_entries(txn, user_key, min_id, max_id, 1, true, last_entry);
+                    if (!s.ok()) {
+                        all_success = false;
+                        continue;
+                    }
+                    if (!last_entry.empty() && stream_id_compare(id, last_entry[0].first) < 0) {
+                        result.success = true;
+                        result.value_present = false;
+                        result.int_value = TXN_STREAM_ERR_SETID_SMALLER;
+                        continue;
+                    }
+                    if (entries_added >= 0 && meta.length > static_cast<uint64_t>(entries_added)) {
+                        result.success = true;
+                        result.value_present = false;
+                        result.int_value = TXN_STREAM_ERR_SETID_ENTRIES_ADDED;
+                        continue;
+                    }
+                }
+                if (!max_deleted_given && stream_id_compare(id, meta.max_deleted_id) < 0) {
+                    result.success = true;
+                    result.value_present = false;
+                    result.int_value = TXN_STREAM_ERR_SETID_TOMBSTONE;
+                    continue;
+                }
+                meta.last_id = id;
+                if (entries_added >= 0) {
+                    meta.entries_added = static_cast<uint64_t>(entries_added);
+                }
+                if (max_deleted_given && !stream_id_is_zero(max_deleted)) {
+                    meta.max_deleted_id = max_deleted;
+                }
+                s = write_stream_meta(txn, user_key, meta);
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                result.success = true;
+                result.value_present = true;
+                result.int_value = 0;
+            } else if (op.op == TXN_OP_XINFO) {
+                std::vector<std::string> args;
+                if (!unpack_bytes_list(op.val_ptr, op.val_len, args) || args.empty()) {
+                    all_success = false;
+                    continue;
+                }
+                bool allowed = false;
+                mako::Status s = stream_key_allowed(txn, user_key, result, allowed);
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                if (!allowed) {
+                    continue;
+                }
+                s = expire_stream_if_needed(txn, user_key);
+                RedisStreamMeta meta;
+                bool exists = false;
+                if (s.ok()) {
+                    s = read_stream_meta(txn, user_key, meta, exists);
+                }
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                if (!exists) {
+                    result.success = true;
+                    result.value_present = false;
+                    result.int_value = TXN_STREAM_ERR_NO_SUCH_KEY;
+                    continue;
+                }
+                RedisStreamId min_id;
+                RedisStreamId max_id;
+                max_id.ms = std::numeric_limits<uint64_t>::max();
+                max_id.seq = std::numeric_limits<uint64_t>::max();
+                std::vector<std::string> payload;
+
+                if (args[0] == "STREAM") {
+                    const bool full = args.size() > 1 && args[1] == "1";
+                    int64_t info_count = 10;
+                    if (args.size() > 2) {
+                        parse_int64(args[2], info_count);
+                    }
+                    payload.push_back(std::to_string(meta.length));
+                    // One storage record per entry, so the entry count is the
+                    // number of keys this stream occupies in the ordered index.
+                    payload.push_back(std::to_string(meta.length));
+                    payload.push_back(std::to_string(meta.length + 1));
+                    payload.push_back(stream_id_format(meta.last_id));
+                    payload.push_back(stream_id_format(meta.max_deleted_id));
+                    payload.push_back(std::to_string(meta.entries_added));
+                    payload.push_back(stream_id_format(meta.first_id));
+                    if (!full) {
+                        payload.push_back(std::to_string(meta.groups));
+                        std::vector<std::pair<RedisStreamId, std::string>> edge;
+                        s = collect_stream_entries(txn, user_key, min_id, max_id, 1, false, edge);
+                        if (s.ok()) {
+                            payload.push_back(edge.empty() ? "0" : "1");
+                            payload.push_back(edge.empty() ? std::string() : stream_id_format(edge[0].first));
+                            payload.push_back(edge.empty() ? std::string() : edge[0].second);
+                            s = collect_stream_entries(txn, user_key, min_id, max_id, 1, true, edge);
+                        }
+                        if (s.ok()) {
+                            payload.push_back(edge.empty() ? "0" : "1");
+                            payload.push_back(edge.empty() ? std::string() : stream_id_format(edge[0].first));
+                            payload.push_back(edge.empty() ? std::string() : edge[0].second);
+                        }
+                    } else {
+                        std::vector<std::pair<RedisStreamId, std::string>> entries;
+                        s = collect_stream_entries(
+                            txn, user_key, min_id, max_id,
+                            info_count > 0 ? static_cast<size_t>(info_count) : 0, false, entries);
+                        if (s.ok()) {
+                            payload.push_back(std::to_string(entries.size()));
+                            for (const auto& [entry_id, entry_fields] : entries) {
+                                payload.push_back(stream_id_format(entry_id));
+                                payload.push_back(entry_fields);
+                            }
+                            s = append_stream_group_info(
+                                txn, user_key, meta, std::string(),
+                                info_count > 0 ? static_cast<size_t>(info_count) : 0,
+                                true, payload);
+                        }
+                    }
+                    if (!s.ok()) {
+                        all_success = false;
+                        continue;
+                    }
+                    result.success = true;
+                    result.int_value = full ? 1 : 0;
+                    if (!copy_result_value(result, pack_bytes_list(payload))) {
+                        all_success = false;
+                    }
+                } else {
+                    all_success = false;
+                    continue;
+                }
+            } else if (op.op == TXN_OP_XRESTORE) {
+                // RESTORE of a MAKO_STREAM_DUMP payload: replace whatever is at
+                // the key with the records the dump carried, which are the
+                // whole stream including its groups, consumers and PELs.
+                std::vector<std::string> records;
+                if (!unpack_bytes_list(op.val_ptr, op.val_len, records) || records.size() % 3 != 0) {
+                    all_success = false;
+                    continue;
+                }
+                std::string storage_key = "table_key_" + user_key;
+                mako::Status s = delete_raw_if_exists(txn, storage_key);
+                if (s.ok()) {
+                    batch_exists[storage_key] = false;
+                    batch_values.erase(storage_key);
+                    s = delete_set(txn, user_key);
+                }
+                if (s.ok()) {
+                    s = delete_list(txn, user_key);
+                }
+                if (s.ok()) {
+                    s = delete_zset(txn, user_key);
+                }
+                if (s.ok()) {
+                    s = delete_hash(txn, user_key);
+                }
+                if (s.ok()) {
+                    s = delete_stream(txn, user_key);
+                }
+                if (s.ok()) {
+                    s = clear_ttl_meta(txn, user_key);
+                }
+                if (s.ok()) {
+                    s = write_stream_records(txn, user_key, records);
+                }
+                if (!s.ok()) {
+                    all_success = false;
+                    continue;
+                }
+                result.success = true;
+                result.value_present = true;
             } else if (op.op == TXN_OP_RESTORE_LIST) {
                 std::vector<std::string> values;
                 if (!unpack_bytes_list(op.val_ptr, op.val_len, values)) {
@@ -5766,6 +7621,9 @@ static bool execute_ops_impl(
                     }
                     if (ds.ok()) {
                         ds = delete_hash(txn, logical_key);
+                    }
+                    if (ds.ok()) {
+                        ds = delete_stream(txn, logical_key);
                     }
                     if (ds.ok()) {
                         ds = clear_ttl_meta(txn, logical_key);
@@ -5865,6 +7723,9 @@ static bool execute_ops_impl(
                         }
                         if (ds.ok()) {
                             ds = delete_hash(txn, logical_key);
+                        }
+                        if (ds.ok()) {
+                            ds = delete_stream(txn, logical_key);
                         }
                         if (ds.ok()) {
                             ds = clear_ttl_meta(txn, logical_key);

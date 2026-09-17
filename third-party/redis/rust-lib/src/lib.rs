@@ -75,6 +75,7 @@ const MAKO_LIST_DUMP_PREFIX: &[u8] = b"MAKO_LIST_DUMP\0";
 const MAKO_STRING_DUMP_PREFIX: &[u8] = b"MAKO_STRING_DUMP\0";
 const MAKO_SET_DUMP_PREFIX: &[u8] = b"MAKO_SET_DUMP\0";
 const MAKO_ZSET_DUMP_PREFIX: &[u8] = b"MAKO_ZSET_DUMP\0";
+const MAKO_STREAM_DUMP_PREFIX: &[u8] = b"MAKO_STREAM_DUMP\0";
 
 // ===== FFI Types (must match transaction_ffi.h) =====
 // Redis-visible keys must not use the 0x01 prefix. The C++ executor stores
@@ -167,6 +168,30 @@ const TXN_OP_BITFIELD: u32 = 82;
 const TXN_OP_HFIELD_EXPIRE: u32 = 83;
 const TXN_OP_HFIELD_TTL: u32 = 84;
 const TXN_OP_HFIELD_PERSIST: u32 = 85;
+// Redis Streams. TXN_OP_XRANGE serves XRANGE, XREVRANGE and each stream of an
+// XREAD, because the three differ only in the read mode packed into the op.
+const TXN_OP_XADD: u32 = 87;
+const TXN_OP_XRANGE: u32 = 88;
+const TXN_OP_XLEN: u32 = 89;
+const TXN_OP_XDEL: u32 = 90;
+const TXN_OP_XTRIM: u32 = 91;
+const TXN_OP_XSETID: u32 = 92;
+const TXN_OP_XINFO: u32 = 93;
+const TXN_OP_XRESTORE: u32 = 94;
+
+// Command-level failures a stream op reports in int_value; see the
+// TXN_STREAM_ERR_* block in include/transaction_ffi.h.
+const TXN_STREAM_ERR_NOMKSTREAM: i64 = -1;
+const TXN_STREAM_ERR_SMALLER_ID: i64 = -2;
+const TXN_STREAM_ERR_NO_SUCH_KEY: i64 = -3;
+const TXN_STREAM_ERR_SETID_SMALLER: i64 = -4;
+const TXN_STREAM_ERR_SETID_ENTRIES_ADDED: i64 = -5;
+const TXN_STREAM_ERR_SETID_TOMBSTONE: i64 = -6;
+
+// Which XINFO reply shape a parsed command wants, carried in `restore_kind`.
+const STREAM_XINFO_STREAM: u8 = 0;
+const STREAM_XINFO_STREAM_FULL: u8 = 1;
+const STREAM_XINFO_HELP: u8 = 4;
 
 /// Redis stores a hash field's expiration in 46 bits of absolute Unix
 /// milliseconds (`EB_EXPIRE_TIME_MAX` in `ebuckets.h`), and every command of
@@ -806,6 +831,17 @@ enum OpCode {
     EvalSha = 201,
     EvalRo = 202,
     EvalShaRo = 203,
+    // Redis Streams. XRANGE and XREVRANGE are separate opcodes because the
+    // reply is the same but the argument order is not, and XREAD is separate
+    // because it reads several streams and can block.
+    XAdd = 204,
+    XRange = 205,
+    XRevRange = 206,
+    XLen = 207,
+    XDel = 208,
+    XTrim = 209,
+    XSetId = 210,
+    XInfo = 211,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -1967,6 +2003,22 @@ fn parse_opcode(name: &[u8]) -> Option<OpCode> {
         Some(OpCode::GeoDist)
     } else if ascii_eq_ci(name, b"GEOHASH") {
         Some(OpCode::GeoHash)
+    } else if ascii_eq_ci(name, b"XADD") {
+        Some(OpCode::XAdd)
+    } else if ascii_eq_ci(name, b"XRANGE") {
+        Some(OpCode::XRange)
+    } else if ascii_eq_ci(name, b"XREVRANGE") {
+        Some(OpCode::XRevRange)
+    } else if ascii_eq_ci(name, b"XLEN") {
+        Some(OpCode::XLen)
+    } else if ascii_eq_ci(name, b"XDEL") {
+        Some(OpCode::XDel)
+    } else if ascii_eq_ci(name, b"XTRIM") {
+        Some(OpCode::XTrim)
+    } else if ascii_eq_ci(name, b"XSETID") {
+        Some(OpCode::XSetId)
+    } else if ascii_eq_ci(name, b"XINFO") {
+        Some(OpCode::XInfo)
     } else if ascii_eq_ci(name, b"GEOSEARCH")
         || ascii_eq_ci(name, b"GEORADIUS")
         || ascii_eq_ci(name, b"GEORADIUS_RO")
@@ -3568,6 +3620,8 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 (3u8, MAKO_SET_DUMP_PREFIX.len())
             } else if payload.starts_with(MAKO_ZSET_DUMP_PREFIX) {
                 (4u8, MAKO_ZSET_DUMP_PREFIX.len())
+            } else if payload.starts_with(MAKO_STREAM_DUMP_PREFIX) {
+                (5u8, MAKO_STREAM_DUMP_PREFIX.len())
             } else {
                 return Err(ParseError::Error(
                     "DUMP payload version or checksum are wrong",
@@ -3581,6 +3635,12 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 ))?
             };
             if (restore_kind == 1 || restore_kind == 4) && fields.len() % 2 != 0 {
+                return Err(ParseError::Error(
+                    "DUMP payload version or checksum are wrong",
+                ));
+            }
+            // A stream payload is [family letter, key suffix, value] triples.
+            if restore_kind == 5 && fields.len() % 3 != 0 {
                 return Err(ParseError::Error(
                     "DUMP payload version or checksum are wrong",
                 ));
@@ -4020,6 +4080,277 @@ fn parse_resp3(frame: DecodedFrame<BytesFrame>) -> Result<Command, ParseError> {
                 None,
                 command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
             ))
+        }
+        OpCode::XAdd => {
+            if parts.len() < 5 {
+                return Err(wrong_arity("xadd"));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            let key = validate_user_key(&key)?;
+            let mut index = 2usize;
+            let mut nomkstream = false;
+            let mut trim = StreamTrimArgs::default();
+            while index < parts.len() {
+                let arg = part_to_bytes(&parts[index])?;
+                if ascii_eq_ci(arg.as_ref(), b"NOMKSTREAM") {
+                    nomkstream = true;
+                    index += 1;
+                } else if ascii_eq_ci(arg.as_ref(), b"MAXLEN")
+                    || ascii_eq_ci(arg.as_ref(), b"MINID")
+                {
+                    index = parse_stream_trim_args(&parts, index, &mut trim)?;
+                } else {
+                    break;
+                }
+            }
+            if index >= parts.len() {
+                return Err(wrong_arity("xadd"));
+            }
+            let id_raw = part_to_bytes(&parts[index])?;
+            index += 1;
+            // "*" and "<ms>-*" reach the executor as they were written; every
+            // other spelling is normalized to "<ms>-<seq>". A bare "<ms>" is an
+            // explicit "<ms>-0", which is why `XADD key 666 f v` fails once the
+            // stream's last ID is 666-0.
+            let id_spec = if id_raw.as_ref() == b"*" {
+                Bytes::from_static(b"*")
+            } else {
+                let (id, seq_given) = parse_stream_id_generic(id_raw.as_ref(), 0, true, true)
+                    .ok_or(ParseError::Error(STREAM_ID_ERROR))?;
+                if !seq_given {
+                    Bytes::from(format!("{}-*", id.ms))
+                } else if id == STREAM_ID_MIN {
+                    // Checked before the key is looked at, as Redis does, so a
+                    // rejected XADD never creates the stream.
+                    return Err(ParseError::Error(
+                        "The ID specified in XADD must be greater than 0-0",
+                    ));
+                } else {
+                    id.text()
+                }
+            };
+            let field_count = parts.len() - index;
+            if field_count < 2 || field_count % 2 != 0 {
+                return Err(wrong_arity("xadd"));
+            }
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values.push(id_spec);
+            cmd.values.push(stream_bool_arg(nomkstream));
+            cmd.values.extend(trim.as_values());
+            for part in &parts[index..] {
+                cmd.values.push(part_to_bytes(part)?);
+            }
+            Ok(cmd)
+        }
+        OpCode::XRange | OpCode::XRevRange => {
+            let forward = op == OpCode::XRange;
+            let name = if forward { "xrange" } else { "xrevrange" };
+            if parts.len() != 4 && parts.len() != 6 {
+                return Err(wrong_arity(name));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            let key = validate_user_key(&key)?;
+            // XREVRANGE takes the range the other way round.
+            let (start_raw, end_raw) = if forward {
+                (part_to_bytes(&parts[2])?, part_to_bytes(&parts[3])?)
+            } else {
+                (part_to_bytes(&parts[3])?, part_to_bytes(&parts[2])?)
+            };
+            let start = parse_stream_range_start(start_raw.as_ref())?;
+            let end = parse_stream_range_end(end_raw.as_ref())?;
+            let mut count = 0i64;
+            if parts.len() == 6 {
+                let option = part_to_bytes(&parts[4])?;
+                if !ascii_eq_ci(option.as_ref(), b"COUNT") {
+                    return Err(ParseError::Protocol("syntax error"));
+                }
+                count = parse_i64_error_arg(
+                    part_to_bytes(&parts[5])?.as_ref(),
+                    "value is not an integer or out of range",
+                )?;
+                if count < 0 {
+                    count = 0;
+                }
+            }
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values = vec![
+                start.text(),
+                end.text(),
+                Bytes::from(count.to_string()),
+                Bytes::from_static(if forward {
+                    STREAM_READ_FORWARD
+                } else {
+                    STREAM_READ_REVERSE
+                }),
+            ];
+            Ok(cmd)
+        }
+        OpCode::XLen => {
+            if parts.len() != 2 {
+                return Err(wrong_arity("xlen"));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            let key = validate_user_key(&key)?;
+            Ok(Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            ))
+        }
+        OpCode::XDel => {
+            if parts.len() < 3 {
+                return Err(wrong_arity("xdel"));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            let key = validate_user_key(&key)?;
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            for part in &parts[2..] {
+                let id = parse_stream_id_strict(part_to_bytes(part)?.as_ref(), 0)?;
+                cmd.values.push(id.text());
+            }
+            Ok(cmd)
+        }
+        OpCode::XTrim => {
+            if parts.len() < 4 {
+                return Err(wrong_arity("xtrim"));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            let key = validate_user_key(&key)?;
+            let mut trim = StreamTrimArgs::default();
+            let index = parse_stream_trim_args(&parts, 2, &mut trim)?;
+            if index != parts.len() {
+                return Err(ParseError::Protocol("syntax error"));
+            }
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values = trim.as_values().to_vec();
+            Ok(cmd)
+        }
+        OpCode::XSetId => {
+            if parts.len() < 3 {
+                return Err(wrong_arity("xsetid"));
+            }
+            let key = part_to_bytes(&parts[1])?;
+            let key = validate_user_key(&key)?;
+            let id = parse_stream_id_strict(part_to_bytes(&parts[2])?.as_ref(), 0)?;
+            let mut entries_added = Bytes::new();
+            let mut max_deleted = Bytes::new();
+            let mut index = 3usize;
+            while index < parts.len() {
+                let arg = part_to_bytes(&parts[index])?;
+                if ascii_eq_ci(arg.as_ref(), b"ENTRIESADDED") && index + 1 < parts.len() {
+                    let count = parse_i64_error_arg(
+                        part_to_bytes(&parts[index + 1])?.as_ref(),
+                        "value is not an integer or out of range",
+                    )?;
+                    if count < 0 {
+                        return Err(ParseError::Error("value for ENTRIESADDED must be positive"));
+                    }
+                    entries_added = Bytes::from(count.to_string());
+                    index += 2;
+                } else if ascii_eq_ci(arg.as_ref(), b"MAXDELETEDID") && index + 1 < parts.len() {
+                    max_deleted =
+                        parse_stream_id_strict(part_to_bytes(&parts[index + 1])?.as_ref(), 0)?
+                            .text();
+                    index += 2;
+                } else {
+                    return Err(ParseError::Protocol("syntax error"));
+                }
+            }
+            let mut cmd = Command::new(
+                op,
+                vec![key],
+                None,
+                command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?,
+            );
+            cmd.values = vec![id.text(), entries_added, max_deleted];
+            Ok(cmd)
+        }
+        OpCode::XInfo => {
+            if parts.len() < 2 {
+                return Err(wrong_arity("xinfo"));
+            }
+            let subcommand = part_to_bytes(&parts[1])?;
+            let args = command_args(&parts).ok_or(ParseError::Protocol("invalid argument"))?;
+            if ascii_eq_ci(subcommand.as_ref(), b"HELP") {
+                if parts.len() != 2 {
+                    return Err(wrong_arity("xinfo|help"));
+                }
+                let mut cmd = Command::new(op, Vec::new(), None, args);
+                cmd.restore_kind = STREAM_XINFO_HELP;
+                return Ok(cmd);
+            }
+            if !ascii_eq_ci(subcommand.as_ref(), b"STREAM") {
+                return Err(ParseError::Owned(format!(
+                    "Unknown XINFO subcommand or wrong number of arguments for '{}'",
+                    String::from_utf8_lossy(subcommand.as_ref())
+                )));
+            }
+            if parts.len() < 3 {
+                return Err(wrong_arity("xinfo|stream"));
+            }
+            let key = part_to_bytes(&parts[2])?;
+            let key = validate_user_key(&key)?;
+            let mut full = false;
+            let mut count = 10i64;
+            let mut index = 3usize;
+            if index < parts.len() {
+                let option = part_to_bytes(&parts[index])?;
+                if !ascii_eq_ci(option.as_ref(), b"FULL") {
+                    return Err(ParseError::Protocol("syntax error"));
+                }
+                full = true;
+                index += 1;
+                if index + 1 < parts.len() {
+                    let option = part_to_bytes(&parts[index])?;
+                    if !ascii_eq_ci(option.as_ref(), b"COUNT") {
+                        return Err(ParseError::Protocol("syntax error"));
+                    }
+                    count = parse_i64_error_arg(
+                        part_to_bytes(&parts[index + 1])?.as_ref(),
+                        "value is not an integer or out of range",
+                    )?;
+                    if count < 0 {
+                        count = 0;
+                    }
+                    index += 2;
+                }
+            }
+            if index != parts.len() {
+                return Err(ParseError::Protocol("syntax error"));
+            }
+            let mut cmd = Command::new(op, vec![key], None, args);
+            cmd.restore_kind = if full {
+                STREAM_XINFO_STREAM_FULL
+            } else {
+                STREAM_XINFO_STREAM
+            };
+            cmd.values = vec![
+                Bytes::from_static(b"STREAM"),
+                stream_bool_arg(full),
+                Bytes::from(count.to_string()),
+            ];
+            Ok(cmd)
         }
         OpCode::HSet | OpCode::HMSet => {
             if parts.len() < 4 || parts.len() % 2 != 0 {
@@ -5996,6 +6327,485 @@ fn pack_bytes_list(items: &[Bytes]) -> Bytes {
     Bytes::from(out)
 }
 
+// ===== Redis Streams =====
+
+const STREAM_ID_ERROR: &str = "Invalid stream ID specified as stream command argument";
+const STREAM_SMALLER_ID_ERROR: &str =
+    "The ID specified in XADD is equal or smaller than the target stream top item";
+
+/// A stream entry ID. Both halves are unsigned 64-bit, as in Redis, so the
+/// derived ordering is exactly the ID ordering.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct StreamId {
+    ms: u64,
+    seq: u64,
+}
+
+const STREAM_ID_MIN: StreamId = StreamId { ms: 0, seq: 0 };
+const STREAM_ID_MAX: StreamId = StreamId {
+    ms: u64::MAX,
+    seq: u64::MAX,
+};
+
+impl StreamId {
+    fn text(self) -> Bytes {
+        Bytes::from(format!("{}-{}", self.ms, self.seq))
+    }
+
+    fn incr(self) -> Option<StreamId> {
+        if self.seq == u64::MAX {
+            if self.ms == u64::MAX {
+                None
+            } else {
+                Some(StreamId {
+                    ms: self.ms + 1,
+                    seq: 0,
+                })
+            }
+        } else {
+            Some(StreamId {
+                ms: self.ms,
+                seq: self.seq + 1,
+            })
+        }
+    }
+
+    fn decr(self) -> Option<StreamId> {
+        if self.seq == 0 {
+            if self.ms == 0 {
+                None
+            } else {
+                Some(StreamId {
+                    ms: self.ms - 1,
+                    seq: u64::MAX,
+                })
+            }
+        } else {
+            Some(StreamId {
+                ms: self.ms,
+                seq: self.seq - 1,
+            })
+        }
+    }
+}
+
+fn parse_stream_u64(raw: &[u8]) -> Option<u64> {
+    if raw.is_empty() || raw.len() > 20 {
+        return None;
+    }
+    let mut value = 0u64;
+    for &byte in raw {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value
+            .checked_mul(10)?
+            .checked_add(u64::from(byte - b'0'))?;
+    }
+    Some(value)
+}
+
+/// Redis's streamGenericParseID. `missing_seq` is the sequence to use when the
+/// client wrote only the milliseconds, `strict` refuses the "-" and "+" edges
+/// (which is what an exclusive "(" bound does), and `allow_auto_seq` accepts
+/// the "<ms>-*" spelling. The returned flag is Redis's `seq_given`, false only
+/// for "<ms>-*", which XADD reads as "pick the next sequence for me": a bare
+/// "<ms>" is an ordinary "<ms>-0", not a request for the next sequence.
+fn parse_stream_id_generic(
+    raw: &[u8],
+    missing_seq: u64,
+    strict: bool,
+    allow_auto_seq: bool,
+) -> Option<(StreamId, bool)> {
+    if raw.is_empty() {
+        return None;
+    }
+    if raw == b"-" {
+        return if strict { None } else { Some((STREAM_ID_MIN, true)) };
+    }
+    if raw == b"+" {
+        return if strict { None } else { Some((STREAM_ID_MAX, true)) };
+    }
+    let (ms_raw, seq_raw) = match raw.iter().position(|&byte| byte == b'-') {
+        Some(pos) => (&raw[..pos], Some(&raw[pos + 1..])),
+        None => (raw, None),
+    };
+    let ms = parse_stream_u64(ms_raw)?;
+    match seq_raw {
+        None => Some((StreamId { ms, seq: missing_seq }, true)),
+        Some(seq_raw) => {
+            if allow_auto_seq && seq_raw == b"*" {
+                return Some((StreamId { ms, seq: 0 }, false));
+            }
+            Some((
+                StreamId {
+                    ms,
+                    seq: parse_stream_u64(seq_raw)?,
+                },
+                true,
+            ))
+        }
+    }
+}
+
+fn parse_stream_id_strict(raw: &[u8], missing_seq: u64) -> Result<StreamId, ParseError> {
+    parse_stream_id_generic(raw, missing_seq, true, false)
+        .map(|(id, _)| id)
+        .ok_or(ParseError::Error(STREAM_ID_ERROR))
+}
+
+fn parse_stream_id_loose(raw: &[u8], missing_seq: u64) -> Result<StreamId, ParseError> {
+    parse_stream_id_generic(raw, missing_seq, false, false)
+        .map(|(id, _)| id)
+        .ok_or(ParseError::Error(STREAM_ID_ERROR))
+}
+
+/// The start of an XRANGE/XPENDING/XAUTOCLAIM interval. Redis turns an
+/// exclusive "(" bound into the neighbouring ID right away, so a bound with no
+/// neighbour is an error rather than an empty range.
+fn parse_stream_range_start(raw: &[u8]) -> Result<StreamId, ParseError> {
+    if let Some(inner) = raw.strip_prefix(b"(") {
+        return parse_stream_id_strict(inner, 0)?
+            .incr()
+            .ok_or(ParseError::Error("invalid start offset"));
+    }
+    parse_stream_id_loose(raw, 0)
+}
+
+fn parse_stream_range_end(raw: &[u8]) -> Result<StreamId, ParseError> {
+    if let Some(inner) = raw.strip_prefix(b"(") {
+        return parse_stream_id_strict(inner, u64::MAX)?
+            .decr()
+            .ok_or(ParseError::Error("invalid end offset"));
+    }
+    parse_stream_id_loose(raw, u64::MAX)
+}
+
+/// How XADD and XTRIM were asked to trim, in the shape the executor reads:
+/// an empty strategy means "do not trim".
+#[derive(Clone)]
+struct StreamTrimArgs {
+    strategy: Bytes,
+    threshold: Bytes,
+    limit: i64,
+    approx: bool,
+}
+
+impl Default for StreamTrimArgs {
+    fn default() -> Self {
+        StreamTrimArgs {
+            strategy: Bytes::new(),
+            threshold: Bytes::new(),
+            limit: 0,
+            approx: false,
+        }
+    }
+}
+
+impl StreamTrimArgs {
+    fn as_values(&self) -> [Bytes; 3] {
+        [
+            self.strategy.clone(),
+            self.threshold.clone(),
+            Bytes::from(self.limit.to_string()),
+        ]
+    }
+}
+
+/// Parse `MAXLEN|MINID [=|~] threshold [LIMIT count]` starting at `index`,
+/// returning the index of the first argument after it.
+fn parse_stream_trim_args(
+    parts: &[BytesFrame],
+    mut index: usize,
+    trim: &mut StreamTrimArgs,
+) -> Result<usize, ParseError> {
+    let keyword = part_to_bytes(&parts[index])?;
+    let maxlen = ascii_eq_ci(keyword.as_ref(), b"MAXLEN");
+    if !maxlen && !ascii_eq_ci(keyword.as_ref(), b"MINID") {
+        return Err(ParseError::Protocol("syntax error"));
+    }
+    trim.strategy = Bytes::from_static(if maxlen { b"MAXLEN" } else { b"MINID" });
+    index += 1;
+    if index >= parts.len() {
+        return Err(ParseError::Protocol("syntax error"));
+    }
+    let next = part_to_bytes(&parts[index])?;
+    if next.as_ref() == b"~" || next.as_ref() == b"=" {
+        trim.approx = next.as_ref() == b"~";
+        index += 1;
+        if index >= parts.len() {
+            return Err(ParseError::Protocol("syntax error"));
+        }
+    }
+    let threshold = part_to_bytes(&parts[index])?;
+    if maxlen {
+        let count = parse_i64_error_arg(
+            threshold.as_ref(),
+            "value is not an integer or out of range",
+        )?;
+        if count < 0 {
+            return Err(ParseError::Error("The MAXLEN argument must be >= 0."));
+        }
+        trim.threshold = Bytes::from(count.to_string());
+    } else {
+        trim.threshold = parse_stream_id_strict(threshold.as_ref(), 0)?.text();
+    }
+    index += 1;
+    if index + 1 < parts.len() {
+        let option = part_to_bytes(&parts[index])?;
+        if ascii_eq_ci(option.as_ref(), b"LIMIT") {
+            let limit = parse_i64_error_arg(
+                part_to_bytes(&parts[index + 1])?.as_ref(),
+                "value is not an integer or out of range",
+            )?;
+            if limit < 0 {
+                return Err(ParseError::Error(
+                    "The LIMIT argument must be >= 0.",
+                ));
+            }
+            if !trim.approx {
+                return Err(ParseError::Error(
+                    "syntax error, LIMIT cannot be used without the special ~ option",
+                ));
+            }
+            trim.limit = limit;
+            index += 2;
+        }
+    }
+    Ok(index)
+}
+
+fn stream_bool_arg(value: bool) -> Bytes {
+    Bytes::from_static(if value { b"1" } else { b"0" })
+}
+
+/// The read mode of one TXN_OP_XRANGE op.
+const STREAM_READ_FORWARD: &[u8] = b"0";
+const STREAM_READ_REVERSE: &[u8] = b"1";
+
+/// One `[id, [field, value, ...]]` element of a stream reply. An empty field
+/// blob is a PEL entry whose stream entry has been deleted, which Redis answers
+/// with a null in place of the field list.
+fn write_stream_entry<W: Write>(
+    writer: &mut W,
+    id: &[u8],
+    fields: &[u8],
+    protocol_version: u8,
+) -> std::io::Result<()> {
+    write_array_header(writer, 2)?;
+    write_bulk(writer, id)?;
+    if fields.is_empty() {
+        if protocol_version >= 3 {
+            write_null(writer, protocol_version)?;
+        } else {
+            writer.write_all(b"*-1\r\n")?;
+        }
+        return Ok(());
+    }
+    match parse_list_payload(fields) {
+        Some(items) => {
+            write_array_header(writer, items.len())?;
+            for item in items {
+                write_bulk(writer, &item)?;
+            }
+        }
+        None => write_array_header(writer, 0)?,
+    }
+    Ok(())
+}
+
+/// A Redis "map-style" reply: a real map in RESP3, the flattened array RESP2
+/// clients (and the TCL suite) expect otherwise.
+fn write_stream_map_header<W: Write>(
+    writer: &mut W,
+    pairs: usize,
+    protocol_version: u8,
+) -> std::io::Result<()> {
+    if protocol_version >= 3 {
+        write_map_header(writer, pairs)
+    } else {
+        write_array_header(writer, pairs * 2)
+    }
+}
+
+/// Redis writes a count that could not be determined as a null: XINFO's
+/// entries-read and lag both do that for a group sitting behind a tombstone.
+fn write_stream_optional_count<W: Write>(
+    writer: &mut W,
+    raw: &[u8],
+    protocol_version: u8,
+) -> std::io::Result<()> {
+    match parse_i64_lossy(raw) {
+        Some(value) => write_integer(writer, value),
+        None => write_null(writer, protocol_version),
+    }
+}
+
+/// The `id, fields` pairs of a stream read result. Item 0 of the payload is the
+/// stream's last-generated ID, which only a blocking read has any use for.
+fn stream_read_entries(result: &TxnOpResult) -> Option<Vec<(Bytes, Bytes)>> {
+    let items = parse_list_payload(result_value_bytes(result))?;
+    if items.is_empty() || items.len() % 2 == 0 {
+        return None;
+    }
+    let mut entries = Vec::with_capacity((items.len() - 1) / 2);
+    for pair in items[1..].chunks_exact(2) {
+        entries.push((Bytes::from(pair[0].clone()), Bytes::from(pair[1].clone())));
+    }
+    Some(entries)
+}
+
+/// XINFO STREAM, the summary form Redis answers without FULL.
+fn write_xinfo_stream<W: Write>(
+    writer: &mut W,
+    items: &[Vec<u8>],
+    protocol_version: u8,
+) -> std::io::Result<()> {
+    if items.len() < 14 {
+        return write_err(writer, "operation failed");
+    }
+    write_stream_map_header(writer, 10, protocol_version)?;
+    for (name, index) in [
+        ("length", 0usize),
+        ("radix-tree-keys", 1),
+        ("radix-tree-nodes", 2),
+    ] {
+        write_bulk(writer, name.as_bytes())?;
+        write_integer(writer, parse_i64_lossy(&items[index]).unwrap_or(0))?;
+    }
+    for (name, index) in [
+        ("last-generated-id", 3usize),
+        ("max-deleted-entry-id", 4),
+    ] {
+        write_bulk(writer, name.as_bytes())?;
+        write_bulk(writer, &items[index])?;
+    }
+    write_bulk(writer, b"entries-added")?;
+    write_integer(writer, parse_i64_lossy(&items[5]).unwrap_or(0))?;
+    write_bulk(writer, b"recorded-first-entry-id")?;
+    write_bulk(writer, &items[6])?;
+    write_bulk(writer, b"groups")?;
+    write_integer(writer, parse_i64_lossy(&items[7]).unwrap_or(0))?;
+    for (name, present, id, fields) in [
+        ("first-entry", 8usize, 9usize, 10usize),
+        ("last-entry", 11, 12, 13),
+    ] {
+        write_bulk(writer, name.as_bytes())?;
+        if items[present] == b"1" {
+            write_stream_entry(writer, &items[id], &items[fields], protocol_version)?;
+        } else {
+            write_null(writer, protocol_version)?;
+        }
+    }
+    Ok(())
+}
+
+/// XINFO STREAM ... FULL. The executor flattens the whole stream into one
+/// packed list, which this walks with a cursor; the layout is written where it
+/// is built, in makoCon.cc.
+fn write_xinfo_stream_full<W: Write>(
+    writer: &mut W,
+    items: &[Vec<u8>],
+    protocol_version: u8,
+) -> std::io::Result<()> {
+    let mut at = 0usize;
+    let take = |at: &mut usize| -> Vec<u8> {
+        let item = items.get(*at).cloned().unwrap_or_default();
+        *at += 1;
+        item
+    };
+    if items.len() < 9 {
+        return write_err(writer, "operation failed");
+    }
+    write_stream_map_header(writer, 9, protocol_version)?;
+    write_bulk(writer, b"length")?;
+    write_integer(writer, parse_i64_lossy(&take(&mut at)).unwrap_or(0))?;
+    write_bulk(writer, b"radix-tree-keys")?;
+    write_integer(writer, parse_i64_lossy(&take(&mut at)).unwrap_or(0))?;
+    write_bulk(writer, b"radix-tree-nodes")?;
+    write_integer(writer, parse_i64_lossy(&take(&mut at)).unwrap_or(0))?;
+    write_bulk(writer, b"last-generated-id")?;
+    write_bulk(writer, &take(&mut at))?;
+    write_bulk(writer, b"max-deleted-entry-id")?;
+    write_bulk(writer, &take(&mut at))?;
+    write_bulk(writer, b"entries-added")?;
+    write_integer(writer, parse_i64_lossy(&take(&mut at)).unwrap_or(0))?;
+    write_bulk(writer, b"recorded-first-entry-id")?;
+    write_bulk(writer, &take(&mut at))?;
+
+    let entry_count = parse_i64_lossy(&take(&mut at)).unwrap_or(0).max(0) as usize;
+    write_bulk(writer, b"entries")?;
+    write_array_header(writer, entry_count)?;
+    for _ in 0..entry_count {
+        let id = take(&mut at);
+        let fields = take(&mut at);
+        write_stream_entry(writer, &id, &fields, protocol_version)?;
+    }
+
+    let group_count = parse_i64_lossy(&take(&mut at)).unwrap_or(0).max(0) as usize;
+    write_bulk(writer, b"groups")?;
+    write_array_header(writer, group_count)?;
+    for _ in 0..group_count {
+        write_stream_map_header(writer, 7, protocol_version)?;
+        write_bulk(writer, b"name")?;
+        write_bulk(writer, &take(&mut at))?;
+        write_bulk(writer, b"last-delivered-id")?;
+        write_bulk(writer, &take(&mut at))?;
+        write_bulk(writer, b"entries-read")?;
+        write_stream_optional_count(writer, &take(&mut at), protocol_version)?;
+        write_bulk(writer, b"lag")?;
+        write_stream_optional_count(writer, &take(&mut at), protocol_version)?;
+        write_bulk(writer, b"pel-count")?;
+        write_integer(writer, parse_i64_lossy(&take(&mut at)).unwrap_or(0))?;
+        let pel_count = parse_i64_lossy(&take(&mut at)).unwrap_or(0).max(0) as usize;
+        write_bulk(writer, b"pending")?;
+        write_array_header(writer, pel_count)?;
+        for _ in 0..pel_count {
+            write_array_header(writer, 4)?;
+            write_bulk(writer, &take(&mut at))?;
+            write_bulk(writer, &take(&mut at))?;
+            write_integer(writer, parse_i64_lossy(&take(&mut at)).unwrap_or(0))?;
+            write_integer(writer, parse_i64_lossy(&take(&mut at)).unwrap_or(0))?;
+        }
+        let consumer_count = parse_i64_lossy(&take(&mut at)).unwrap_or(0).max(0) as usize;
+        write_bulk(writer, b"consumers")?;
+        write_array_header(writer, consumer_count)?;
+        for _ in 0..consumer_count {
+            write_stream_map_header(writer, 5, protocol_version)?;
+            write_bulk(writer, b"name")?;
+            write_bulk(writer, &take(&mut at))?;
+            write_bulk(writer, b"seen-time")?;
+            write_integer(writer, parse_i64_lossy(&take(&mut at)).unwrap_or(0))?;
+            write_bulk(writer, b"active-time")?;
+            write_integer(writer, parse_i64_lossy(&take(&mut at)).unwrap_or(0))?;
+            write_bulk(writer, b"pel-count")?;
+            write_integer(writer, parse_i64_lossy(&take(&mut at)).unwrap_or(0))?;
+            let own_count = parse_i64_lossy(&take(&mut at)).unwrap_or(0).max(0) as usize;
+            write_bulk(writer, b"pending")?;
+            write_array_header(writer, own_count)?;
+            for _ in 0..own_count {
+                write_array_header(writer, 3)?;
+                write_bulk(writer, &take(&mut at))?;
+                write_integer(writer, parse_i64_lossy(&take(&mut at)).unwrap_or(0))?;
+                write_integer(writer, parse_i64_lossy(&take(&mut at)).unwrap_or(0))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+const XINFO_HELP: &[&str] = &[
+    "XINFO <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+    "CONSUMERS <key> <groupname>",
+    "    Show consumers of <groupname>.",
+    "GROUPS <key>",
+    "    Show the stream consumer groups.",
+    "STREAM <key> [FULL [COUNT <count>]",
+    "    Show information about the stream.",
+    "HELP",
+    "    Print this help.",
+];
+
 fn parse_list_payload(input: &[u8]) -> Option<Vec<Vec<u8>>> {
     let mut pos = 0usize;
     let item_count = read_u64_le(input, &mut pos)? as usize;
@@ -7214,6 +8024,35 @@ fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)
                     continue;
                 };
                 match cmd.restore_kind {
+                    5 => {
+                        // Stream payload: the executor clears the key and
+                        // rewrites every stream record the dump carried.
+                        let payload = pack_bytes_list(&cmd.values);
+                        payloads.push(payload);
+                        let payload = payloads.last().unwrap();
+                        ops.push(TxnOperation {
+                            op: TXN_OP_XRESTORE,
+                            key_ptr: key.as_ptr(),
+                            key_len: key.len(),
+                            val_ptr: payload.as_ptr(),
+                            val_len: payload.len(),
+                            flags: 0,
+                            expire_at_ms: -1,
+                            group_id: 0,
+                        });
+                        if cmd.expire_at_ms > 0 {
+                            ops.push(TxnOperation {
+                                op: TXN_OP_EXPIRE,
+                                key_ptr: key.as_ptr(),
+                                key_len: key.len(),
+                                val_ptr: std::ptr::null(),
+                                val_len: 0,
+                                flags: 0,
+                                expire_at_ms: cmd.expire_at_ms,
+                                group_id: 0,
+                            });
+                        }
+                    }
                     2 => {
                         // String payload: a plain SET carries the TTL itself.
                         let value = cmd.values.first().cloned().unwrap_or_default();
@@ -7689,6 +8528,48 @@ fn build_txn_ops(commands: &[Command]) -> (Vec<TxnOperation>, Vec<(usize, usize)
                     key_len: key.len(),
                     val_ptr: std::ptr::null(),
                     val_len: 0,
+                    flags: 0,
+                    expire_at_ms: -1,
+                    group_id: 0,
+                });
+            }
+            OpCode::XAdd
+            | OpCode::XRange
+            | OpCode::XRevRange
+            | OpCode::XLen
+            | OpCode::XDel
+            | OpCode::XTrim
+            | OpCode::XSetId
+            | OpCode::XInfo => {
+                if cmd.op == OpCode::XInfo && cmd.restore_kind == STREAM_XINFO_HELP {
+                    // Answered from the command table, like the other HELP
+                    // subcommands: no storage op at all.
+                    spans.push((start, 0));
+                    continue;
+                }
+                let Some(key) = cmd.keys.first() else {
+                    spans.push((start, 0));
+                    continue;
+                };
+                let payload = pack_bytes_list(&cmd.values);
+                payloads.push(payload);
+                let payload = payloads.last().unwrap();
+                ops.push(TxnOperation {
+                    op: match cmd.op {
+                        OpCode::XAdd => TXN_OP_XADD,
+                        OpCode::XLen => TXN_OP_XLEN,
+                        OpCode::XDel => TXN_OP_XDEL,
+                        OpCode::XTrim => TXN_OP_XTRIM,
+                        OpCode::XSetId => TXN_OP_XSETID,
+                        OpCode::XInfo => TXN_OP_XINFO,
+                        // XRANGE and XREVRANGE differ only in the read mode
+                        // already packed into the payload.
+                        _ => TXN_OP_XRANGE,
+                    },
+                    key_ptr: key.as_ptr(),
+                    key_len: key.len(),
+                    val_ptr: payload.as_ptr(),
+                    val_len: payload.len(),
                     flags: 0,
                     expire_at_ms: -1,
                     group_id: 0,
@@ -8657,6 +9538,14 @@ fn command_needs_retry(cmd: &Command) -> bool {
             | OpCode::GeoDist
             | OpCode::GeoHash
             | OpCode::GeoSearch
+            | OpCode::XAdd
+            | OpCode::XRange
+            | OpCode::XRevRange
+            | OpCode::XLen
+            | OpCode::XDel
+            | OpCode::XTrim
+            | OpCode::XSetId
+            | OpCode::XInfo
     )
 }
 
@@ -10014,6 +10903,13 @@ fn write_command_result<W: Write>(
         handle_cluster_command(cmd, cluster_mode(), writer)?;
         return Ok(());
     }
+    if cmd.op == OpCode::XInfo && cmd.restore_kind == STREAM_XINFO_HELP {
+        write_array_header(writer, XINFO_HELP.len())?;
+        for line in XINFO_HELP {
+            write_simple_string(writer, line)?;
+        }
+        return Ok(());
+    }
     if matches!(cmd.op, OpCode::ReadOnly | OpCode::ReadWrite) {
         write_cluster_readonly_reply(cluster_mode(), writer)?;
         return Ok(());
@@ -10377,7 +11273,7 @@ fn write_command_result<W: Write>(
                 write_err(writer, "operation failed")?;
             } else {
                 let subcommand = cmd.args.first().map(|arg| arg.as_ref()).unwrap_or(b"");
-                if !(1..=5).contains(&first.int_value) {
+                if !(1..=6).contains(&first.int_value) {
                     write_null(writer, protocol_version)?;
                 } else if ascii_eq_ci(subcommand, b"ENCODING") {
                     // Mako has no Redis object encodings; report the canonical
@@ -10387,6 +11283,7 @@ fn write_command_result<W: Write>(
                         2 => "hashtable",
                         3 => "quicklist",
                         4 => "skiplist",
+                        6 => "stream",
                         _ => "hashtable",
                     };
                     write_bulk(writer, encoding.as_bytes())?;
@@ -10652,12 +11549,86 @@ fn write_command_result<W: Write>(
                     3 => write_simple_string(writer, "list")?,
                     4 => write_simple_string(writer, "zset")?,
                     5 => write_simple_string(writer, "hash")?,
+                    6 => write_simple_string(writer, "stream")?,
                     _ => write_simple_string(writer, "none")?,
                 }
             } else {
                 write_err(writer, "operation failed")?;
             }
         }
+        OpCode::XAdd => {
+            if !first.success {
+                write_wrongtype(writer)?;
+            } else if first.int_value == TXN_STREAM_ERR_NOMKSTREAM {
+                write_null(writer, protocol_version)?;
+            } else if first.int_value == TXN_STREAM_ERR_SMALLER_ID {
+                write_err(writer, STREAM_SMALLER_ID_ERROR)?;
+            } else if first.value_present {
+                write_bulk(writer, result_value_bytes(first))?;
+            } else {
+                write_err(writer, "operation failed")?;
+            }
+        }
+        OpCode::XRange | OpCode::XRevRange => {
+            if !first.success {
+                write_wrongtype(writer)?;
+            } else if let Some(entries) = stream_read_entries(first) {
+                write_array_header(writer, entries.len())?;
+                for (id, fields) in &entries {
+                    write_stream_entry(writer, id, fields, protocol_version)?;
+                }
+            } else {
+                write_err(writer, "operation failed")?;
+            }
+        }
+        OpCode::XLen | OpCode::XDel | OpCode::XTrim => {
+            if first.success {
+                write_integer(writer, first.int_value)?;
+            } else {
+                write_wrongtype(writer)?;
+            }
+        }
+        OpCode::XSetId => {
+            if !first.success {
+                write_wrongtype(writer)?;
+            } else {
+                match first.int_value {
+                    TXN_STREAM_ERR_NO_SUCH_KEY => write_err(writer, "no such key")?,
+                    TXN_STREAM_ERR_SETID_SMALLER => write_err(
+                        writer,
+                        "The ID specified in XSETID is smaller than the target stream top item",
+                    )?,
+                    TXN_STREAM_ERR_SETID_ENTRIES_ADDED => write_err(
+                        writer,
+                        "The entries_added specified in XSETID is smaller than the target stream length",
+                    )?,
+                    TXN_STREAM_ERR_SETID_TOMBSTONE => write_err(
+                        writer,
+                        "The ID specified in XSETID is smaller than the provided max_deleted_entry_id",
+                    )?,
+                    _ => write_simple_ok(writer)?,
+                }
+            }
+        }
+        OpCode::XInfo => {
+            if !first.success {
+                write_wrongtype(writer)?;
+            } else if first.int_value == TXN_STREAM_ERR_NO_SUCH_KEY {
+                write_err(writer, "no such key")?;
+            } else {
+                match parse_list_payload(result_value_bytes(first)) {
+                    Some(items) => {
+                        if cmd.restore_kind == STREAM_XINFO_STREAM_FULL {
+                            write_xinfo_stream_full(writer, &items, protocol_version)?;
+                        } else {
+                            write_xinfo_stream(writer, &items, protocol_version)?;
+                        }
+                    }
+                    None => write_err(writer, "operation failed")?,
+                }
+            }
+        }
+
         OpCode::Keys => {
             let pattern = cmd.val.as_ref().map(|v| v.as_ref()).unwrap_or(b"*");
             if let Some((_, keys)) = scan_result_from_response(first) {
@@ -11168,7 +12139,9 @@ fn write_command_result<W: Write>(
                 if first.int_value == -3 {
                     write_err(writer, "resulting score is not a number (NaN)")?;
                 } else {
-                    write_err(writer, "operation failed")?;
+                    // zset_key_allowed refused the key, which is what every
+                    // other typed op reports as WRONGTYPE.
+                    write_wrongtype(writer)?;
                 }
             } else if (cmd.expire_flags & TXN_FLAG_ZADD_INCR) != 0 {
                 if first.value_present {
@@ -12163,6 +13136,11 @@ fn is_dirty_command(op: OpCode) -> bool {
             | OpCode::ZDiffStore
             // GEOADD is the only geo writer: everything else reads scores.
             | OpCode::GeoAdd
+            // XADD is what wakes a client blocked in XREAD or XREADGROUP.
+            | OpCode::XAdd
+            | OpCode::XDel
+            | OpCode::XTrim
+            | OpCode::XSetId
     )
 }
 
@@ -15787,7 +16765,15 @@ fn handle_command<W: Write>(
         | OpCode::GeoAdd
         | OpCode::GeoPos
         | OpCode::GeoDist
-        | OpCode::GeoHash => {
+        | OpCode::GeoHash
+        | OpCode::XAdd
+        | OpCode::XRange
+        | OpCode::XRevRange
+        | OpCode::XLen
+        | OpCode::XDel
+        | OpCode::XTrim
+        | OpCode::XSetId
+        | OpCode::XInfo => {
             if txn_state.in_multi {
                 // Queue command for later execution
                 txn_state.queue_command(cmd.clone());
@@ -18051,12 +19037,11 @@ $6\r\nFIELDS\r\n$1\r\n1\r\n$2\r\nf1\r\n"
                 "key call site binds {bound} but reads {argument}: {line}"
             );
         }
-        // 99: the 98 from package 6 plus the EVAL family's declared keys,
-        // which are what the script's interactive session locks. The raw key
-        // bytes the script sees in KEYS come from cmd.args and are deliberately
-        // left alone, exactly like MONITOR's argument list.
+        // 106: the 99 from package 8 plus one for each of the seven stream
+        // commands that name a key (XADD, XRANGE, XREVRANGE, XLEN, XDEL, XTRIM,
+        // XSETID, XINFO STREAM -- XINFO HELP names none).
         assert_eq!(
-            sites, 99,
+            sites, 106,
             "the number of Redis-visible key call sites changed; audit the new one"
         );
     }

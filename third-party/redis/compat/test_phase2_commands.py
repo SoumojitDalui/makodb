@@ -1137,6 +1137,371 @@ def check_script_kill(host, port, c):
     for filler in fillers:
         filler.sock.close()
 
+def as_map(reply):
+    """A Redis map-style reply as a dict: RESP2 flattens it into an array."""
+    if isinstance(reply, dict):
+        return reply
+    return {reply[i]: reply[i + 1] for i in range(0, len(reply), 2)}
+
+
+def check_streams_basic(host, port, c):
+    """XADD/XRANGE/XREVRANGE/XLEN/XDEL/XTRIM/XSETID/XINFO STREAM."""
+    # ----- XADD and the IDs it assigns -----
+    c.cmd("DEL", "st")
+    generated = c.cmd("XADD", "st", "*", "item", "1", "value", "a")
+    check("XADD * returns an ms-seq ID", generated,
+          pred=lambda g: isinstance(g, bytes) and re.fullmatch(rb"\d+-\d+", g))
+    second = c.cmd("XADD", "st", "*", "item", "2", "value", "b")
+    check("XADD * IDs are increasing", (generated, second),
+          pred=lambda g: stream_id_tuple(g[0]) < stream_id_tuple(g[1]))
+    check("XLEN after two XADDs", c.cmd("XLEN", "st"), 2)
+    check("XRANGE returns [id, [field, value...]]", c.cmd("XRANGE", "st", "-", "+"),
+          pred=lambda g: len(g) == 2 and g[0][0] == generated
+          and g[0][1] == [b"item", b"1", b"value", b"a"]
+          and g[1][1] == [b"item", b"2", b"value", b"b"])
+
+    # Redis doc example: explicit IDs, and the ordering rule
+    c.cmd("DEL", "st")
+    check("XADD with an explicit ID", c.cmd("XADD", "st", "1-1", "a", "1"), b"1-1")
+    check("XADD with a larger explicit ID", c.cmd("XADD", "st", "1-2", "b", "2"), b"1-2")
+    check("XADD with a smaller ID is refused", c.cmd("XADD", "st", "1-1", "c", "3"),
+          pred=lambda g: is_err(g, "ERR The ID specified in XADD is equal or smaller "
+                                   "than the target stream top item"))
+    check("XADD with the same ID is refused", c.cmd("XADD", "st", "1-2", "c", "3"),
+          pred=lambda g: is_err(g, "ERR The ID specified in XADD is equal or smaller"))
+    check("a bare ms is an explicit ms-0", c.cmd("XADD", "st", "2", "c", "3"), b"2-0")
+    check("a bare ms is refused once it is the top item",
+          c.cmd("XADD", "st", "2", "d", "4"),
+          pred=lambda g: is_err(g, "ERR The ID specified in XADD is equal or smaller"))
+    check("XADD 0-0 is refused", c.cmd("XADD", "st0", "0-0", "a", "1"),
+          pred=lambda g: is_err(g, "ERR The ID specified in XADD must be greater than 0-0"))
+    check("the refused 0-0 XADD created no key", c.cmd("EXISTS", "st0"), 0)
+    check("XADD rejects a malformed ID", c.cmd("XADD", "st", "bogus", "a", "1"),
+          pred=lambda g: is_err(g, "ERR Invalid stream ID specified as stream command argument"))
+    check("XADD needs at least one field", c.cmd("XADD", "st", "*"),
+          pred=lambda g: is_err(g, "ERR wrong number of arguments"))
+    check("XADD needs a value for every field", c.cmd("XADD", "st", "*", "f"),
+          pred=lambda g: is_err(g, "ERR wrong number of arguments"))
+
+    # ms-* picks the next sequence, and restarts at zero for a new millisecond
+    c.cmd("DEL", "st")
+    c.cmd("XADD", "st", "123-456", "item", "1")
+    check("ms-* continues the sequence", c.cmd("XADD", "st", "123-*", "item", "2"), b"123-457")
+    check("ms-* restarts the sequence for a later ms",
+          c.cmd("XADD", "st", "789-*", "item", "3"), b"789-0")
+    check("ms-* cannot go backwards", c.cmd("XADD", "st", "42-*", "item", "4"),
+          pred=lambda g: is_err(g, "ERR The ID specified in XADD is equal or smaller"))
+    c.cmd("DEL", "st")
+    check("0-* starts at 0-1", c.cmd("XADD", "st", "0-*", "a", "b"), b"0-1")
+    c.cmd("DEL", "st")
+    c.cmd("XADD", "st", "1-18446744073709551615", "a", "b")
+    check("ms-* refuses to overflow the sequence", c.cmd("XADD", "st", "1-*", "c", "d"),
+          pred=lambda g: is_err(g, "ERR The ID specified in XADD is equal or smaller"))
+
+    # NOMKSTREAM
+    c.cmd("DEL", "st")
+    check("XADD NOMKSTREAM on a missing key is nil",
+          c.cmd("XADD", "st", "NOMKSTREAM", "*", "item", "1"), None)
+    check("XADD NOMKSTREAM created no key", c.cmd("EXISTS", "st"), 0)
+    c.cmd("XADD", "st", "*", "item", "1")
+    check("XADD NOMKSTREAM on an existing stream adds",
+          c.cmd("XADD", "st", "NOMKSTREAM", "*", "item", "2"),
+          pred=lambda g: isinstance(g, bytes))
+    check("XLEN after NOMKSTREAM", c.cmd("XLEN", "st"), 2)
+
+    # MAXLEN, MAXLEN = and MAXLEN ~, MINID
+    c.cmd("DEL", "st")
+    for j in range(10):
+        c.cmd("XADD", "st", "MAXLEN", "5", "*", "j", str(j))
+    check("XADD MAXLEN keeps the newest entries", c.cmd("XLEN", "st"), 5)
+    check("the surviving entries are the newest", [e[1][1] for e in c.cmd("XRANGE", "st", "-", "+")],
+          [b"5", b"6", b"7", b"8", b"9"])
+    c.cmd("DEL", "st")
+    for j in range(10):
+        c.cmd("XADD", "st", "MAXLEN", "=", "3", "*", "j", str(j))
+    check("XADD MAXLEN = is the same as MAXLEN", c.cmd("XLEN", "st"), 3)
+    c.cmd("DEL", "st")
+    for j in range(10):
+        c.cmd("XADD", "st", "MAXLEN", "~", "4", "*", "j", str(j))
+    check("XADD MAXLEN ~ trims to the threshold here", c.cmd("XLEN", "st"), 4)
+    check("XADD MAXLEN 0 leaves an existing but empty stream",
+          c.cmd("XADD", "st", "MAXLEN", "0", "*", "a", "b"),
+          pred=lambda g: isinstance(g, bytes))
+    check("the emptied stream still exists", c.cmd("EXISTS", "st"), 1)
+    check("and reports length 0", c.cmd("XLEN", "st"), 0)
+    check("and is still a stream", c.cmd("TYPE", "st"), "stream")
+    check("XADD MAXLEN rejects a negative threshold",
+          c.cmd("XADD", "st", "MAXLEN", "-1", "*", "a", "b"),
+          pred=lambda g: is_err(g, "ERR The MAXLEN argument must be >= 0."))
+    check("LIMIT needs the ~ option",
+          c.cmd("XADD", "st", "MAXLEN", "5", "LIMIT", "3", "*", "a", "b"),
+          pred=lambda g: is_err(g, "ERR syntax error, LIMIT cannot be used without "
+                                   "the special ~ option"))
+
+    c.cmd("DEL", "st")
+    for j in range(1, 6):
+        c.cmd("XADD", "st", "%d-0" % j, "f", "v")
+    check("XADD MINID drops older entries",
+          c.cmd("XADD", "st", "MINID", "4", "6-0", "f", "v"),
+          b"6-0")
+    check("only the entries at or after MINID remain",
+          [e[0] for e in c.cmd("XRANGE", "st", "-", "+")], [b"4-0", b"5-0", b"6-0"])
+
+    # ----- XRANGE / XREVRANGE -----
+    c.cmd("DEL", "st")
+    for spec in ("1-1", "1-2", "2-1", "3-0"):
+        c.cmd("XADD", "st", spec, "f", spec)
+    check("XRANGE - +", [e[0] for e in c.cmd("XRANGE", "st", "-", "+")],
+          [b"1-1", b"1-2", b"2-1", b"3-0"])
+    check("XREVRANGE + - is the reverse", [e[0] for e in c.cmd("XREVRANGE", "st", "+", "-")],
+          [b"3-0", b"2-1", b"1-2", b"1-1"])
+    check("XRANGE with a partial start ID means ms-0",
+          [e[0] for e in c.cmd("XRANGE", "st", "2", "+")], [b"2-1", b"3-0"])
+    check("XRANGE with a partial end ID means ms-max",
+          [e[0] for e in c.cmd("XRANGE", "st", "-", "1")], [b"1-1", b"1-2"])
+    check("XRANGE exclusive start", [e[0] for e in c.cmd("XRANGE", "st", "(1-1", "+")],
+          [b"1-2", b"2-1", b"3-0"])
+    check("XRANGE exclusive end", [e[0] for e in c.cmd("XRANGE", "st", "-", "(3-0")],
+          [b"1-1", b"1-2", b"2-1"])
+    check("XRANGE COUNT", [e[0] for e in c.cmd("XRANGE", "st", "-", "+", "COUNT", "2")],
+          [b"1-1", b"1-2"])
+    check("XREVRANGE COUNT takes from the end",
+          [e[0] for e in c.cmd("XREVRANGE", "st", "+", "-", "COUNT", "2")], [b"3-0", b"2-1"])
+    check("XRANGE of a missing stream is empty", c.cmd("XRANGE", "st-missing", "-", "+"), [])
+    check("XRANGE rejects an exclusive -", c.cmd("XRANGE", "st", "(-", "+"),
+          pred=lambda g: is_err(g, "ERR Invalid stream ID specified as stream command argument"))
+    check("XRANGE rejects an exclusive +", c.cmd("XRANGE", "st", "-", "(+"),
+          pred=lambda g: is_err(g, "ERR Invalid stream ID specified as stream command argument"))
+    check("XRANGE rejects an unincrementable exclusive start",
+          c.cmd("XRANGE", "st", "(18446744073709551615-18446744073709551615", "+"),
+          pred=lambda g: is_err(g, "ERR invalid start offset"))
+    check("XRANGE rejects an undecrementable exclusive end",
+          c.cmd("XRANGE", "st", "-", "(0-0"),
+          pred=lambda g: is_err(g, "ERR invalid end offset"))
+    check("XLEN of a missing stream is 0", c.cmd("XLEN", "st-missing"), 0)
+
+    # ----- XDEL -----
+    c.cmd("DEL", "st")
+    for spec in ("1-1", "1-2", "1-3", "1-4", "1-5"):
+        c.cmd("XADD", "st", spec, "f", spec)
+    check("XDEL counts only the IDs it removed",
+          c.cmd("XDEL", "st", "1-1", "1-4", "1-5", "2-1"), 3)
+    check("XLEN after XDEL", c.cmd("XLEN", "st"), 2)
+    check("XRANGE after XDEL", [e[0] for e in c.cmd("XRANGE", "st", "-", "+")],
+          [b"1-2", b"1-3"])
+    info = as_map(c.cmd("XINFO", "STREAM", "st"))
+    check("XDEL moved recorded-first-entry-id", info[b"recorded-first-entry-id"], b"1-2")
+    check("XDEL recorded the largest deleted ID", info[b"max-deleted-entry-id"], b"1-5")
+    check("XDEL did not change last-generated-id", info[b"last-generated-id"], b"1-5")
+    check("XDEL rejects a malformed ID", c.cmd("XDEL", "st", "nope"),
+          pred=lambda g: is_err(g, "ERR Invalid stream ID specified as stream command argument"))
+
+    # ----- XTRIM -----
+    c.cmd("DEL", "st")
+    for j in range(1, 11):
+        c.cmd("XADD", "st", "%d-0" % j, "f", "v")
+    check("XTRIM MAXLEN returns the number removed", c.cmd("XTRIM", "st", "MAXLEN", "6"), 4)
+    check("XLEN after XTRIM MAXLEN", c.cmd("XLEN", "st"), 6)
+    check("XTRIM MAXLEN above the length removes nothing",
+          c.cmd("XTRIM", "st", "MAXLEN", "100"), 0)
+    check("XTRIM MINID removes by ID", c.cmd("XTRIM", "st", "MINID", "8-0"), 3)
+    check("XRANGE after XTRIM MINID", [e[0] for e in c.cmd("XRANGE", "st", "-", "+")],
+          [b"8-0", b"9-0", b"10-0"])
+    check("XTRIM MINID = accepts the exact marker", c.cmd("XTRIM", "st", "MINID", "=", "9-0"), 1)
+    check("XTRIM MAXLEN ~ LIMIT caps the deletions",
+          c.cmd("XTRIM", "st", "MAXLEN", "~", "0", "LIMIT", "1"), 1)
+    check("XTRIM without ~ refuses LIMIT", c.cmd("XTRIM", "st", "MAXLEN", "1", "LIMIT", "3"),
+          pred=lambda g: is_err(g, "ERR syntax error, LIMIT cannot be used without "
+                                   "the special ~ option"))
+    check("XTRIM of a missing stream is 0", c.cmd("XTRIM", "st-missing", "MAXLEN", "1"), 0)
+
+    # ----- XSETID -----
+    c.cmd("DEL", "st")
+    c.cmd("XADD", "st", "1-0", "a", "b")
+    check("XSETID sets last-generated-id", c.cmd("XSETID", "st", "200-0"), "OK")
+    check("XINFO reports the new last-generated-id",
+          as_map(c.cmd("XINFO", "STREAM", "st"))[b"last-generated-id"], b"200-0")
+    check("XSETID refuses an ID below the top item", c.cmd("XSETID", "st", "0-1"),
+          pred=lambda g: is_err(g, "ERR The ID specified in XSETID is smaller than "
+                                   "the target stream top item"))
+    check("XSETID on a missing key", c.cmd("XSETID", "st-missing", "1-1"),
+          pred=lambda g: is_err(g, "ERR no such key"))
+    check("XSETID rejects a lone positional argument", c.cmd("XSETID", "st", "300-0", "0"),
+          pred=lambda g: is_err(g, "ERR") and "syntax error" in str(g))
+    check("XSETID rejects a negative ENTRIESADDED",
+          c.cmd("XSETID", "st", "300-0", "ENTRIESADDED", "-1", "MAXDELETEDID", "0-0"),
+          pred=lambda g: is_err(g, "ERR value for ENTRIESADDED must be positive"))
+    check("XSETID refuses ENTRIESADDED below the length",
+          c.cmd("XSETID", "st", "300-0", "ENTRIESADDED", "0", "MAXDELETEDID", "0-0"),
+          pred=lambda g: is_err(g, "ERR The entries_added specified in XSETID is smaller "
+                                   "than the target stream length"))
+    check("XSETID refuses a MAXDELETEDID above the new ID",
+          c.cmd("XSETID", "st", "300-0", "ENTRIESADDED", "5", "MAXDELETEDID", "400-0"),
+          pred=lambda g: is_err(g, "ERR The ID specified in XSETID is smaller than "
+                                   "the provided max_deleted_entry_id"))
+    check("XSETID accepts ENTRIESADDED and MAXDELETEDID together",
+          c.cmd("XSETID", "st", "300-0", "ENTRIESADDED", "7", "MAXDELETEDID", "250-0"), "OK")
+    info = as_map(c.cmd("XINFO", "STREAM", "st"))
+    check("XSETID wrote entries-added", info[b"entries-added"], 7)
+    check("XSETID wrote max-deleted-entry-id", info[b"max-deleted-entry-id"], b"250-0")
+    c.cmd("DEL", "st")
+    c.cmd("XADD", "st", "1-1", "a", "1")
+    c.cmd("XADD", "st", "1-2", "b", "2")
+    c.cmd("XADD", "st", "1-3", "c", "3")
+    c.cmd("XDEL", "st", "1-2")
+    c.cmd("XDEL", "st", "1-3")
+    check("XSETID refuses an ID below the recorded tombstone",
+          c.cmd("XSETID", "st", "1-2"),
+          pred=lambda g: is_err(g, "ERR The ID specified in XSETID is smaller than "
+                                   "the provided max_deleted_entry_id"))
+
+    # ----- XINFO STREAM -----
+    c.cmd("DEL", "st")
+    c.cmd("XADD", "st", "1-0", "data", "a")
+    c.cmd("XADD", "st", "2-0", "data", "b")
+    info = as_map(c.cmd("XINFO", "STREAM", "st"))
+    check("XINFO STREAM has every documented field", sorted(info.keys()),
+          sorted([b"length", b"radix-tree-keys", b"radix-tree-nodes", b"last-generated-id",
+                  b"max-deleted-entry-id", b"entries-added", b"recorded-first-entry-id",
+                  b"groups", b"first-entry", b"last-entry"]))
+    check("XINFO STREAM length", info[b"length"], 2)
+    check("XINFO STREAM last-generated-id", info[b"last-generated-id"], b"2-0")
+    check("XINFO STREAM entries-added", info[b"entries-added"], 2)
+    check("XINFO STREAM recorded-first-entry-id", info[b"recorded-first-entry-id"], b"1-0")
+    check("XINFO STREAM max-deleted-entry-id", info[b"max-deleted-entry-id"], b"0-0")
+    check("XINFO STREAM groups", info[b"groups"], 0)
+    check("XINFO STREAM first-entry", info[b"first-entry"], [b"1-0", [b"data", b"a"]])
+    check("XINFO STREAM last-entry", info[b"last-entry"], [b"2-0", [b"data", b"b"]])
+    full = as_map(c.cmd("XINFO", "STREAM", "st", "FULL"))
+    check("XINFO STREAM FULL lists the entries", full[b"entries"],
+          [[b"1-0", [b"data", b"a"]], [b"2-0", [b"data", b"b"]]])
+    check("XINFO STREAM FULL has no groups yet", full[b"groups"], [])
+    check("XINFO STREAM FULL COUNT limits the entries",
+          as_map(c.cmd("XINFO", "STREAM", "st", "FULL", "COUNT", "1"))[b"entries"],
+          [[b"1-0", [b"data", b"a"]]])
+    check("XINFO STREAM on a missing key", c.cmd("XINFO", "STREAM", "st-missing"),
+          pred=lambda g: is_err(g, "ERR no such key"))
+    check("XINFO HELP lists its subcommands", c.cmd("XINFO", "HELP"),
+          pred=lambda g: isinstance(g, list) and any("STREAM" in line for line in g))
+    check("XINFO HELP takes no argument", c.cmd("XINFO", "HELP", "xxx"),
+          pred=lambda g: is_err(g, "ERR wrong number of arguments for 'xinfo|help' command"))
+    check("XINFO rejects an unknown subcommand", c.cmd("XINFO", "NOPE", "st"),
+          pred=lambda g: is_err(g, "ERR Unknown XINFO subcommand"))
+
+    # ----- streams and the generic key commands -----
+    c.cmd("DEL", "st", "st2")
+    c.cmd("XADD", "st", "1-0", "f", "v")
+    c.cmd("XADD", "st", "2-0", "f", "v")
+    check("TYPE of a stream", c.cmd("TYPE", "st"), "stream")
+    check("EXISTS sees a stream", c.cmd("EXISTS", "st"), 1)
+    check("OBJECT ENCODING of a stream", c.cmd("OBJECT", "ENCODING", "st"), b"stream")
+    check("EXPIRE on a stream", c.cmd("EXPIRE", "st", "100"), 1)
+    check("TTL of a stream", c.cmd("TTL", "st"), pred=lambda g: 0 < g <= 100)
+    check("PERSIST on a stream", c.cmd("PERSIST", "st"), 1)
+    check("RENAME a stream", c.cmd("RENAME", "st", "st2"), "OK")
+    check("the renamed stream kept its entries",
+          [e[0] for e in c.cmd("XRANGE", "st2", "-", "+")], [b"1-0", b"2-0"])
+    check("the old name is gone", c.cmd("EXISTS", "st"), 0)
+    check("COPY a stream", c.cmd("COPY", "st2", "st3"), 1)
+    check("the copy holds the same entries",
+          [e[0] for e in c.cmd("XRANGE", "st3", "-", "+")], [b"1-0", b"2-0"])
+    check("the copy is a stream", c.cmd("TYPE", "st3"), "stream")
+    dump = c.cmd("DUMP", "st2")
+    check("DUMP of a stream returns a payload", dump, pred=lambda g: isinstance(g, bytes) and g)
+    c.cmd("DEL", "st4")
+    check("RESTORE a stream", c.cmd("RESTORE", "st4", "0", dump), "OK")
+    check("the restored stream holds the entries",
+          c.cmd("XRANGE", "st4", "-", "+"),
+          [[b"1-0", [b"f", b"v"]], [b"2-0", [b"f", b"v"]]])
+    check("the restored stream reports the same length",
+          as_map(c.cmd("XINFO", "STREAM", "st4"))[b"entries-added"], 2)
+    check("DEL removes a stream", c.cmd("DEL", "st4"), 1)
+    check("and the stream is gone", c.cmd("EXISTS", "st4"), 0)
+    check("XLEN after DEL", c.cmd("XLEN", "st4"), 0)
+
+    # MOVE carries the stream to another database
+    c.cmd("DEL", "stmove")
+    c.cmd("XADD", "stmove", "5-5", "f", "v")
+    check("MOVE a stream to database 3", c.cmd("MOVE", "stmove", "3"), 1)
+    check("the source name is gone after MOVE", c.cmd("EXISTS", "stmove"), 0)
+    moved = Resp(host, port)
+    moved.cmd("SELECT", "3")
+    check("the moved stream arrived", moved.cmd("XRANGE", "stmove", "-", "+"),
+          [[b"5-5", [b"f", b"v"]]])
+    moved.cmd("DEL", "stmove")
+    moved.sock.close()
+
+    # ----- WRONGTYPE in both directions -----
+    c.cmd("DEL", "st", "plain")
+    c.cmd("XADD", "st", "1-0", "f", "v")
+    c.cmd("SET", "plain", "x")
+    # Every string, list, set, hash and sorted-set command that consults the
+    # type guard refuses a stream key. GET, APPEND, STRLEN, GETEX and GETDEL do
+    # not consult it for any collection type, which known_divergences.txt
+    # records, so they are checked for the behaviour they actually have.
+    for name, args in (("INCR", ("INCR", "st")),
+                       ("INCRBYFLOAT", ("INCRBYFLOAT", "st", "1.5")),
+                       ("SETRANGE", ("SETRANGE", "st", "0", "x")),
+                       ("GETRANGE", ("GETRANGE", "st", "0", "1")),
+                       ("SETBIT", ("SETBIT", "st", "0", "1")),
+                       ("GETBIT", ("GETBIT", "st", "0")),
+                       ("BITCOUNT", ("BITCOUNT", "st")),
+                       ("BITFIELD", ("BITFIELD", "st", "GET", "u8", "0")),
+                       ("PFADD", ("PFADD", "st", "x")),
+                       ("LPUSH", ("LPUSH", "st", "x")),
+                       ("LRANGE", ("LRANGE", "st", "0", "-1")),
+                       ("SADD", ("SADD", "st", "x")),
+                       ("SMEMBERS", ("SMEMBERS", "st")),
+                       ("ZADD", ("ZADD", "st", "1", "x")),
+                       ("ZRANGE", ("ZRANGE", "st", "0", "-1")),
+                       ("HSET", ("HSET", "st", "f", "v")),
+                       ("HGETALL", ("HGETALL", "st"))):
+        check("%s on a stream is WRONGTYPE" % name, c.cmd(*args),
+              pred=lambda g: is_err(g, "WRONGTYPE"))
+    check("the stream survived the wrong-type attempts", c.cmd("TYPE", "st"), "stream")
+    check("GET on a stream answers nil, as it does for every collection",
+          c.cmd("GET", "st"), None)
+    check("STRLEN on a stream answers 0, as it does for every collection",
+          c.cmd("STRLEN", "st"), 0)
+    for name, args in (("XADD", ("XADD", "plain", "*", "f", "v")),
+                       ("XLEN", ("XLEN", "plain")),
+                       ("XRANGE", ("XRANGE", "plain", "-", "+")),
+                       ("XREVRANGE", ("XREVRANGE", "plain", "+", "-")),
+                       ("XDEL", ("XDEL", "plain", "1-1")),
+                       ("XTRIM", ("XTRIM", "plain", "MAXLEN", "1")),
+                       ("XSETID", ("XSETID", "plain", "1-1")),
+                       ("XINFO", ("XINFO", "STREAM", "plain"))):
+        check("%s on a string is WRONGTYPE" % name, c.cmd(*args),
+              pred=lambda g: is_err(g, "WRONGTYPE"))
+
+    # ----- logical database isolation -----
+    zero = Resp(host, port)
+    one = Resp(host, port)
+    one.cmd("SELECT", "1")
+    zero.cmd("DEL", "stdb")
+    one.cmd("DEL", "stdb")
+    zero.cmd("XADD", "stdb", "1-0", "db", "0")
+    one.cmd("XADD", "stdb", "9-0", "db", "1")
+    check("a stream in database 0 is the database-0 one",
+          zero.cmd("XRANGE", "stdb", "-", "+"), [[b"1-0", [b"db", b"0"]]])
+    check("a stream in database 1 is its own", one.cmd("XRANGE", "stdb", "-", "+"),
+          [[b"9-0", [b"db", b"1"]]])
+    check("XLEN is per database", (zero.cmd("XLEN", "stdb"), one.cmd("XLEN", "stdb")), (1, 1))
+    one.cmd("DEL", "stdb")
+    check("deleting the database-1 stream leaves database 0 alone",
+          zero.cmd("XLEN", "stdb"), 1)
+    zero.cmd("DEL", "stdb")
+    zero.sock.close()
+    one.sock.close()
+
+    for key in ("st", "st0", "st2", "st3", "st4", "plain", "stdb"):
+        c.cmd("DEL", key)
+
+
+def stream_id_tuple(raw):
+    ms, _, seq = raw.decode().partition("-")
+    return (int(ms), int(seq))
+
 def main():
     host, port = sys.argv[1], int(sys.argv[2])
     c = Resp(host, port)
@@ -2574,6 +2939,9 @@ def main():
 
     # ----- Lua scripting -----
     check_scripting(host, port, c)
+
+    # ----- Streams -----
+    check_streams_basic(host, port, c)
 
     c.cmd("SET", "t1", "v")
     c.cmd("SADD", "s1", "a")

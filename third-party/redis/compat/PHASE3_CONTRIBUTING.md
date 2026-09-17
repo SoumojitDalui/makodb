@@ -114,6 +114,44 @@ live under hidden `0x01` prefixes built by `make_set_member_key`,
 with a `*_meta_key` carrying the cardinality. Follow the same pattern for any
 new type: one meta key per logical key plus one composite key per element.
 
+## Streams
+
+Streams are the one family with five namespaces instead of two, and the only
+one whose element keys are ordered by something the client chose. Every key is
+`<tag> + u64le(len(stream key)) + stream key + <suffix>`, so one stream's
+records are a contiguous prefix range and no stream can spell another's key:
+
+| Tag | Record | Suffix | Value |
+|---|---|---|---|
+| `\x01X#:` | the stream itself | none | length, last-generated-id, recorded-first-entry-id, entries-added, max-deleted-entry-id, group count, as nine little-endian 64-bit fields |
+| `\x01X:` | one entry | `be64(ms) be64(seq)` | `pack_bytes_list([field, value, ...])` |
+| `\x01XG:` | one consumer group | `u64le(len(group)) group` | last-delivered-id, entries-read (-1 when unknowable), consumer count, PEL count |
+| `\x01XC:` | one consumer | the group's suffix then the consumer name | seen-time, active-time (-1 until an entry is handed over), pending count |
+| `\x01XP:` | one pending-entry-list entry | the group's suffix then `be64(ms) be64(seq)` | delivery-time, delivery-count, owning consumer name |
+
+The two things to know before touching it. First, the IDs in the entry and PEL
+suffixes are fixed-width and big-endian, so lexicographic key order *is* ID
+order: `XRANGE start end` is a storage key range, `COUNT` stops the forward
+walk instead of filtering after it, and `XAUTOCLAIM`'s cursor is just the next
+PEL key. A reverse read has no such luck, because the ordered index only walks
+forward, so `XREVRANGE` and the two commands that need the largest stored ID
+(`XINFO STREAM`, `XSETID`) read the range before they answer. Second, a stream
+exists for exactly as long as its meta record does, not as long as it has
+entries: `XADD key MAXLEN 0 * f v` and `XGROUP CREATE key g $ MKSTREAM` both
+leave an empty stream that `EXISTS` reports and `TYPE` calls `stream`, which is
+why `stream_exists` reads the meta key and nothing else, and why every
+`*_key_allowed` guard, `read_logical_exists`, TYPE, DEL, RENAME, COPY, MOVE,
+DUMP and the destination-clearing lambdas all call it.
+
+Two helpers carry a whole stream between names: `collect_stream_records` reads
+every record of every family as `(family letter, key suffix, value)` triples
+and `write_stream_records` writes them back under another name. RENAME, COPY,
+MOVE and `DUMP`/`RESTORE` (a `MAKO_STREAM_DUMP` payload) all go through that
+pair, so a stream carries its groups, consumers and pending-entry lists
+wherever it goes. Per-consumer PEL views are not stored: they are the group's
+PEL filtered by owner, which is what keeps `XACK`, `XCLAIM` and `XAUTOCLAIM`
+to one record write per entry.
+
 When you add a C++ op you must also:
 1. Add `TXN_OP_NEW = <n>` to `include/transaction_ffi.h` (next free: 87) and
    `const TXN_OP_NEW: u32 = <n>;` in `lib.rs`.

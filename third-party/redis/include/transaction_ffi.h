@@ -29,8 +29,11 @@
  *   TTL metadata under "\x01TTL:<key>", set internals under "\x01S:" /
  *   "\x01S#:", list internals under "\x01L:" / "\x01L#:", hash internals under
  *   "\x01H:" / "\x01H#:" plus per-field expirations under "\x01HX:", and
- *   sorted-set internals under "\x01Z:" / "\x01ZS:" / "\x01Z#:". These records
- *   are hidden from Redis keyspace commands.
+ *   sorted-set internals under "\x01Z:" / "\x01ZS:" / "\x01Z#:", and stream
+ *   internals under "\x01X#:" (one meta record per stream) / "\x01X:" (one per
+ *   entry) / "\x01XG:" (one per consumer group) / "\x01XC:" (one per consumer)
+ *   / "\x01XP:" (one per pending-entry-list entry). These records are hidden
+ *   from Redis keyspace commands.
  *
  * Sorted-set score encoding:
  *   Sorted-set score indexes use order-preserving IEEE-754 double encoding:
@@ -194,6 +197,75 @@ typedef enum {
     // key, so it is in redis_op_uses_only_primary_lock_key and adds the packed
     // destination in redis_request_lock_stripes.
     TXN_OP_MOVE = 86,
+    // Redis Streams. A stream is an ordered composite-key family, laid out so
+    // that one prefix range scan of storage walks the entries in ID order:
+    //
+    //   meta      "\x01X#:"  + u64le(len(key)) + key
+    //             -> length, last-generated-id, recorded-first-entry-id,
+    //                entries-added, max-deleted-entry-id, group count, as nine
+    //                little-endian 64-bit fields.
+    //   entry     "\x01X:"   + u64le(len(key)) + key + be64(ms) + be64(seq)
+    //             -> pack_bytes_list([field, value, ...]).
+    //   group     "\x01XG:"  + u64le(len(key)) + key
+    //                        + u64le(len(group)) + group
+    //             -> last-delivered-id, entries-read (-1 when it cannot be
+    //                known, Redis's SCG_INVALID_ENTRIES_READ), consumer count,
+    //                PEL count.
+    //   consumer  "\x01XC:"  + <stream> + <group> + consumer
+    //             -> seen-time, active-time (-1 until an entry is handed over),
+    //                pending count.
+    //   PEL       "\x01XP:"  + <stream> + <group> + be64(ms) + be64(seq)
+    //             -> delivery-time, delivery-count, owning consumer name. A
+    //                per-consumer PEL view is this list filtered by owner.
+    //
+    // The 128-bit IDs are written big-endian and fixed-width, so lexicographic
+    // key order is ID order: an XRANGE start/end pair becomes a key range and
+    // COUNT stops the walk instead of filtering afterwards. A stream exists for
+    // as long as its meta record does, which is what lets XADD MAXLEN 0 and
+    // XGROUP CREATE MKSTREAM leave an empty but existing stream, as Redis does.
+    //
+    // Every ID crosses this interface as decimal "<ms>-<seq>" text, both halves
+    // unsigned 64-bit as in Redis; the executor parses and formats them, so no
+    // ID has to be squeezed into the signed int64 of a TxnOpResult. Rust has
+    // already expanded "-", "+", the bare "<ms>" forms, the "(" exclusive
+    // markers and "$", so the executor only ever sees both halves written out.
+    //
+    // Payloads are pack_bytes_list of decimal/text items, per op:
+    //
+    // XADD: key = the stream. value = packed
+    //   [id spec ("*", "<ms>-*" or "<ms>-<seq>"), NOMKSTREAM ("0"/"1"),
+    //    trim strategy ("" | "MAXLEN" | "MINID"), trim threshold, trim LIMIT
+    //    ("0" for none), field, value, ...]. The insert and the trim are one op
+    //   because a request's op list is built before the executor runs it.
+    //   On success int_value is 0 and the data is the ID that was assigned.
+    // XRANGE (also XREVRANGE and each stream of an XREAD): value = packed
+    //   [start id, end id, COUNT ("0" for all), reverse ("0"/"1")]. Read-only.
+    //   The result data is packed [last-generated-id, id, fields, id, fields...]
+    //   where each `fields` is the entry's own packed [field, value, ...] blob
+    //   copied out verbatim. Item 0 is what a blocking XREAD resolves "$" and
+    //   "+" to when the first attempt found nothing. int_value is 1 when the
+    //   stream exists and 0 when it does not.
+    // XLEN: int_value is the length. Read-only.
+    // XDEL: value = packed [id, ...]; int_value is the number removed.
+    // XTRIM: value = packed [strategy, threshold, LIMIT]; int_value is the
+    //   number removed.
+    // XSETID: value = packed [last id, ENTRIESADDED ("" when absent),
+    //   MAXDELETEDID ("" when absent)].
+    // XINFO: value = packed ["STREAM", FULL ("0"/"1"), COUNT] for XINFO STREAM,
+    //   ["GROUPS"] or ["CONSUMERS", group] for the other two. Read-only. The
+    //   result data is a flat packed list Rust walks with a cursor; the shapes
+    //   are described where they are built in makoCon.cc.
+    // XRESTORE: value = packed [family letter, key suffix, value, ...] as DUMP
+    //   produced it under the "MAKO_STREAM_DUMP" magic, so a restore brings
+    //   back the entries and the consumer groups with their PELs.
+    TXN_OP_XADD = 87,
+    TXN_OP_XRANGE = 88,
+    TXN_OP_XLEN = 89,
+    TXN_OP_XDEL = 90,
+    TXN_OP_XTRIM = 91,
+    TXN_OP_XSETID = 92,
+    TXN_OP_XINFO = 93,
+    TXN_OP_XRESTORE = 94,
 } TxnOpCode;
 
 /**
@@ -254,6 +326,20 @@ typedef enum {
 #define TXN_INCR_ERR_OVERFLOW (-2)     /* increment or decrement would overflow */
 #define TXN_INCR_ERR_NOT_FLOAT (-3)    /* value is not a valid float */
 #define TXN_INCR_ERR_NAN_OR_INF (-4)   /* increment would produce NaN or Infinity */
+
+/**
+ * Stream result convention. A stream op that fails because of a command-level
+ * condition rather than a storage failure reports success=true with one of
+ * these sentinels in int_value and no value, so Rust can write Redis's exact
+ * error (or, for NOMKSTREAM, a null) instead of failing the whole transaction.
+ * success=false still means plain WRONGTYPE.
+ */
+#define TXN_STREAM_ERR_NOMKSTREAM (-1)          /* XADD NOMKSTREAM, no such key -> null */
+#define TXN_STREAM_ERR_SMALLER_ID (-2)          /* "The ID specified in XADD is equal or smaller than the target stream top item" */
+#define TXN_STREAM_ERR_NO_SUCH_KEY (-3)         /* "no such key" */
+#define TXN_STREAM_ERR_SETID_SMALLER (-4)       /* "The ID specified in XSETID is smaller than the target stream top item" */
+#define TXN_STREAM_ERR_SETID_ENTRIES_ADDED (-5) /* "The entries_added specified in XSETID is smaller than the target stream length" */
+#define TXN_STREAM_ERR_SETID_TOMBSTONE (-6)     /* "The ID specified in XSETID is smaller than the provided max_deleted_entry_id" */
 
 typedef enum {
     TXN_FLAG_NONE = 0,
