@@ -417,6 +417,25 @@ extern "C" {
         makocon_ffi::free_transaction_response(response);
     }
 
+    // Interactive transaction sessions. This binary dispatches every operation
+    // through the worker queue rather than owning a storage transaction on the
+    // calling thread, so it cannot hold one open across calls. Refusing to
+    // begin one is the honest answer: Rust reports the script as unsupported
+    // instead of silently losing atomicity.
+    void* cpp_txn_begin(const uint8_t* const*, const size_t*, size_t) {
+        return nullptr;
+    }
+
+    bool cpp_txn_execute(void*, const TxnRequest*, TxnResponse*) {
+        return false;
+    }
+
+    bool cpp_txn_commit(void*) {
+        return false;
+    }
+
+    void cpp_txn_abort(void*) {}
+
     void cpp_cleanup_thread_info() {
         RustWrapper::cleanup_thread_info();
     }

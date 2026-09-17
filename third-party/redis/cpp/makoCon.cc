@@ -1295,89 +1295,46 @@ static bool execute_fast_mako_string(
     }
 }
 
-// Generic executor for single commands and MULTI/EXEC batches.
-bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
-    ensure_thread_info();
+// Every piece of state one Mako transaction accumulates while the Redis
+// executor runs operations inside it. The batch entry point
+// (cpp_execute_transaction) fills one of these, runs its whole op list and
+// finishes it in a single call; an interactive session (cpp_txn_begin) keeps
+// one alive across many cpp_txn_execute calls, so a Lua script's redis.call
+// sees everything the calls before it wrote. Sessions are single-threaded and
+// short-lived: the storage transaction, the lock guards and the caches all
+// belong to the thread that opened them.
+struct RedisTxnSession {
+    // Set while the object is a live session, cleared before it is freed, so a
+    // stale or bogus handle from Rust is caught instead of dereferenced.
+    static constexpr uint64_t kSessionMagic = 0x4d414b4f54584e31ull;  // "MAKOTXN1"
+    uint64_t magic = kSessionMagic;
 
-    if (!makocon_ffi::allocate_response(request, response)) {
-        return false;
-    }
+    // The storage transaction. NULL is a legal value: mbta_wrapper::new_txn()
+    // always returns NULL and keeps the real transaction in thread-local STO
+    // state, so `active` rather than `txn` says whether one is open.
+    void* txn = nullptr;
+    // A storage transaction is open and has neither committed nor rolled back.
+    bool active = false;
+    // Opened by cpp_txn_begin rather than by the batch path.
+    bool interactive = false;
+    // At least one non-read-only op has run (or was declared by the batch
+    // path), so the commit waits for replication.
+    bool has_write = false;
+    // Cleared by any storage failure; the transaction can no longer commit.
+    bool all_success = true;
+    // An abort exception reached the executor, so the caller marks every
+    // result failed.
+    bool threw = false;
 
-    const bool has_write = redis_request_has_write(request);
-    if (has_write && !redis_can_write_here()) {
-        response->transaction_success = false;
-        for (size_t i = 0; i < response->num_results; ++i) {
-            response->results[i].success = false;
-        }
-        g_mako_txn_aborts.fetch_add(1, std::memory_order_relaxed);
-        return true;
-    }
-
-    std::unique_lock<std::shared_mutex> redis_keyspace_exclusive_lock;
-    std::shared_lock<std::shared_mutex> redis_keyspace_shared_lock;
-    std::unique_lock<std::mutex> redis_single_key_lock;
-    std::vector<std::unique_lock<std::mutex>> redis_key_locks;
-    if (g_redis_single_worker_mode) {
-        // One Rust protocol worker already serializes all FFI executor calls.
-    } else if (redis_request_has_flushdb(request)) {
-        redis_keyspace_exclusive_lock = std::unique_lock<std::shared_mutex>(g_redis_keyspace_mutex);
-        // Generic operations take the keyspace lock before any stripe. Once
-        // exclusive ownership is established, acquiring every stripe cannot
-        // deadlock and excludes specialized GET/SET until the scan completes.
-        redis_key_locks.reserve(kRedisTxnLockStripes);
-        for (size_t stripe = 0; stripe < kRedisTxnLockStripes; ++stripe) {
-            redis_key_locks.emplace_back(g_redis_txn_key_mutexes[stripe]);
-        }
-    } else {
-        redis_keyspace_shared_lock = std::shared_lock<std::shared_mutex>(g_redis_keyspace_mutex);
-        if (request != nullptr
-            && request->ops != nullptr
-            && request->num_ops == 1
-            && !redis_op_is_read_only(request->ops[0])
-            && redis_op_uses_only_primary_lock_key(request->ops[0])) {
-            const TxnOperation& op = request->ops[0];
-            const size_t stripe = redis_lock_hash(op.key_ptr, op.key_len) % kRedisTxnLockStripes;
-            redis_single_key_lock = std::unique_lock<std::mutex>(g_redis_txn_key_mutexes[stripe]);
-        } else if (has_write) {
-            const std::vector<size_t> stripes = redis_request_lock_stripes(request);
-            redis_key_locks.reserve(stripes.size());
-            for (size_t stripe : stripes) {
-                redis_key_locks.emplace_back(g_redis_txn_key_mutexes[stripe]);
-            }
-        }
-    }
-
-    if (request->num_ops == 1 && request->ops != nullptr && request->ops[0].op == TXN_OP_FLUSHDB) {
-        const bool ok = execute_flushdb_chunked(
-            redis_flush_db_filter(request->ops[0].val_ptr, request->ops[0].val_len));
-        response->transaction_success = ok;
-        response->results[0].success = ok;
-        response->results[0].value_present = ok;
-        if (ok) {
-            redis_cache_clear();
-            g_mako_txn_commits.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            g_mako_txn_aborts.fetch_add(1, std::memory_order_relaxed);
-        }
-        return true;
-    }
-
-    // Reset arena for this transaction
-    if (tl_arena) {
-        tl_arena->reset();
-    }
+    std::unique_lock<std::shared_mutex> keyspace_exclusive_lock;
+    std::shared_lock<std::shared_mutex> keyspace_shared_lock;
+    std::unique_lock<std::mutex> single_key_lock;
+    std::vector<std::unique_lock<std::mutex>> key_locks;
 
     // StringWrapper stores a pointer to the string, so encoded values must
     // outlive Commit(). deque keeps references stable as we append values.
     std::deque<std::string> owned_encoded_vals;
 
-    // Begin a single database transaction for all operations
-    // NOTE: mbta_wrapper::new_txn() always returns NULL - it uses thread-local TThread::txn state
-    // The actual transaction is started via Sto::start_transaction() internally
-    // DO NOT check for NULL - that's expected behavior!
-    void* txn = g_mako_db->BeginTransaction();
-
-    bool all_success = true;
     std::unordered_map<std::string, bool> batch_exists;
     std::unordered_map<std::string, std::string> batch_values;
     std::unordered_map<std::string, int64_t> batch_ttls;
@@ -1422,6 +1379,184 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
     std::unordered_set<std::string> staged_zsets_loaded;
     std::unordered_set<std::string> dirty_zsets;
     std::unordered_map<uint32_t, bool> group_can_write;
+    // Interactive sessions only: the Redis-visible names whose cached string
+    // value this transaction changed, collected just before the flush and
+    // dropped from the cache once the commit succeeds. The batch path still
+    // has its TxnRequest at that point and invalidates straight from it.
+    std::vector<std::string> cache_invalidations;
+
+    void release_locks() {
+        key_locks.clear();
+        single_key_lock = std::unique_lock<std::mutex>();
+        keyspace_shared_lock = std::shared_lock<std::shared_mutex>();
+        keyspace_exclusive_lock = std::unique_lock<std::shared_mutex>();
+    }
+};
+
+// Opens the storage transaction of a session whose locks are already held.
+static void begin_session_txn(RedisTxnSession& session) {
+    // Reset arena for this transaction
+    if (tl_arena) {
+        tl_arena->reset();
+    }
+
+    // Begin a single database transaction for all operations
+    // NOTE: mbta_wrapper::new_txn() always returns NULL - it uses thread-local TThread::txn state
+    // The actual transaction is started via Sto::start_transaction() internally
+    // DO NOT check for NULL - that's expected behavior!
+    session.txn = g_mako_db->BeginTransaction();
+    session.active = true;
+}
+
+// The executor body. `finish` runs the end-of-transaction tail (staged
+// collections, the two flushes, commit or rollback); `commit` says which of the
+// two the tail should do. execute_ops() and finish_session() below are the two
+// ways in: they are one function because the tail needs the same hundred helper
+// lambdas the op loop does, and those close over the session's caches.
+static bool execute_ops_impl(
+    RedisTxnSession& session,
+    const TxnRequest* request,
+    TxnResponse* response,
+    bool finish,
+    bool commit);
+
+// Runs one op list inside an open session, leaving the transaction open.
+static bool execute_ops(
+    RedisTxnSession& session, const TxnRequest* request, TxnResponse* response) {
+    return execute_ops_impl(session, request, response, false, false);
+}
+
+// Ends an open session: writes out the staged collections and the buffered
+// writes and deletes, then commits or rolls back. Returns whether the storage
+// commit succeeded (an OCC abort, or `commit == false`, returns false).
+static bool finish_session(RedisTxnSession& session, bool commit) {
+    if (!session.active) {
+        session.release_locks();
+        return false;
+    }
+    const TxnRequest empty_request{0, nullptr};
+    TxnResponse sink{false, 0, nullptr};
+    execute_ops_impl(session, &empty_request, &sink, true, commit);
+    session.release_locks();
+    return sink.transaction_success;
+}
+
+// Generic executor for single commands and MULTI/EXEC batches.
+bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
+    ensure_thread_info();
+
+    if (!makocon_ffi::allocate_response(request, response)) {
+        return false;
+    }
+
+    const bool has_write = redis_request_has_write(request);
+    if (has_write && !redis_can_write_here()) {
+        response->transaction_success = false;
+        for (size_t i = 0; i < response->num_results; ++i) {
+            response->results[i].success = false;
+        }
+        g_mako_txn_aborts.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    RedisTxnSession session;
+    session.has_write = has_write;
+    if (g_redis_single_worker_mode) {
+        // One Rust protocol worker already serializes all FFI executor calls.
+    } else if (redis_request_has_flushdb(request)) {
+        session.keyspace_exclusive_lock = std::unique_lock<std::shared_mutex>(g_redis_keyspace_mutex);
+        // Generic operations take the keyspace lock before any stripe. Once
+        // exclusive ownership is established, acquiring every stripe cannot
+        // deadlock and excludes specialized GET/SET until the scan completes.
+        session.key_locks.reserve(kRedisTxnLockStripes);
+        for (size_t stripe = 0; stripe < kRedisTxnLockStripes; ++stripe) {
+            session.key_locks.emplace_back(g_redis_txn_key_mutexes[stripe]);
+        }
+    } else {
+        session.keyspace_shared_lock = std::shared_lock<std::shared_mutex>(g_redis_keyspace_mutex);
+        if (request != nullptr
+            && request->ops != nullptr
+            && request->num_ops == 1
+            && !redis_op_is_read_only(request->ops[0])
+            && redis_op_uses_only_primary_lock_key(request->ops[0])) {
+            const TxnOperation& op = request->ops[0];
+            const size_t stripe = redis_lock_hash(op.key_ptr, op.key_len) % kRedisTxnLockStripes;
+            session.single_key_lock = std::unique_lock<std::mutex>(g_redis_txn_key_mutexes[stripe]);
+        } else if (has_write) {
+            const std::vector<size_t> stripes = redis_request_lock_stripes(request);
+            session.key_locks.reserve(stripes.size());
+            for (size_t stripe : stripes) {
+                session.key_locks.emplace_back(g_redis_txn_key_mutexes[stripe]);
+            }
+        }
+    }
+
+    if (request->num_ops == 1 && request->ops != nullptr && request->ops[0].op == TXN_OP_FLUSHDB) {
+        const bool ok = execute_flushdb_chunked(
+            redis_flush_db_filter(request->ops[0].val_ptr, request->ops[0].val_len));
+        response->transaction_success = ok;
+        response->results[0].success = ok;
+        response->results[0].value_present = ok;
+        if (ok) {
+            redis_cache_clear();
+            g_mako_txn_commits.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_mako_txn_aborts.fetch_add(1, std::memory_order_relaxed);
+        }
+        return true;
+    }
+
+    begin_session_txn(session);
+    execute_ops(session, request, response);
+    if (!session.active) {
+        // An op settled the transaction on its own (the chunked DBSIZE path)
+        // and already filled in the response.
+        return true;
+    }
+
+    const bool committed = finish_session(session, true);
+    response->transaction_success = committed;
+    if (committed) {
+        if (has_write) {
+            redis_cache_invalidate_committed_writes(request);
+        }
+    } else if (session.threw) {
+        // Mark all results as failed on abort
+        for (size_t i = 0; i < response->num_results; i++) {
+            response->results[i].success = false;
+        }
+    }
+    return true;
+}
+
+static bool execute_ops_impl(
+    RedisTxnSession& session,
+    const TxnRequest* request,
+    TxnResponse* response,
+    bool finish,
+    bool commit) {
+    // Bound to the session so the op bodies below read exactly as they did when
+    // all of this was one function's locals.
+    void* txn = session.txn;
+    bool& all_success = session.all_success;
+    auto& owned_encoded_vals = session.owned_encoded_vals;
+    auto& batch_exists = session.batch_exists;
+    auto& batch_values = session.batch_values;
+    auto& batch_ttls = session.batch_ttls;
+    // Deferred removals and buffered writes; see RedisTxnSession for why both
+    // buffers exist and what breaks without them.
+    auto& pending_deletes = session.pending_deletes;
+    auto& pending_writes = session.pending_writes;
+    auto& staged_sets = session.staged_sets;
+    auto& staged_sets_loaded = session.staged_sets_loaded;
+    auto& dirty_sets = session.dirty_sets;
+    auto& staged_lists = session.staged_lists;
+    auto& staged_lists_loaded = session.staged_lists_loaded;
+    auto& dirty_lists = session.dirty_lists;
+    auto& staged_zsets = session.staged_zsets;
+    auto& staged_zsets_loaded = session.staged_zsets_loaded;
+    auto& dirty_zsets = session.dirty_zsets;
+    auto& group_can_write = session.group_can_write;
 
     auto make_prefixed_key = [](const TxnOperation& op) {
         std::string key;
@@ -1943,12 +2078,18 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
         return std::optional<std::string>{};
     };
 
-    if (request->num_ops == 1 && request->ops != nullptr
+    // DBSIZE over the whole of database 0 walks the keyspace in its own chunked
+    // transactions, so it cannot run inside an interactive session: the session
+    // has to stay open for the ops after it. A session answers DBSIZE from the
+    // general TXN_OP_SCAN branch instead, inside the session's transaction.
+    if (!session.interactive
+        && request->num_ops == 1 && request->ops != nullptr
         && request->ops[0].op == TXN_OP_SCAN
         && (request->ops[0].flags & TXN_FLAG_SCAN_COUNT_ONLY) != 0
         && request->ops[0].key_len == 0
         && request->ops[0].val_len == 0) {
         g_mako_db->Rollback(txn);
+        session.active = false;
 
         constexpr size_t kDbSizeChunkSize = 1024;
         int64_t visible_count = 0;
@@ -8071,6 +8212,30 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
             }
         }
 
+        if (!finish) {
+            return true;
+        }
+
+        // An interactive session has no TxnRequest left to walk at commit time,
+        // so the Redis-visible names whose string value changed are read off
+        // the write and delete buffers, which is exactly the string namespace
+        // the cache holds.
+        if (session.interactive && redis_cache_enabled()) {
+            constexpr std::string_view kStoragePrefix = "table_key_";
+            for (const auto& [storage_key, raw_value] : pending_writes) {
+                if (storage_key.rfind(kStoragePrefix, 0) == 0) {
+                    session.cache_invalidations.push_back(
+                        storage_key.substr(kStoragePrefix.size()));
+                }
+            }
+            for (const auto& storage_key : pending_deletes) {
+                if (storage_key.rfind(kStoragePrefix, 0) == 0) {
+                    session.cache_invalidations.push_back(
+                        storage_key.substr(kStoragePrefix.size()));
+                }
+            }
+        }
+
         if (all_success) {
             for (const auto& set_key : dirty_sets) {
                 auto values_it = staged_sets.find(set_key);
@@ -8143,11 +8308,14 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
         }
 
         // Commit or rollback based on success
-        if (all_success) {
+        if (all_success && commit) {
             g_mako_db->Commit(txn);
-            if (has_write) {
+            if (session.has_write) {
                 wait_for_redis_replication();
-                redis_cache_invalidate_committed_writes(request);
+            }
+            for (const auto& user_key : session.cache_invalidations) {
+                redis_cache_invalidate(
+                    reinterpret_cast<const uint8_t*>(user_key.data()), user_key.size());
             }
             response->transaction_success = true;
             g_mako_txn_commits.fetch_add(1, std::memory_order_relaxed);
@@ -8156,9 +8324,13 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
             response->transaction_success = false;
             g_mako_txn_aborts.fetch_add(1, std::memory_order_relaxed);
         }
+        session.active = false;
 
     } catch (abstract_db::abstract_abort_exception& ex) {
         g_mako_db->Rollback(txn);
+        session.active = false;
+        session.threw = true;
+        all_success = false;
         response->transaction_success = false;
         g_mako_txn_aborts.fetch_add(1, std::memory_order_relaxed);
         // Mark all results as failed on abort
@@ -8167,6 +8339,9 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
         }
     } catch (...) {
         g_mako_db->Rollback(txn);
+        session.active = false;
+        session.threw = true;
+        all_success = false;
         response->transaction_success = false;
         g_mako_txn_aborts.fetch_add(1, std::memory_order_relaxed);
         for (size_t i = 0; i < response->num_results; i++) {
@@ -8175,6 +8350,110 @@ bool execute_transaction(const TxnRequest* request, TxnResponse* response) {
     }
 
     return true;
+}
+
+// ===== Interactive transaction sessions =====
+//
+// cpp_txn_begin opens one, cpp_txn_execute runs an op list inside it as many
+// times as the caller likes, and cpp_txn_commit / cpp_txn_abort end it. The
+// point is read-your-writes across calls: everything the op loop buffers in the
+// session (pending_writes, pending_deletes, the staged collections and the
+// exists/value caches) is what the next call reads, so a Lua script's
+// redis.call('get', k) after a redis.call('set', k, v) sees v without either
+// reaching storage.
+
+static RedisTxnSession* session_from_handle(void* handle) {
+    if (handle == nullptr) {
+        return nullptr;
+    }
+    RedisTxnSession* session = static_cast<RedisTxnSession*>(handle);
+    if (session->magic != RedisTxnSession::kSessionMagic) {
+        std::cerr << "[cpp] interactive transaction: bad session handle" << std::endl;
+        return nullptr;
+    }
+    return session;
+}
+
+static void destroy_session(RedisTxnSession* session) {
+    session->magic = 0;
+    delete session;
+}
+
+void* txn_begin(const uint8_t* const* keys, const size_t* key_lens, size_t num_keys) {
+    ensure_thread_info();
+    if (g_mako_db == nullptr) {
+        return nullptr;
+    }
+
+    std::unique_ptr<RedisTxnSession> session(new RedisTxnSession());
+    session->interactive = true;
+
+    if (!g_redis_single_worker_mode) {
+        session->keyspace_shared_lock = std::shared_lock<std::shared_mutex>(g_redis_keyspace_mutex);
+        std::vector<size_t> stripes;
+        stripes.reserve(num_keys);
+        for (size_t i = 0; keys != nullptr && key_lens != nullptr && i < num_keys; ++i) {
+            stripes.push_back(redis_lock_hash(keys[i], key_lens[i]) % kRedisTxnLockStripes);
+        }
+        // Stripe order, as the batch path takes them, so the two cannot deadlock
+        // against each other.
+        std::sort(stripes.begin(), stripes.end());
+        stripes.erase(std::unique(stripes.begin(), stripes.end()), stripes.end());
+        session->key_locks.reserve(stripes.size());
+        for (size_t stripe : stripes) {
+            session->key_locks.emplace_back(g_redis_txn_key_mutexes[stripe]);
+        }
+    }
+
+    begin_session_txn(*session);
+    return session.release();
+}
+
+bool txn_execute(void* handle, const TxnRequest* request, TxnResponse* response) {
+    RedisTxnSession* session = session_from_handle(handle);
+    if (session == nullptr || !session->active) {
+        return false;
+    }
+    if (!makocon_ffi::allocate_response(request, response)) {
+        return false;
+    }
+
+    // Lazy, per-call: a session that only reads is legal on a follower, and the
+    // first write in one is not.
+    if (redis_request_has_write(request)) {
+        if (!redis_can_write_here()) {
+            response->transaction_success = false;
+            for (size_t i = 0; i < response->num_results; ++i) {
+                response->results[i].success = false;
+            }
+            session->all_success = false;
+            return false;
+        }
+        session->has_write = true;
+    }
+
+    const bool ok = execute_ops(*session, request, response);
+    response->transaction_success = ok && session->active && session->all_success;
+    return response->transaction_success;
+}
+
+bool txn_commit(void* handle) {
+    RedisTxnSession* session = session_from_handle(handle);
+    if (session == nullptr) {
+        return false;
+    }
+    const bool committed = finish_session(*session, true);
+    destroy_session(session);
+    return committed;
+}
+
+void txn_abort(void* handle) {
+    RedisTxnSession* session = session_from_handle(handle);
+    if (session == nullptr) {
+        return;
+    }
+    finish_session(*session, false);
+    destroy_session(session);
 }
 
 // Free transaction response resources
@@ -8211,6 +8490,23 @@ extern "C" {
     // Generic command/fallback and MULTI/EXEC entry point.
     bool cpp_execute_transaction(const TxnRequest* request, TxnResponse* response) {
         return execute_transaction(request, response);
+    }
+
+    // Interactive transaction sessions (Lua scripting).
+    void* cpp_txn_begin(const uint8_t* const* keys, const size_t* key_lens, size_t num_keys) {
+        return txn_begin(keys, key_lens, num_keys);
+    }
+
+    bool cpp_txn_execute(void* session, const TxnRequest* request, TxnResponse* response) {
+        return txn_execute(session, request, response);
+    }
+
+    bool cpp_txn_commit(void* session) {
+        return txn_commit(session);
+    }
+
+    void cpp_txn_abort(void* session) {
+        txn_abort(session);
     }
 
     // Free transaction response resources

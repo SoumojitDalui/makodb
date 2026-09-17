@@ -10,10 +10,12 @@ thread per configured Redis worker). Each command that touches data becomes
 one `TxnRequest` (an array of `TxnOperation`) handed once across a C ABI
 (`include/transaction_ffi.h`) to the C++ executor `execute_transaction` in
 `cpp/makoCon.cc`, which runs every op inside a single Mako/STO transaction and
-fills a `TxnResponse`. Rust formats the reply. There is no interactive
-transaction: the whole op list is built before the call, so a later op cannot
-depend on an earlier op's result within one call. Anything needing
-read-then-write atomicity must be a single C++ op.
+fills a `TxnResponse`. Rust formats the reply. For that call the whole op list
+is built before the call, so a later op cannot depend on an earlier op's result
+within one call, and anything needing read-then-write atomicity must be a single
+C++ op. The one exception is Lua scripting, which runs on the interactive
+session interface described under "Interactive sessions" below; ordinary
+commands and MULTI/EXEC do not use it.
 
 ## Where each part of a command lives (Rust, `lib.rs`)
 
@@ -36,8 +38,10 @@ Search for these anchors; do not rely on line numbers.
 
 ## Where each part lives (C++, `cpp/makoCon.cc`)
 
-`execute_transaction(const TxnRequest*, TxnResponse*)` is one very large
-function. Helpers are lambdas defined near its top; ops are handled in a long
+`execute_ops_impl(RedisTxnSession&, const TxnRequest*, TxnResponse*, finish,
+commit)` is one very large function, and `execute_transaction` is a thin
+wrapper around it (see "Interactive sessions"). Helpers are lambdas defined
+near its top, bound to the session's fields; ops are handled in a long
 `if (op.op == TXN_OP_X) { ... } else if (...)` chain. To add an op, insert a
 new `} else if (op.op == TXN_OP_NEW) {` branch (a good insertion point is just
 before `} else if (op.op == TXN_OP_RESTORE_LIST) {`).
@@ -121,6 +125,48 @@ When you add a C++ op you must also:
 
 `makoConMultiTrd.cc` is a separate binary that must keep compiling; it only
 needs the header to build, and it deliberately supports a small op subset.
+
+## Interactive sessions
+
+`cpp_execute_transaction` is still how every command and every MULTI/EXEC batch
+runs, and the paragraph above is still true of it: the whole op list is built
+before the call. Beside it there is now a second way in, for the one caller
+that cannot build its op list in advance — a Lua script, whose next `redis.call`
+depends on the result of the last one. `cpp_txn_begin` opens one Mako
+transaction and returns an opaque `RedisTxnSession*`; `cpp_txn_execute` runs an
+op list inside it as many times as the caller likes; `cpp_txn_commit` or
+`cpp_txn_abort` ends it and frees it. Everything the executor buffers —
+`pending_writes`, `pending_deletes`, the staged collections, `batch_exists` and
+`batch_values` — lives in the session, so the second call reads what the first
+one wrote, without either of them reaching storage. That is the whole point of
+the interface.
+
+In C++ the two entry points are the same code. `execute_ops_impl` holds the
+helper lambdas, the op loop and the end-of-transaction tail; `execute_ops` calls
+it with the tail switched off, `finish_session` calls it with an empty op list
+and the tail switched on, and `execute_transaction` is now begin + `execute_ops`
++ `finish_session`. Op bodies bind `batch_exists`, `pending_writes` and the rest
+as references to the session's fields, so they read exactly as they did when all
+of it was one function's locals. Two things a session cannot do: the chunked
+DBSIZE path (it settles its own transactions, so a session answers DBSIZE from
+the general `TXN_OP_SCAN` branch instead) and the chunked FLUSHDB path (it never
+reaches the op loop). A session that has already settled its transaction leaves
+`session.active` false, which is how the caller knows not to finish it again.
+
+In Rust the wrapper is `SessionTxn`: `execute` turns one `Command` into a
+`TxnRequest` with `build_txn_ops` and formats the reply with
+`write_command_result`, so any storage command can run inside a session with
+byte-identical reply formatting, and `ffi_run_session(keys, body)` owns the
+retry loop — commit, and on an OCC abort run the whole body again in a fresh
+session, `TXN_MAX_ATTEMPTS` times before answering `ERR backend`.
+
+The locking is the one place a session is weaker than a batch. The batch path
+locks the key stripe of every key in the request before it starts; a session can
+only lock what the caller declares at `cpp_txn_begin`, which for EVAL is the
+`KEYS` array. A key the session touches without declaring it is still correct,
+but it is protected only by STO's optimistic concurrency, so a conflict on it
+appears as a failed commit and a re-run rather than as a wait. Declare the keys
+a script writes.
 
 ## Logical databases
 

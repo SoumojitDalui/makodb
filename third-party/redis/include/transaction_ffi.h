@@ -472,6 +472,81 @@ bool cpp_execute_transaction(const TxnRequest* request, TxnResponse* response);
 void cpp_free_transaction_response(TxnResponse* response);
 
 /**
+ * Interactive (resumable) transactions.
+ *
+ * cpp_execute_transaction builds the whole operation list before it is called,
+ * so an operation cannot depend on the result of an earlier one in the same
+ * transaction. A session inverts that: it opens one storage transaction, hands
+ * back an opaque handle, and lets the caller run op lists inside it as many
+ * times as it likes before committing. Everything the executor buffers in the
+ * session -- the deferred deletes, the buffered writes, the staged collections
+ * and the exists/value caches -- is visible to the next call, so a Lua script's
+ *
+ *     redis.call('set', k, v)   then   redis.call('get', k)
+ *
+ * reads back v without either operation reaching storage. That read-your-writes
+ * behaviour is the whole point; it is the same mechanism a MULTI/EXEC batch
+ * already relies on, exposed one call at a time.
+ *
+ * Usage:
+ *     void* s = cpp_txn_begin(keys, key_lens, num_keys);
+ *     if (!s) -> could not start, the caller reports an error
+ *     while (...) if (!cpp_txn_execute(s, &request, &response)) { cpp_txn_abort(s); ... }
+ *     bool ok = cpp_txn_commit(s);   // false = OCC abort, the caller retries
+ *
+ * Exactly one of cpp_txn_commit / cpp_txn_abort must be called, and it frees
+ * the session. Every call for one session must happen on the thread that
+ * called cpp_txn_begin: the storage transaction lives in thread-local STO
+ * state. Sessions carry a magic word so a stale or foreign handle is refused
+ * rather than dereferenced.
+ *
+ * Locking. The batch path takes the key-stripe lock of every key in the
+ * request up front, which is what serializes concurrent writers to the same
+ * key. A session can only lock what the caller declares in cpp_txn_begin: for
+ * EVAL that is the KEYS array. A key the session touches without declaring it
+ * is not stripe-locked, so two sessions writing the same undeclared key are
+ * serialized only by STO's optimistic concurrency -- one of them fails at
+ * commit and the caller has to retry the whole unit of work (which is what the
+ * Lua path does: an OCC abort re-runs the script from scratch). Declaring the
+ * keys a script writes is therefore what turns retry-on-conflict into
+ * wait-for-the-lock, and undeclared keys stay correct but can livelock a
+ * pathological workload.
+ */
+
+/**
+ * Open a session. keys/key_lens describe num_keys Redis-visible (already
+ * database-prefixed) keys whose stripes are locked for the life of the
+ * session, in stripe order so this cannot deadlock against the batch path.
+ * Returns an opaque session handle, or NULL if no transaction could be
+ * started.
+ */
+void* cpp_txn_begin(const uint8_t* const* keys, const size_t* key_lens, size_t num_keys);
+
+/**
+ * Run one operation list inside an open session. The response is filled and
+ * owned exactly as cpp_execute_transaction fills it, and must be released with
+ * cpp_free_transaction_response. Per-operation success flags mean what they
+ * always mean (false is usually WRONGTYPE for a typed op).
+ *
+ * Returns false only on an internal failure: a bad handle, a storage error, an
+ * STO abort, or a write attempted in a session on a follower. After a false
+ * return the session can no longer commit; the caller must abort it.
+ */
+bool cpp_txn_execute(void* session, const TxnRequest* request, TxnResponse* response);
+
+/**
+ * Flush and commit the session, then free it. Returns whether the storage
+ * commit succeeded; false means an OCC abort and nothing the session did is
+ * visible.
+ */
+bool cpp_txn_commit(void* session);
+
+/**
+ * Roll the session back and free it. Nothing it did becomes visible.
+ */
+void cpp_txn_abort(void* session);
+
+/**
  * Fill metrics for INFO server / INFO mako.
  */
 bool cpp_get_metrics(MakoMetrics* metrics);

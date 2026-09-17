@@ -349,6 +349,22 @@ extern "C" {
     fn cpp_free_transaction_response(response: *mut TxnResponse);
     fn cpp_get_metrics(metrics: *mut MakoMetrics) -> bool;
     fn cpp_record_txn_retry();
+
+    // Interactive (resumable) transactions: one open Mako transaction that
+    // many op lists run inside, so a later op can depend on an earlier one's
+    // result. See include/transaction_ffi.h for the locking contract.
+    fn cpp_txn_begin(
+        keys: *const *const u8,
+        key_lens: *const usize,
+        num_keys: usize,
+    ) -> *mut std::ffi::c_void;
+    fn cpp_txn_execute(
+        session: *mut std::ffi::c_void,
+        request: *const TxnRequest,
+        response: *mut TxnResponse,
+    ) -> bool;
+    fn cpp_txn_commit(session: *mut std::ffi::c_void) -> bool;
+    fn cpp_txn_abort(session: *mut std::ffi::c_void);
 }
 
 #[cfg(test)]
@@ -378,7 +394,167 @@ unsafe fn cpp_execute_transaction(
 }
 
 #[cfg(test)]
-unsafe fn cpp_free_transaction_response(_response: *mut TxnResponse) {}
+unsafe fn cpp_free_transaction_response(response: *mut TxnResponse) {
+    // Only the session stubs below allocate a response in test builds; the
+    // cpp_execute_transaction stub leaves the pointers null, and freeing null
+    // is a no-op.
+    if response.is_null() {
+        return;
+    }
+    let response = &mut *response;
+    if response.results.is_null() {
+        return;
+    }
+    for index in 0..response.num_results {
+        let result = &mut *response.results.add(index);
+        if !result.data_ptr.is_null() {
+            libc::free(result.data_ptr as *mut libc::c_void);
+            result.data_ptr = std::ptr::null_mut();
+        }
+    }
+    libc::free(response.results as *mut libc::c_void);
+    response.results = std::ptr::null_mut();
+    response.num_results = 0;
+}
+
+// The interactive transaction FFI, stubbed for unit tests as a string-only
+// store with one overlay per session. It is enough to exercise SessionTxn end
+// to end: read-your-writes inside a session, a commit that publishes the
+// overlay, and an abort that throws it away.
+#[cfg(test)]
+static TEST_SESSION_STORE: OnceLock<Mutex<HashMap<Vec<u8>, Vec<u8>>>> = OnceLock::new();
+
+#[cfg(test)]
+fn test_session_store() -> &'static Mutex<HashMap<Vec<u8>, Vec<u8>>> {
+    TEST_SESSION_STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+struct TestSession {
+    /// None is a delete.
+    writes: HashMap<Vec<u8>, Option<Vec<u8>>>,
+}
+
+#[cfg(test)]
+impl TestSession {
+    fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
+        match self.writes.get(key) {
+            Some(buffered) => buffered.clone(),
+            None => test_session_store().lock().unwrap().get(key).cloned(),
+        }
+    }
+}
+
+#[cfg(test)]
+unsafe fn cpp_txn_begin(
+    _keys: *const *const u8,
+    _key_lens: *const usize,
+    _num_keys: usize,
+) -> *mut std::ffi::c_void {
+    Box::into_raw(Box::new(TestSession {
+        writes: HashMap::new(),
+    })) as *mut std::ffi::c_void
+}
+
+#[cfg(test)]
+unsafe fn cpp_txn_execute(
+    session: *mut std::ffi::c_void,
+    request: *const TxnRequest,
+    response: *mut TxnResponse,
+) -> bool {
+    if session.is_null() || request.is_null() || response.is_null() {
+        return false;
+    }
+    let session = &mut *(session as *mut TestSession);
+    let request = &*request;
+    let count = request.num_ops;
+    let results =
+        libc::malloc(count * std::mem::size_of::<TxnOpResult>()) as *mut TxnOpResult;
+    if results.is_null() && count != 0 {
+        return false;
+    }
+    for index in 0..count {
+        std::ptr::write(
+            results.add(index),
+            TxnOpResult {
+                success: false,
+                value_present: false,
+                data_ptr: std::ptr::null_mut(),
+                data_len: 0,
+                int_value: 0,
+            },
+        );
+    }
+    (*response).results = results;
+    (*response).num_results = count;
+    (*response).transaction_success = true;
+
+    for index in 0..count {
+        let op = &*request.ops.add(index);
+        let key = std::slice::from_raw_parts(op.key_ptr, op.key_len).to_vec();
+        let result = &mut *results.add(index);
+        match op.op {
+            TXN_OP_SET => {
+                let value = std::slice::from_raw_parts(op.val_ptr, op.val_len).to_vec();
+                session.writes.insert(key, Some(value));
+                result.success = true;
+            }
+            TXN_OP_GET => {
+                result.success = true;
+                if let Some(value) = session.read(&key) {
+                    result.value_present = true;
+                    result.data_len = value.len();
+                    if !value.is_empty() {
+                        result.data_ptr = libc::malloc(value.len()) as *mut u8;
+                        std::ptr::copy_nonoverlapping(
+                            value.as_ptr(),
+                            result.data_ptr,
+                            value.len(),
+                        );
+                    }
+                }
+            }
+            TXN_OP_DEL => {
+                result.success = true;
+                result.value_present = session.read(&key).is_some();
+                session.writes.insert(key, None);
+            }
+            _ => {
+                (*response).transaction_success = false;
+                return false;
+            }
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+unsafe fn cpp_txn_commit(session: *mut std::ffi::c_void) -> bool {
+    if session.is_null() {
+        return false;
+    }
+    let session = Box::from_raw(session as *mut TestSession);
+    let mut store = test_session_store().lock().unwrap();
+    for (key, value) in session.writes {
+        match value {
+            Some(value) => {
+                store.insert(key, value);
+            }
+            None => {
+                store.remove(&key);
+            }
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+unsafe fn cpp_txn_abort(session: *mut std::ffi::c_void) {
+    if session.is_null() {
+        return;
+    }
+    drop(Box::from_raw(session as *mut TestSession));
+}
 
 #[cfg(test)]
 unsafe fn cpp_get_metrics(metrics: *mut MakoMetrics) -> bool {
@@ -9274,6 +9450,266 @@ fn ffi_execute_transaction<W: Write>(
     Ok(())
 }
 
+// ===== Interactive transaction sessions =====
+//
+// `cpp_execute_transaction` takes a whole op list at once, so nothing in it can
+// depend on the result of an earlier op. A session keeps one Mako transaction
+// open across many calls instead: `SessionTxn::execute` turns one `Command`
+// into a `TxnRequest`, runs it inside the open transaction and formats the
+// reply with `write_command_result`, so any storage command can run inside a
+// session with exactly the bytes the single-command path would have produced.
+// Everything the executor buffers (deferred deletes, buffered writes, staged
+// collections) stays in the session, which is what gives a Lua script
+// read-your-writes across its `redis.call`s.
+//
+// Memory backend: `MAKO_REDIS_BACKEND=memory` has no transactions at all, so a
+// session there runs each op straight through `memory_execute_transaction`.
+// Writes land immediately, commit and abort do nothing, and a failed script
+// leaves its partial writes behind. That backend exists for parser unit tests,
+// which do not exercise scripting; the functional suites all run on Mako.
+
+/// What the body of `ffi_run_session` decided to do with the session.
+enum SessionRun<T> {
+    /// Finished successfully: commit, and if the commit succeeds hand this
+    /// value back.
+    Commit(T),
+    /// Finished with a result that must not be committed (a script error).
+    /// Abort and hand the value back without retrying.
+    Abort(T),
+    /// The session broke (storage error, STO abort, or a write refused on a
+    /// follower). Abort and run the body again in a fresh session.
+    Retry,
+}
+
+/// One open `cpp_txn_begin` session.
+struct SessionTxn {
+    /// The C++ session handle, or null on the memory backend.
+    handle: *mut std::ffi::c_void,
+    memory: bool,
+    finished: bool,
+    /// At least one write command has run inside the session. SCRIPT KILL uses
+    /// this: a script that has already written is UNKILLABLE.
+    dirty: bool,
+    /// Keys a write command named, so WATCH invalidation can be replayed once
+    /// the session commits.
+    written_keys: Vec<Bytes>,
+    /// PUBLISH calls made inside the session. Redis makes a script's effects
+    /// visible only once it has run, so the messages are delivered after the
+    /// commit and never at all if the session aborts.
+    pending_publishes: Vec<(Bytes, Bytes)>,
+}
+
+impl SessionTxn {
+    /// Opens a session that holds the key-stripe locks of `keys`. Keys the
+    /// session touches without declaring them here are still correct, but they
+    /// are serialized by STO's optimistic concurrency and a conflict shows up
+    /// as a failed commit instead of a wait.
+    fn begin(keys: &[Bytes]) -> Option<SessionTxn> {
+        if redis_backend() == RedisBackend::Memory {
+            return Some(SessionTxn {
+                handle: std::ptr::null_mut(),
+                memory: true,
+                finished: false,
+                dirty: false,
+                written_keys: Vec::new(),
+                pending_publishes: Vec::new(),
+            });
+        }
+        let key_ptrs: Vec<*const u8> = keys.iter().map(|key| key.as_ptr()).collect();
+        let key_lens: Vec<usize> = keys.iter().map(|key| key.len()).collect();
+        let handle = unsafe { cpp_txn_begin(key_ptrs.as_ptr(), key_lens.as_ptr(), keys.len()) };
+        if handle.is_null() {
+            return None;
+        }
+        Some(SessionTxn {
+            handle,
+            memory: false,
+            finished: false,
+            dirty: false,
+            written_keys: Vec::new(),
+            pending_publishes: Vec::new(),
+        })
+    }
+
+    /// Runs one command inside the session and returns its RESP2 reply.
+    /// `Err(())` means the session broke and the caller must abort and retry.
+    fn execute(&mut self, cmd: &Command) -> Result<Vec<u8>, ()> {
+        let single = [cmd.clone()];
+        let (ops, spans, _payloads) = build_txn_ops(&single);
+        let mut reply = Vec::new();
+
+        if is_dirty_command(cmd.op) {
+            self.dirty = true;
+            for key in &cmd.keys {
+                self.written_keys.push(key.clone());
+            }
+        }
+
+        // PUBLISH is not a storage op: buffer it so a script's messages are
+        // delivered only if the script's writes become visible. The reply is
+        // the number of subscribers at the time of the call.
+        if cmd.op == OpCode::Publish {
+            let channel = cmd.keys.first().cloned().unwrap_or_default();
+            let message = cmd.val.clone().unwrap_or_default();
+            let receivers = count_pubsub_receivers(&channel);
+            self.pending_publishes.push((channel, message));
+            write_integer(&mut reply, receivers as i64).map_err(|_| ())?;
+            return Ok(reply);
+        }
+
+        if ops.is_empty() {
+            // PING, TIME and WAIT answer from write_command_result itself.
+            write_command_result(cmd, None, spans[0], 2, &mut reply).map_err(|_| ())?;
+            return Ok(reply);
+        }
+
+        if self.memory {
+            let response = memory_execute_transaction(&ops);
+            write_command_result(cmd, Some(response.as_response()), spans[0], 2, &mut reply)
+                .map_err(|_| ())?;
+            return Ok(reply);
+        }
+
+        let request = TxnRequest {
+            num_ops: ops.len(),
+            ops: ops.as_ptr(),
+        };
+        let mut response = TxnResponse {
+            transaction_success: false,
+            num_results: 0,
+            results: std::ptr::null_mut(),
+        };
+        let call_ok = unsafe { cpp_txn_execute(self.handle, &request, &mut response) };
+        if !call_ok || response.num_results < ops.len() {
+            unsafe { cpp_free_transaction_response(&mut response) };
+            return Err(());
+        }
+        let formatted = write_command_result(cmd, Some(&response), spans[0], 2, &mut reply);
+        unsafe { cpp_free_transaction_response(&mut response) };
+        formatted.map_err(|_| ())?;
+        Ok(reply)
+    }
+
+    /// True once a write command has run inside the session.
+    fn has_written(&self) -> bool {
+        self.dirty
+    }
+
+    /// Takes `&mut self` rather than `self` so the session can live inside the
+    /// script state the Lua closures share; `finished` is what keeps it from
+    /// being ended twice.
+    fn commit(&mut self) -> bool {
+        if self.finished {
+            return false;
+        }
+        self.finished = true;
+        if self.memory {
+            self.deliver_publishes();
+            self.replay_watch_invalidation();
+            return true;
+        }
+        let committed = unsafe { cpp_txn_commit(self.handle) };
+        if committed {
+            self.deliver_publishes();
+            self.replay_watch_invalidation();
+        }
+        committed
+    }
+
+    fn abort(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        if !self.memory {
+            unsafe { cpp_txn_abort(self.handle) };
+        }
+    }
+
+    fn deliver_publishes(&mut self) {
+        for (channel, message) in std::mem::take(&mut self.pending_publishes) {
+            publish_pubsub_message(&channel, &message);
+        }
+    }
+
+    /// A committed session changed keys without going through
+    /// `execute_or_block_command`'s dirty bookkeeping, so WATCH is told here.
+    fn replay_watch_invalidation(&mut self) {
+        if self.written_keys.is_empty() {
+            return;
+        }
+        record_dirty_change();
+        for key in std::mem::take(&mut self.written_keys) {
+            bump_key_version(&key);
+        }
+    }
+}
+
+impl Drop for SessionTxn {
+    fn drop(&mut self) {
+        if !self.finished && !self.memory {
+            unsafe { cpp_txn_abort(self.handle) };
+            self.finished = true;
+        }
+    }
+}
+
+/// Runs `body` inside a session that declares `keys`, committing when the body
+/// asks for it and re-running the whole body in a fresh session when the
+/// storage commit loses an optimistic-concurrency race. Returns `None` when
+/// every attempt was used up, which the caller reports as `ERR backend`, the
+/// same answer the batch path gives.
+fn ffi_run_session<T>(
+    keys: &[Bytes],
+    mut body: impl FnMut(&mut SessionTxn) -> SessionRun<T>,
+) -> Option<T> {
+    for attempt in 0..TXN_MAX_ATTEMPTS {
+        let Some(mut session) = SessionTxn::begin(keys) else {
+            return None;
+        };
+        match body(&mut session) {
+            SessionRun::Commit(value) => {
+                if session.commit() {
+                    return Some(value);
+                }
+            }
+            SessionRun::Abort(value) => {
+                session.abort();
+                return Some(value);
+            }
+            SessionRun::Retry => {
+                session.abort();
+            }
+        }
+        if attempt + 1 < TXN_MAX_ATTEMPTS {
+            unsafe { cpp_record_txn_retry() };
+            sleep_for_retry(attempt);
+        }
+    }
+    None
+}
+
+/// How many subscribers a PUBLISH would reach right now, without delivering
+/// anything. A script's PUBLISH is buffered until the session commits, but its
+/// reply has to be written when the call is made.
+fn count_pubsub_receivers(channel: &Bytes) -> usize {
+    let Ok(mut registry) = pubsub_registry().lock() else {
+        return 0;
+    };
+    registry.prune_dead();
+    let mut receivers = registry
+        .channels
+        .get(channel)
+        .map(|targets| targets.len())
+        .unwrap_or(0);
+    for (pattern, targets) in &registry.patterns {
+        if glob_matches(pattern.as_ref(), channel.as_ref()) {
+            receivers += targets.len();
+        }
+    }
+    receivers
+}
+
 fn scan_page_start(cmd: &Command) -> usize {
     if cmd.expire_at_ms <= 0 {
         0
@@ -15174,6 +15610,76 @@ mod tests {
         }
 
         out
+    }
+
+    /// The session wrapper against the test stubs: a command run inside an open
+    /// session sees what earlier commands in the same session wrote, the reply
+    /// bytes are the ones the single-command path would have produced, and a
+    /// commit is what makes the writes visible to the next session.
+    #[test]
+    fn session_txn_reads_its_own_writes_and_publishes_on_commit() {
+        let key = Bytes::from_static(b"session-rmw-key");
+        let set = Command::new(
+            OpCode::Set,
+            vec![key.clone()],
+            Some(Bytes::from_static(b"first")),
+            Vec::new(),
+        );
+        let get = Command::new(OpCode::Get, vec![key.clone()], None, Vec::new());
+
+        // Nothing committed yet, so a fresh session misses.
+        let miss = ffi_run_session(&[key.clone()], |session| {
+            let reply = session.execute(&get).unwrap();
+            SessionRun::Abort(reply)
+        });
+        assert_eq!(miss.as_deref(), Some(b"$-1\r\n".as_slice()));
+
+        // Read-your-writes inside one session.
+        let seen = ffi_run_session(&[key.clone()], |session| {
+            session.execute(&set).unwrap();
+            assert!(session.has_written());
+            let reply = session.execute(&get).unwrap();
+            SessionRun::Commit(reply)
+        });
+        assert_eq!(seen.as_deref(), Some(b"$5\r\nfirst\r\n".as_slice()));
+
+        // And the commit published them.
+        let after_commit = ffi_run_session(&[key.clone()], |session| {
+            let reply = session.execute(&get).unwrap();
+            SessionRun::Abort(reply)
+        });
+        assert_eq!(after_commit.as_deref(), Some(b"$5\r\nfirst\r\n".as_slice()));
+
+        // An aborted session leaves nothing behind.
+        let rolled_back = Command::new(
+            OpCode::Set,
+            vec![key.clone()],
+            Some(Bytes::from_static(b"second")),
+            Vec::new(),
+        );
+        ffi_run_session(&[key.clone()], |session| {
+            session.execute(&rolled_back).unwrap();
+            SessionRun::Abort(())
+        })
+        .unwrap();
+        let unchanged = ffi_run_session(&[key.clone()], |session| {
+            let reply = session.execute(&get).unwrap();
+            SessionRun::Abort(reply)
+        });
+        assert_eq!(unchanged.as_deref(), Some(b"$5\r\nfirst\r\n".as_slice()));
+    }
+
+    /// A body that keeps asking to retry uses every attempt and then gives up,
+    /// which is what makes the caller answer `ERR backend` instead of looping.
+    #[test]
+    fn session_retries_are_bounded() {
+        let mut attempts = 0usize;
+        let outcome: Option<()> = ffi_run_session(&[], |_session| {
+            attempts += 1;
+            SessionRun::Retry
+        });
+        assert!(outcome.is_none());
+        assert_eq!(attempts, TXN_MAX_ATTEMPTS);
     }
 
     #[test]
