@@ -57,6 +57,9 @@ synchronous inside the owning worker.
 - `redis-protocol` (6.0.0) - RESP3 protocol parsing.
 - `bytes` - Byte buffers.
 - `itoa` - Integer formatting.
+- `libc` - `poll(2)` and other socket-level calls.
+- `mlua` (0.9, `lua51`, `vendored`) - The Lua 5.1 interpreter for `EVAL`, built
+  from source so no system Lua is needed.
 
 ## C/C++ FFI Interface
 
@@ -137,11 +140,13 @@ int main() {
 
 ## Command Scope And Validation
 
-The server now covers the scoped Redis connection, string, keyspace,
-transaction, expiry, set, list, hash, sorted-set, blocking, and Pub/Sub command
-families. The maintained command tiers, correctness suites, dated results, and
-intentional divergences are documented in
-`third-party/redis/compat/README.md`.
+The server covers 228 of the 251 Redis 7.4 commands: connection, string,
+bitmap, HyperLogLog, keyspace, expiry, logical-database, transaction, set, list,
+hash (with field expiry), sorted-set, geo, stream, blocking, Pub/Sub, scripting,
+`MONITOR` and emulated `CLUSTER` families. `src/script.rs` holds the Lua
+scripting layer. The command map and known limits are in
+`docs/redis_interface.md`; the correctness suites, dated results and
+divergences are in `third-party/redis/compat/README.md`.
 
 ## Building
 
@@ -156,7 +161,7 @@ Output: `target/release/librust_redis.a` (static library)
 
 | Setting | Value | Notes |
 |---------|-------|-------|
-| Listen address | `127.0.0.1:6380` | Hardcoded |
+| Listen address | `127.0.0.1:6380` | Default; override with `MAKO_HOST` and `MAKO_PORT` |
 | Read buffer | 16 KB | Matches Redis `PROTO_IOBUF_LEN` |
 | Write buffer | 16 KB | Matches Redis `PROTO_REPLY_CHUNK_BYTES` |
 | Listen backlog | 1024 | Per-socket pending connection queue |

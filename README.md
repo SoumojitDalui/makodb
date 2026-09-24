@@ -89,11 +89,13 @@ Mako includes a Redis-compatible layer for:
 - **Multi-key atomic operations** with full ACID guarantees
 - **Geographic distribution** with automatic failover
 
-The default Redis path sends commands through Mako transactions. A Redis-layer
-cache is not part of the current phase plan; if added later for read-heavy
-workloads, cache-mode results must be reported separately. Mako remains the
-source of truth, and cached reads must not weaken serializability, multi-key
-atomicity, or failover semantics.
+The `makoCon` server speaks RESP2/RESP3 and covers 228 of the 251 Redis 7.4
+commands, including hashes, sorted sets, streams, geo, Lua scripting, blocking
+commands and sixteen logical databases. Every data command runs through Mako
+transactions. An opt-in string cache (`MAKO_REDIS_CACHE_MB`) can serve plain
+string reads, and it stays coherent only for writes made through the same
+`makoCon` process. See [docs/redis_interface.md](docs/redis_interface.md) for
+the command surface and known limits.
 
 ---
 

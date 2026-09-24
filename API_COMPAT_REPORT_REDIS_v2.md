@@ -1,5 +1,12 @@
 # Redis API Compatibility Report v2
 
+> **Superseded.** This report describes the surface at phase 12 of the first
+> phase of PR 72 (June 2026). The adapter has since grown to 228 of the 251
+> Redis 7.4 commands, including logical databases, streams, scripting and
+> blocking commands, none of which this report covers. The current reference is
+> [`docs/redis_interface.md`](docs/redis_interface.md), with validation results
+> in [`third-party/redis/compat/README.md`](third-party/redis/compat/README.md).
+
 This report summarizes the Redis-compatible `makoCon` surface implemented in
 this PR. The semantic target is `third-party/redis/cpp/makoCon.cc`.
 `third-party/redis/cpp/makoConMultiTrd.cc` is ABI/link-compatible only for extended Redis

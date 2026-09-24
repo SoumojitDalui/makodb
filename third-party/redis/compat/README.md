@@ -62,6 +62,37 @@ ag2 methods, variance, CPU accounting, latency, and artifact paths are in
 
 ## Latest Validation Snapshot
 
+### 2026-09-17 Phases 2 and 3 (final code commit `835cec52`)
+
+Collected on ag2 (`zoo-002`) against the final code of phase 3 package 10, one
+server per run on a private port, suites run serially. Every gate was also run
+after each earlier package and stayed green throughout.
+
+| Check | Result |
+|---|---|
+| Rust unit tests (`cargo test`) | PASS, 94/94 |
+| `test_phase2_commands.py` | PASS, 1,328 checks, 0 failures |
+| Focused pytest suite | PASS, 111 passed, 2 skipped (the two string-cache cases run only with `MAKO_REDIS_CACHE_MB` set) |
+| Redis 7.4 Tcl semantic guard | PASS, 11/11 scoped files |
+
+Non-gating Redis Tcl files, run for information:
+
+| File | Result | Why the failures are not regressions |
+|---|---|---|
+| `unit/scripting`, EVAL half | 73 passed, 25 failed, 20 skipped | Script debugger, effects replication and other scripting internals the adapter does not claim |
+| `unit/type/stream` | 66 passed, 6 failed, 8 skipped by tag | All six assert Redis's radix-tree node granularity for `~` trimming |
+| `unit/type/stream-cgroups` | 53 passed, 2 failed, 3 skipped, stopped by 1 exception | `errorstat` counters, the dirty counter on history replay, and `RESTORE` of a real Redis RDB payload |
+| `unit/geo` | 61 passed, stopped by 1 exception, 2 not reached | A single 20,000-member `GEOADD` hits the transaction size limit in [Known Limits](#known-limits) |
+
+Throughput sanity after the final package: 15,870,779 operations/s on the
+development profile (32 workers, pipeline depth 64, `MAKO_REDIS_CACHE_MB=256`),
+0.15% below package 9 and 0.9% below package 8, inside the 5% regression bound
+every package was held to. This
+is a regression check, not a capacity claim; the capacity methodology is in
+[`SCALABILITY.md`](SCALABILITY.md) and has not been rerun on this binary.
+
+### 2026-07-21 Snapshot
+
 The following results were collected on 2026-07-21 from branch
 `redis-compat-phase3`, based on commit
 `c28e39f2affee7c74ecb9747342c0811dd560053` plus the Redis compatibility
@@ -140,7 +171,8 @@ ignored by Git; the dated human-readable findings are retained here.
 
 ## Focused Pytest Coverage
 
-The 105 collected cases are project-owned tests. Seven set cases are ports of
+The table below is the 2026-07-21 breakdown of 105 cases; the suite now
+collects 113. All are project-owned tests. Seven set cases are ports of
 in-scope Apache Kvrocks behavior; their source and excluded cases are recorded
 under `kvrocks_set_cases/`. They are not an unmodified run of the complete
 Kvrocks test harness.
@@ -350,7 +382,9 @@ the label `N/A`. It must not be relabeled as `PASS`.
 The authoritative list is `known_divergences.txt`. Current decisions include:
 
 - `KEYS`, `SCAN`, and `DBSIZE` do not expose collection keys stored only as
-  hidden set, list, or sorted-set composite keys.
+  hidden set, list, hash, sorted-set, or stream composite keys.
+- `HRANDFIELD` and `ZRANDMEMBER` return a consecutive window from a rotating
+  offset rather than a random sample; `SPOP` and `SRANDMEMBER` are random.
 - `makoConMultiTrd` remains ABI-compatible but is not the extended-command
   semantic target.
 - Redis's sixteen logical databases are emulated with a hidden key prefix
@@ -360,6 +394,24 @@ The authoritative list is `known_divergences.txt`. Current decisions include:
 
 These are design differences, not test passes. Any newly discovered in-scope
 failure must be fixed or added to the divergence file with review.
+
+## Known Limits
+
+These are not design decisions; they are open problems.
+
+- **Oversized transactions crash the server.** One command or one `MULTI`
+  block whose Mako transaction needs more than 32,768 STO items segfaults
+  `makoCon`. The boundary is exact and repeatable: `GEOADD` with 14,974 members
+  in one command succeeds, and 14,975 crashes. A `MULTI` of about 5,000 `SET`s
+  crashes, while a pipeline of 10,000 separate `SET`s is fine. gdb shows STO's
+  item array (64 chunks of 512) overflowing at item 32,769; its bounds check is
+  an assert that Release builds compile out. STO is untouched by this adapter.
+  Fix options are an adapter-side size check that answers with an error, or a
+  growable array or clean abort inside STO. Details are in
+  `known_divergences.txt` ("Very large write transactions") and on PR 72.
+- **Stubs.** `WAIT` answers 0, the replication section of `INFO` hard-codes the
+  master role, `SAVE` and `SHUTDOWN` are refused, and `AUTH` accepts any
+  password.
 
 ## Reproducing The Checks
 
@@ -410,10 +462,10 @@ does not select a file. Use `TCL_COMPAT_FILES` for file selection.
 
 ## Phase 2 and 3 Command Additions
 
-The `redis-compat-phase2` branch and, for the HyperLogLog, `BITFIELD`, Geo,
-hash-field-expiry, Cluster, Monitoring, scripting and Streams rows, the
-`redis-compat-phase3` branch add the following on top of PR 72, all implemented
-in the adapter with no changes below `makoCon`:
+Phases 2 and 3 of PR 72 add the following, all implemented in the adapter with
+no changes below `makoCon`. Phase 2 is the bitmaps, keyspace, `DUMP`/`RESTORE`,
+sharded Pub/Sub and observability rows; phase 3 is the rest. The package-by-package
+plan and resulting command counts are in [`PHASE3_PLAN.md`](PHASE3_PLAN.md):
 
 | Area | Commands |
 |---|---|
