@@ -15,10 +15,10 @@ protected:
     void SetUp() override {
         // Clear registries before each test
         get_table_registry().clear();
-        // Empty the process-global ClusterConfig so routing uses the
-        // legacy ShardingPolicyCache path (shard_count 0 disables the
-        // ClusterConfig branch). The ClusterConfig routing test opts in
-        // explicitly by populating it.
+        // Empty the process-global ClusterConfig so routing uses only the
+        // placement path (shard_count 0 disables every ClusterConfig
+        // refinement). The ClusterConfig routing tests opt in explicitly by
+        // populating it.
         janus::get_cluster_config().set_shard_count(0);
     }
 
@@ -239,43 +239,62 @@ TEST_F(ShardRouterTest, GetPolicyNumShards) {
 // Routing consults the process-global ClusterConfig when populated
 // =============================================================================
 
-TEST_F(ShardRouterTest, ComputeShardConsultsClusterConfigWhenPopulated) {
-    get_table_registry().register_table(1, "WAREHOUSE");
-
+namespace {
+void populate_two_active_shards() {
     auto& cc = janus::get_cluster_config();
     cc.set_shard_count(2);
     janus::ShardInfo s0; s0.id = 0; s0.status = "active"; cc.update_shard(0, s0);
     janus::ShardInfo s1; s1.id = 1; s1.status = "active"; cc.update_shard(1, s1);
+}
+}  // namespace
 
-    // With ClusterConfig populated, compute_shard_for_key routes through
-    // it (hash-mod default here — no per-table policy). Stable + in range.
-    const int a = compute_shard_for_key(1, "warehouse/42");
-    const int b = compute_shard_for_key(1, "warehouse/42");
-    EXPECT_EQ(a, b);
-    EXPECT_GE(a, 0);
-    EXPECT_LT(a, 2);
+// Regression: a populated ClusterConfig with no per-table policy must not
+// re-place data by key hash. Every key of a table stays on the table's home
+// shard, as it does with the config empty. (Names without a
+// ShardingPolicyCache policy, so placement is the table-ID home.)
+TEST_F(ShardRouterTest, ClusterConfigKeepsTablePlacementWithoutTablePolicy) {
+    get_table_registry().register_table(1, "CC_PLACEMENT_T0");     // home shard 0
+    get_table_registry().register_table(201, "CC_PLACEMENT_T1");   // home shard 1
+    populate_two_active_shards();
+
+    for (int i = 0; i < 256; ++i) {
+        const std::string k = "key/" + std::to_string(i);
+        EXPECT_EQ(0, compute_shard_for_key(1, k)) << k;
+        EXPECT_EQ(1, compute_shard_for_key(201, k)) << k;
+    }
 }
 
+// A table with its own policy in the ClusterConfig routes by that policy,
+// even against its table-ID home.
+TEST_F(ShardRouterTest, ClusterConfigTablePolicyOverridesPlacement) {
+    get_table_registry().register_table(1, "CC_POLICY_T");   // home shard 0
+    populate_two_active_shards();
+    janus::get_cluster_config().set_table_policy(
+        "CC_POLICY_T",
+        janus::make_table_policy("CC_POLICY_T", janus::KeyExtractor::by_field(0),
+                                 {{0, 5, 0}, {5, 10, 1}}, 0));
+
+    char key3[] = {0, 0, 0, 0, 0, 0, 0, 3};
+    char key7[] = {0, 0, 0, 0, 0, 0, 0, 7};
+    EXPECT_EQ(0, compute_shard_for_key(1, std::string(key3, 8)));
+    EXPECT_EQ(1, compute_shard_for_key(1, std::string(key7, 8)));
+
+    janus::get_cluster_config().clear_table_policy("CC_POLICY_T");
+}
+
+// A dead shard's keys follow its replacement pointer, also for tables
+// placed by table ID.
 TEST_F(ShardRouterTest, ComputeShardFollowsDeadShardReplacementViaClusterConfig) {
-    get_table_registry().register_table(1, "WAREHOUSE");
-
+    get_table_registry().register_table(201, "CC_REPLACEMENT_T");   // home shard 1
+    populate_two_active_shards();
     auto& cc = janus::get_cluster_config();
-    cc.set_shard_count(2);
-    janus::ShardInfo s0; s0.id = 0; s0.status = "active"; cc.update_shard(0, s0);
-    janus::ShardInfo s1; s1.id = 1; s1.status = "active"; cc.update_shard(1, s1);
+    EXPECT_EQ(1, compute_shard_for_key(201, "probe"));
 
-    // Find a key that routes to shard 1.
-    std::string probe;
-    for (int i = 0; i < 64; ++i) {
-        const std::string k = "k" + std::to_string(i);
-        if (compute_shard_for_key(1, k) == 1) { probe = k; break; }
-    }
-    ASSERT_FALSE(probe.empty());
-
-    // Kill shard 1 -> taker 0. The router must reroute the probe key.
+    // Kill shard 1 -> taker 0. The router must reroute the table's keys.
     janus::ShardInfo dead; dead.id = 1; dead.status = "dead"; dead.replacement = 0;
     cc.update_shard(1, dead);
-    EXPECT_EQ(compute_shard_for_key(1, probe), 0);
+    EXPECT_EQ(0, compute_shard_for_key(201, "probe"));
+    EXPECT_EQ(0, compute_shard_for_key(201, "another-key"));
 }
 
 TEST_F(ShardRouterTest, EmptyClusterConfigFallsBackToLegacyPath) {
