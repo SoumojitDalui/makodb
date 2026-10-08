@@ -4,6 +4,7 @@
 #include <string.h>  // strcmp
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -41,6 +42,46 @@ constexpr uint64_t kConfigPollIntervalMs = 1000;
 // How long a node waits between attempts to reach shard 0's config service.
 constexpr auto kConfigReconnectInterval = std::chrono::seconds(1);
 
+// Shard 0's config store as the leader uses it: every write goes to the
+// __mako_config__ Mako index (the record) and to an in-memory mirror, and
+// every read is served from the mirror. The readers are the ConfigWatcher
+// poll thread and the ConfigKvService handler thread, which are not
+// transaction-engine threads, and an index op needs engine thread state (an
+// STO thread id and a Masstree threadinfo). Registering those two threads
+// with the engine works, but on the two-shard TPC-C bench it cost about 19%
+// of throughput on both shards while they sat idle between reads, so they
+// never touch the index. Writes must come from an engine-registered thread;
+// today the only writer is the bootstrap thread, which seeds the store
+// before any reader starts.
+// @unsafe - writes through to a Mako index
+class MirroredConfigStore : public KvStore {
+public:
+    explicit MirroredConfigStore(KvStore* record) : record_(record) {}
+    ~MirroredConfigStore() noexcept override {}
+
+    rusty::Option<std::string> get(const std::string& key) override {
+        std::lock_guard<std::mutex> lock(mu_);
+        return mirror_.get(key);
+    }
+
+    void put(const std::string& key, const std::string& value) override {
+        record_->put(key, value);
+        std::lock_guard<std::mutex> lock(mu_);
+        mirror_.put(key, value);
+    }
+
+    void remove(const std::string& key) override {
+        record_->remove(key);
+        std::lock_guard<std::mutex> lock(mu_);
+        mirror_.remove(key);
+    }
+
+private:
+    KvStore* record_;   // non-owning: the OrderedIndexKvStore over the index
+    std::mutex mu_;
+    InMemoryKvStore mirror_;
+};
+
 // ---- Process-lifetime singletons (this wiring runs once per node) ------
 // File scope, mirroring config_node_init.cc's g_config_* pattern. The
 // Boxes give stable addresses for the raw-pointer cross-references below
@@ -48,7 +89,8 @@ constexpr auto kConfigReconnectInterval = std::chrono::seconds(1);
 // ConfigManager and the routing cache).
 rusty::Option<rusty::Arc<srpc::PollThread>> g_cfg_poll;
 srpc::Server* g_cfg_server = nullptr;                          // shard-0 leader only
-rusty::Option<rusty::Box<OrderedIndexKvStore>> g_cfg_kv_local;   // shard-0 leader
+rusty::Option<rusty::Box<OrderedIndexKvStore>> g_cfg_kv_record;  // shard-0 leader
+rusty::Option<rusty::Box<MirroredConfigStore>> g_cfg_kv_local;   // shard-0 leader
 rusty::Option<rusty::Box<RemoteKvStore>> g_cfg_kv_remote;        // other nodes
 rusty::Option<rusty::Box<ConfigManager>> g_cfg_cm;
 rusty::Option<rusty::Box<ConfigWatcher>> g_cfg_watcher;
@@ -165,16 +207,6 @@ void SeedTopology(ConfigManager* cm, uint32_t nshards) {
     cm->set_shard_count(nshards);  // version-bumping write, done last
 }
 
-// Engine setup for a thread that reaches shard 0's config store without
-// being a Mako worker (the ConfigWatcher poll thread, the ConfigKvService
-// handler thread): the loader-style thread_init an RPC helper thread runs
-// (rpc_setup.cc helper_server), giving it an STO thread id and a Masstree
-// threadinfo. Mode stays 0: helper mode (1) changes commit/abort handling
-// for 2PC participants, which one-op config reads and writes are not.
-// @unsafe - engine thread registration
-void InitConfigThread(void* ctx) {
-    static_cast<abstract_db*>(ctx)->thread_init(/*loader=*/true, /*source=*/1);
-}
 
 // Connection to shard 0's config service that reconnects. A node can come
 // up before shard 0's service is listening (shard 0's own followers start
@@ -255,11 +287,9 @@ void StartShard0Leader(abstract_db* db, uint32_t nshards, const ConfigEndpoint& 
                         "cluster config disabled");
         return;
     }
-    g_cfg_kv_local = rusty::Some(rusty::make_box<OrderedIndexKvStore>(
-        idx, &InitConfigThread, static_cast<void*>(db)));
-    // This (bootstrap) thread is already set up for the engine; never
-    // re-initialize it.
-    OrderedIndexKvStore::mark_current_thread_ready();
+    g_cfg_kv_record = rusty::Some(rusty::make_box<OrderedIndexKvStore>(idx));
+    g_cfg_kv_local = rusty::Some(rusty::make_box<MirroredConfigStore>(
+        g_cfg_kv_record.as_ref().unwrap().get()));
     KvStore* kv = g_cfg_kv_local.as_ref().unwrap().get();
 
     g_cfg_cm = rusty::Some(rusty::make_box<ConfigManager>(kv));
