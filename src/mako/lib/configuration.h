@@ -62,6 +62,8 @@ namespace transport
         
         // Old interface (backward compatibility)
         ShardAddress shard(int idx, int clusterRole=0) const;
+        // Whether shard(idx, clusterRole) would succeed (it Panics otherwise).
+        bool HasShard(int idx, int clusterRole=0) const;
         
         // New interface
         SiteInfo* GetSiteByName(const string& name);

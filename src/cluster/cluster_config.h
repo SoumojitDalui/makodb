@@ -12,6 +12,12 @@ import btree_port.btree.map;   // c529cd3d: btree_port is now a C++20 module (re
 import :sharding_policy;
 import :config_manager;   // ConfigManager named in load_from_config_manager / cc_load_from_cm
 
+/*RUSTYCPP:GEN-DISPATCH-BEGIN*/
+namespace rusty { namespace detail {
+RUSTY_METHOD_DISPATCH(unwrap)
+} } // namespace rusty::detail (issue #31 deref_call dispatch)
+/*RUSTYCPP:GEN-DISPATCH-END*/
+
 namespace btree_port { using btree::map::BTreeMap; }  // compat: flat name the DSL/GEN expect
 
 export namespace janus {
@@ -140,6 +146,12 @@ impl ClusterConfig {
         let g = (*self).state.lock().unwrap();
         (*g).table_policies.contains_key(table)
     }
+    // The shard that serves `shard_id` now: itself, or the end of its
+    // dead-shard replacement chain.
+    fn resolve_live_shard(&self, shard_id: u32) -> u32 {
+        let g = (*self).state.lock().unwrap();
+        unsafe { cc_follow_replacement((*g), shard_id) }
+    }
     fn get_shard_count(&self) -> u32 {
         let g = (*self).state.lock().unwrap();
         (*g).shard_count
@@ -182,7 +194,7 @@ impl ClusterConfig {
     }
 }
 #endif
-/*RUSTYCPP:GEN-BEGIN id=cluster_config.1 version=1 rust_sha256=bb0c3c6ae9d030da1628cb49cd09a7dba1189fc76895bbb290638b41925b4e3f*/
+/*RUSTYCPP:GEN-BEGIN id=cluster_config.1 version=1 rust_sha256=cb09fdf5d4fe5e263d5bde3b326f168cf795a119426236451519f195a0a9e0a4*/
 struct ClusterConfig;
 
 struct ClusterConfig {
@@ -195,6 +207,7 @@ struct ClusterConfig {
     void set_table_policy(const std::string& table, TableShardingPolicy policy);
     void clear_table_policy(const std::string& table);
     bool has_table_policy(const std::string& table) const;
+    uint32_t resolve_live_shard(uint32_t shard_id) const;
     uint32_t get_shard_count() const;
     std::vector<std::string> get_shard_replicas(uint32_t shard_id) const;
     std::string get_shard_leader(uint32_t shard_id) const;
@@ -213,7 +226,7 @@ ClusterConfig ClusterConfig::new_() {
 }
 
 bool ClusterConfig::load_from_config_manager(ConfigManager* cm) {
-    auto g = ((*this)).state.lock().unwrap();
+    auto&& g = rusty::deref_call(((*this)).state.lock(), rusty::detail::__mdisp_unwrap{});
     // @unsafe
     {
         return cc_load_from_cm((rusty::detail::deref_if_pointer_like(g)), cm);
@@ -221,7 +234,7 @@ bool ClusterConfig::load_from_config_manager(ConfigManager* cm) {
 }
 
 uint32_t ClusterConfig::get_shard_for_key(const std::string& table, const std::string& key) const {
-    const auto g = ((*this)).state.lock().unwrap();
+    const auto&& g = rusty::deref_call(((*this)).state.lock(), rusty::detail::__mdisp_unwrap{});
     // @unsafe
     {
         return cc_route((rusty::detail::deref_if_pointer_like(g)), table, key);
@@ -234,27 +247,35 @@ uint32_t ClusterConfig::get_shard_for_key_default(const std::string& key) const 
 }
 
 void ClusterConfig::set_table_policy(const std::string& table, TableShardingPolicy policy) {
-    auto g = ((*this)).state.lock().unwrap();
+    auto&& g = rusty::deref_call(((*this)).state.lock(), rusty::detail::__mdisp_unwrap{});
     (rusty::detail::deref_if_pointer_like(g)).table_policies.insert(table, std::move(policy));
 }
 
 void ClusterConfig::clear_table_policy(const std::string& table) {
-    auto g = ((*this)).state.lock().unwrap();
+    auto&& g = rusty::deref_call(((*this)).state.lock(), rusty::detail::__mdisp_unwrap{});
     (rusty::detail::deref_if_pointer_like(g)).table_policies.remove(table);
 }
 
 bool ClusterConfig::has_table_policy(const std::string& table) const {
-    const auto g = ((*this)).state.lock().unwrap();
+    const auto&& g = rusty::deref_call(((*this)).state.lock(), rusty::detail::__mdisp_unwrap{});
     return (rusty::detail::deref_if_pointer_like(g)).table_policies.contains_key(table);
 }
 
+uint32_t ClusterConfig::resolve_live_shard(uint32_t shard_id) const {
+    const auto&& g = rusty::deref_call(((*this)).state.lock(), rusty::detail::__mdisp_unwrap{});
+    // @unsafe
+    {
+        return cc_follow_replacement((rusty::detail::deref_if_pointer_like(g)), std::move(shard_id));
+    }
+}
+
 uint32_t ClusterConfig::get_shard_count() const {
-    const auto g = ((*this)).state.lock().unwrap();
+    const auto&& g = rusty::deref_call(((*this)).state.lock(), rusty::detail::__mdisp_unwrap{});
     return (rusty::detail::deref_if_pointer_like(g)).shard_count;
 }
 
 std::vector<std::string> ClusterConfig::get_shard_replicas(uint32_t shard_id) const {
-    const auto g = ((*this)).state.lock().unwrap();
+    const auto&& g = rusty::deref_call(((*this)).state.lock(), rusty::detail::__mdisp_unwrap{});
     // @unsafe
     {
         return cc_shard_replicas((rusty::detail::deref_if_pointer_like(g)), std::move(shard_id));
@@ -262,7 +283,7 @@ std::vector<std::string> ClusterConfig::get_shard_replicas(uint32_t shard_id) co
 }
 
 std::string ClusterConfig::get_shard_leader(uint32_t shard_id) const {
-    const auto g = ((*this)).state.lock().unwrap();
+    const auto&& g = rusty::deref_call(((*this)).state.lock(), rusty::detail::__mdisp_unwrap{});
     // @unsafe
     {
         return cc_shard_leader((rusty::detail::deref_if_pointer_like(g)), std::move(shard_id));
@@ -270,7 +291,7 @@ std::string ClusterConfig::get_shard_leader(uint32_t shard_id) const {
 }
 
 std::string ClusterConfig::get_shard_status(uint32_t shard_id) const {
-    const auto g = ((*this)).state.lock().unwrap();
+    const auto&& g = rusty::deref_call(((*this)).state.lock(), rusty::detail::__mdisp_unwrap{});
     // @unsafe
     {
         return cc_shard_status((rusty::detail::deref_if_pointer_like(g)), std::move(shard_id));
@@ -278,32 +299,32 @@ std::string ClusterConfig::get_shard_status(uint32_t shard_id) const {
 }
 
 uint64_t ClusterConfig::get_version() const {
-    const auto g = ((*this)).state.lock().unwrap();
+    const auto&& g = rusty::deref_call(((*this)).state.lock(), rusty::detail::__mdisp_unwrap{});
     return (rusty::detail::deref_if_pointer_like(g)).version;
 }
 
 uint64_t ClusterConfig::get_epoch() const {
-    const auto g = ((*this)).state.lock().unwrap();
+    const auto&& g = rusty::deref_call(((*this)).state.lock(), rusty::detail::__mdisp_unwrap{});
     return (rusty::detail::deref_if_pointer_like(g)).epoch;
 }
 
 void ClusterConfig::update_shard(uint32_t id, const ShardInfo& info) {
-    auto g = ((*this)).state.lock().unwrap();
+    auto&& g = rusty::deref_call(((*this)).state.lock(), rusty::detail::__mdisp_unwrap{});
     (rusty::detail::deref_if_pointer_like(g)).shards.insert(std::move(id), std::move(info));
 }
 
 void ClusterConfig::set_shard_count(uint32_t count) {
-    auto g = ((*this)).state.lock().unwrap();
+    auto&& g = rusty::deref_call(((*this)).state.lock(), rusty::detail::__mdisp_unwrap{});
     (rusty::detail::deref_if_pointer_like(g)).shard_count = std::move(count);
 }
 
 void ClusterConfig::set_version(uint64_t version) {
-    auto g = ((*this)).state.lock().unwrap();
+    auto&& g = rusty::deref_call(((*this)).state.lock(), rusty::detail::__mdisp_unwrap{});
     (rusty::detail::deref_if_pointer_like(g)).version = std::move(version);
 }
 
 void ClusterConfig::set_epoch(uint64_t epoch) {
-    auto g = ((*this)).state.lock().unwrap();
+    auto&& g = rusty::deref_call(((*this)).state.lock(), rusty::detail::__mdisp_unwrap{});
     (rusty::detail::deref_if_pointer_like(g)).epoch = std::move(epoch);
 }
 /*RUSTYCPP:GEN-END id=cluster_config.1*/
