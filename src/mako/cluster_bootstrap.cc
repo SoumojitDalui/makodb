@@ -229,6 +229,11 @@ public:
             drop();
             return rusty::None;
         }
+        if (!serving_) {
+            srpc::Log_info("BootstrapClusterConfig: reading shard-0 config from {}", addr_.c_str());
+            serving_ = true;
+            waiting_logged_ = false;
+        }
         auto resp = r.unwrap();
         if (!resp.found) return rusty::None;
         return rusty::Some(std::move(resp.value));
@@ -252,14 +257,19 @@ private:
         client_ = rusty::Some(std::move(client));
         proxy_ = std::make_unique<ConfigKvServiceProxy>(
             const_cast<srpc::Client*>(client_.as_ref().unwrap().get()));
-        srpc::Log_info("BootstrapClusterConfig: connected to shard-0 config at {}", addr_.c_str());
-        waiting_logged_ = false;
         return true;
     }
 
+    // A successful connect only means the port accepted: a leader that has
+    // crashed but is still writing its core keeps its listening socket open
+    // and times out every read. So state is logged on read outcomes, once
+    // per transition, not on each connect.
     void drop() {
-        srpc::Log_warn("BootstrapClusterConfig: lost shard-0 config at {}; will reconnect",
-                       addr_.c_str());
+        if (serving_) {
+            srpc::Log_warn("BootstrapClusterConfig: lost shard-0 config at {}; will reconnect",
+                           addr_.c_str());
+            serving_ = false;
+        }
         proxy_.reset();
         if (client_.is_some()) {
             client_.as_ref().unwrap()->close();
@@ -273,6 +283,7 @@ private:
     std::unique_ptr<ConfigKvServiceProxy> proxy_;
     std::chrono::steady_clock::time_point next_attempt_{};
     bool waiting_logged_ = false;
+    bool serving_ = false;   // last read RPC succeeded
 };
 
 RemoteConfigConnection* g_cfg_remote = nullptr;   // other nodes; lives for the process
