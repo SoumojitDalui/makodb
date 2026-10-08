@@ -5,6 +5,7 @@ module;
 #include <cstdint>
 
 #include <rusty/mutex.hpp>
+#include <rusty/sync/atomic.hpp>   // AtomicU32 routing hints
 #include <rusty/slice.hpp>   // deref_if_pointer_like (guard bodies)
 
 export module cluster:cluster_config;
@@ -48,6 +49,12 @@ struct ShardInfo {
  * insert); the pure scalar accessors are inline. Routing math (FNV-1a
  * hash, dead-shard replacement chase with a cycle guard, big-endian key
  * decode) lives in the kernels too.
+ *
+ * Next to the mutex sits a lock-free summary of the state, the routing
+ * hints (CC_HINT_*), republished under the guard by every method that
+ * changes what routing can see. compute_shard_for_key reads it with one
+ * atomic load and takes the guard only for lookups a set bit says can
+ * change its answer, so steady-state routing never touches the mutex.
  */
 // ConfigManager is named (as a pointer) below; imported from
 // cluster:config_manager above — modules forbid forward-declaring a foreign
@@ -106,9 +113,32 @@ void cc_shards_insert(btree_port::BTreeMap<uint32_t, ShardInfo>& shards,
     shards.insert(std::move(id), std::move(info));
 }
 
+// Routing hints: which config lookups can change a routing decision.
+constexpr uint32_t CC_HINT_POPULATED = 1;        // shard_count > 0
+constexpr uint32_t CC_HINT_TABLE_POLICIES = 2;   // some table has a config policy
+constexpr uint32_t CC_HINT_REDIRECTS = 4;        // some shard is "dead" (may redirect)
+// Runs under the caller's held guard.
+inline uint32_t cc_routing_hints(const ClusterConfigState& s) {
+    uint32_t hints = 0;
+    if (s.shard_count > 0) hints |= CC_HINT_POPULATED;
+    if (!s.table_policies.is_empty()) hints |= CC_HINT_TABLE_POLICIES;
+    auto it = s.shards.iter();
+    while (true) {
+        auto kv = it.next();
+        if (kv.is_none()) break;
+        if (std::get<1>(kv.unwrap()).status == "dead") {
+            hints |= CC_HINT_REDIRECTS;
+            break;
+        }
+    }
+    return hints;
+}
+
 #if RUSTYCPP_RUST
 pub struct ClusterConfig {
     state: rusty::Mutex<ClusterConfigState>,
+    // CC_HINT_* summary of `state`; written only under the state guard.
+    hints: rusty::sync::atomic::AtomicU32,
 }
 impl ClusterConfig {
     fn new() -> ClusterConfig {
@@ -120,11 +150,15 @@ impl ClusterConfig {
                 shards: btree_port::BTreeMap::<u32, ShardInfo>::new_(),
                 table_policies: btree_port::BTreeMap::<std::string, TableShardingPolicy>::new_(),
             }),
+            hints: rusty::sync::atomic::AtomicU32::new_(0),
         }
     }
     fn load_from_config_manager(&mut self, cm: *mut ConfigManager) -> bool {
         let mut g = (*self).state.lock().unwrap();
-        unsafe { cc_load_from_cm((*g), cm) }
+        let ok: bool = unsafe { cc_load_from_cm((*g), cm) };
+        let h: u32 = unsafe { cc_routing_hints((*g)) };
+        (*self).hints.store(h);
+        ok
     }
     fn get_shard_for_key(&self, table: &std::string, key: &std::string) -> u32 {
         let g = (*self).state.lock().unwrap();
@@ -137,10 +171,14 @@ impl ClusterConfig {
     fn set_table_policy(&mut self, table: &std::string, policy: TableShardingPolicy) {
         let mut g = (*self).state.lock().unwrap();
         (*g).table_policies.insert(table, policy);
+        let h: u32 = unsafe { cc_routing_hints((*g)) };
+        (*self).hints.store(h);
     }
     fn clear_table_policy(&mut self, table: &std::string) {
         let mut g = (*self).state.lock().unwrap();
         (*g).table_policies.remove(table);
+        let h: u32 = unsafe { cc_routing_hints((*g)) };
+        (*self).hints.store(h);
     }
     fn has_table_policy(&self, table: &std::string) -> bool {
         let g = (*self).state.lock().unwrap();
@@ -151,6 +189,10 @@ impl ClusterConfig {
     fn resolve_live_shard(&self, shard_id: u32) -> u32 {
         let g = (*self).state.lock().unwrap();
         unsafe { cc_follow_replacement((*g), shard_id) }
+    }
+    // The CC_HINT_* bits: one atomic load, no lock (routing hot path).
+    fn routing_hints(&self) -> u32 {
+        (*self).hints.load()
     }
     fn get_shard_count(&self) -> u32 {
         let g = (*self).state.lock().unwrap();
@@ -179,10 +221,14 @@ impl ClusterConfig {
     fn update_shard(&mut self, id: u32, info: &ShardInfo) {
         let mut g = (*self).state.lock().unwrap();
         (*g).shards.insert(id, info);
+        let h: u32 = unsafe { cc_routing_hints((*g)) };
+        (*self).hints.store(h);
     }
     fn set_shard_count(&mut self, count: u32) {
         let mut g = (*self).state.lock().unwrap();
         (*g).shard_count = count;
+        let h: u32 = unsafe { cc_routing_hints((*g)) };
+        (*self).hints.store(h);
     }
     fn set_version(&mut self, version: u64) {
         let mut g = (*self).state.lock().unwrap();
@@ -194,11 +240,12 @@ impl ClusterConfig {
     }
 }
 #endif
-/*RUSTYCPP:GEN-BEGIN id=cluster_config.1 version=1 rust_sha256=cb09fdf5d4fe5e263d5bde3b326f168cf795a119426236451519f195a0a9e0a4*/
+/*RUSTYCPP:GEN-BEGIN id=cluster_config.1 version=1 rust_sha256=e1de5d35f4fd519f547c0f785281dc9d48210e877391636a31aefddd2b292863*/
 struct ClusterConfig;
 
 struct ClusterConfig {
     rusty::Mutex<ClusterConfigState> state;
+    rusty::sync::atomic::AtomicU32 hints;
 
     static ClusterConfig new_();
     bool load_from_config_manager(ConfigManager* cm);
@@ -208,6 +255,7 @@ struct ClusterConfig {
     void clear_table_policy(const std::string& table);
     bool has_table_policy(const std::string& table) const;
     uint32_t resolve_live_shard(uint32_t shard_id) const;
+    uint32_t routing_hints() const;
     uint32_t get_shard_count() const;
     std::vector<std::string> get_shard_replicas(uint32_t shard_id) const;
     std::string get_shard_leader(uint32_t shard_id) const;
@@ -222,15 +270,15 @@ struct ClusterConfig {
 
 
 ClusterConfig ClusterConfig::new_() {
-    return ClusterConfig{.state = rusty::Mutex<ClusterConfigState>::new_(ClusterConfigState{.shard_count = 0, .version = 0, .epoch = 0, .shards = btree_port::BTreeMap<uint32_t, ShardInfo>::new_(), .table_policies = btree_port::BTreeMap<std::string, TableShardingPolicy>::new_()})};
+    return ClusterConfig{.state = rusty::Mutex<ClusterConfigState>::new_(ClusterConfigState{.shard_count = 0, .version = 0, .epoch = 0, .shards = btree_port::BTreeMap<uint32_t, ShardInfo>::new_(), .table_policies = btree_port::BTreeMap<std::string, TableShardingPolicy>::new_()}), .hints = rusty::sync::atomic::AtomicU32::new_(0)};
 }
 
 bool ClusterConfig::load_from_config_manager(ConfigManager* cm) {
     auto&& g = rusty::deref_call(((*this)).state.lock(), rusty::detail::__mdisp_unwrap{});
-    // @unsafe
-    {
-        return cc_load_from_cm((rusty::detail::deref_if_pointer_like(g)), cm);
-    }
+    bool ok = cc_load_from_cm((rusty::detail::deref_if_pointer_like(g)), cm);
+    const uint32_t h = cc_routing_hints((rusty::detail::deref_if_pointer_like(g)));
+    ((*this)).hints.store(std::move(h));
+    return std::move(ok);
 }
 
 uint32_t ClusterConfig::get_shard_for_key(const std::string& table, const std::string& key) const {
@@ -249,11 +297,15 @@ uint32_t ClusterConfig::get_shard_for_key_default(const std::string& key) const 
 void ClusterConfig::set_table_policy(const std::string& table, TableShardingPolicy policy) {
     auto&& g = rusty::deref_call(((*this)).state.lock(), rusty::detail::__mdisp_unwrap{});
     (rusty::detail::deref_if_pointer_like(g)).table_policies.insert(table, std::move(policy));
+    const uint32_t h = cc_routing_hints((rusty::detail::deref_if_pointer_like(g)));
+    ((*this)).hints.store(std::move(h));
 }
 
 void ClusterConfig::clear_table_policy(const std::string& table) {
     auto&& g = rusty::deref_call(((*this)).state.lock(), rusty::detail::__mdisp_unwrap{});
     (rusty::detail::deref_if_pointer_like(g)).table_policies.remove(table);
+    const uint32_t h = cc_routing_hints((rusty::detail::deref_if_pointer_like(g)));
+    ((*this)).hints.store(std::move(h));
 }
 
 bool ClusterConfig::has_table_policy(const std::string& table) const {
@@ -267,6 +319,10 @@ uint32_t ClusterConfig::resolve_live_shard(uint32_t shard_id) const {
     {
         return cc_follow_replacement((rusty::detail::deref_if_pointer_like(g)), std::move(shard_id));
     }
+}
+
+uint32_t ClusterConfig::routing_hints() const {
+    return ((*this)).hints.load();
 }
 
 uint32_t ClusterConfig::get_shard_count() const {
@@ -311,11 +367,15 @@ uint64_t ClusterConfig::get_epoch() const {
 void ClusterConfig::update_shard(uint32_t id, const ShardInfo& info) {
     auto&& g = rusty::deref_call(((*this)).state.lock(), rusty::detail::__mdisp_unwrap{});
     (rusty::detail::deref_if_pointer_like(g)).shards.insert(std::move(id), std::move(info));
+    const uint32_t h = cc_routing_hints((rusty::detail::deref_if_pointer_like(g)));
+    ((*this)).hints.store(std::move(h));
 }
 
 void ClusterConfig::set_shard_count(uint32_t count) {
     auto&& g = rusty::deref_call(((*this)).state.lock(), rusty::detail::__mdisp_unwrap{});
     (rusty::detail::deref_if_pointer_like(g)).shard_count = std::move(count);
+    const uint32_t h = cc_routing_hints((rusty::detail::deref_if_pointer_like(g)));
+    ((*this)).hints.store(std::move(h));
 }
 
 void ClusterConfig::set_version(uint64_t version) {

@@ -180,6 +180,22 @@ TEST_F(ConfigManagerTest, ClusterConfigLoadMirrorsManager) {
     EXPECT_EQ(cc.get_version(), cm_.get_version());
 }
 
+// A reload republishes the routing hints, so a shard killed in the store
+// turns redirects on for the router.
+TEST_F(ConfigManagerTest, ClusterConfigLoadPublishesRoutingHints) {
+    ASSERT_TRUE(cm_.add_shard(0, {"a"}));
+    ASSERT_TRUE(cm_.add_shard(1, {"b"}));
+
+    ClusterConfig cc = ClusterConfig::new_();
+    ASSERT_TRUE(cc.load_from_config_manager(&cm_));
+    EXPECT_EQ(cc.routing_hints(), CC_HINT_POPULATED);
+
+    ASSERT_TRUE(cm_.kill_shard(1, 0));
+    ASSERT_TRUE(cc.load_from_config_manager(&cm_));
+    EXPECT_EQ(cc.routing_hints(), CC_HINT_POPULATED | CC_HINT_REDIRECTS);
+    EXPECT_EQ(cc.resolve_live_shard(1), 0u);
+}
+
 TEST_F(ConfigManagerTest, ClusterConfigLoadFromNullManagerFails) {
     ClusterConfig cc = ClusterConfig::new_();
     EXPECT_FALSE(cc.load_from_config_manager(nullptr));
