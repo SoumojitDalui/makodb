@@ -34,7 +34,7 @@ namespace janus {
 //
 // When active, branches on this node's identity:
 //   - Shard 0's leader opens its __mako_config__ index, wraps it in an
-//     OrderedIndexKvStore, seeds it from the shared shard config (shard
+//     OrderedIndexKvStore behind an in-memory mirror, seeds it from the shared shard config (shard
 //     count + per-shard replicas, leader, status and replica addresses;
 //     no per-table policy), primes and watches its own routing cache, and
 //     stands up a dedicated ConfigKvService RPC server so other nodes can
@@ -42,9 +42,9 @@ namespace janus {
 //   - Every other node wraps a reconnecting RPC client to that service in
 //     a RemoteKvStore and starts a ConfigWatcher. A node that starts before
 //     shard 0 serves keeps retrying every second.
-// Threads that touch the Mako-backed store without being workers (the
-// leader's watcher thread, the service handler thread) are registered
-// with the transaction engine on first use.
+// On shard 0's leader the store writes through to the Mako index and an
+// in-memory mirror; the watcher and the service handler read the mirror,
+// so no thread outside the transaction engine touches the index.
 //
 // Not covered here: the config table is written only on shard 0's leader
 // and is neither replicated nor persisted, so a shard-0 failover or restart
