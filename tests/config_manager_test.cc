@@ -273,6 +273,20 @@ TEST_F(ConfigManagerTest, EachChangeIsOneBatch) {
     EXPECT_EQ(depth, 0);
 }
 
+// A store with a version but no shard_count holds no topology to route
+// by (or the shard_count read failed); loading it keeps the current config.
+TEST_F(ConfigManagerTest, ClusterConfigRejectsLoadWithoutShards) {
+    ASSERT_TRUE(cm_.add_shard(0, {"a"}));
+    ClusterConfig cc = ClusterConfig::new_();
+    ASSERT_TRUE(cc.load_from_config_manager(&cm_));
+
+    InMemoryKvStore other;
+    ConfigManager no_shards{&other};
+    ASSERT_TRUE(no_shards.set_sharding_mode("hash"));   // version 1, no shard_count
+    EXPECT_FALSE(cc.load_from_config_manager(&no_shards));
+    EXPECT_EQ(cc.get_shard_count(), 1u);
+}
+
 TEST_F(ConfigManagerTest, ClusterConfigLoadFromNullManagerFails) {
     ClusterConfig cc = ClusterConfig::new_();
     EXPECT_FALSE(cc.load_from_config_manager(nullptr));

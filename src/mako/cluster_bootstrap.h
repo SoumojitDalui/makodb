@@ -58,15 +58,21 @@ namespace janus {
 void BootstrapClusterConfig(abstract_db* db);
 
 // Take over serving the cluster config when this process becomes shard 0's
-// leader after startup (a Paxos learner or p1 taking over, or a Raft
-// leadership change). The replica stops reading the old leader and serves
+// leader after startup (a Paxos learner or p1 taking over). The work runs on
+// its own thread so the failover callback is not held up; it happens once
+// per process. The replica stops reading the old leader and serves
 // its own copy of the config table, which it received through the
 // replication log, after naming itself shard 0's leader in it; if no
 // complete copy arrived (promoted before the seed replicated), it rebuilds
 // the config from the shared shard config. The version continues above the
-// last one it saw, so every watcher reloads. Other nodes find it by trying
-// shard 0's replicas. No-op off shard 0, when the feature is off, and on a
-// node that already serves.
+// last one it saw and above the new Paxos epoch shifted into the high half,
+// so every watcher reloads and no two promoted leaders share a version.
+// Other nodes find it by trying shard 0's replicas. No-op off shard 0, when
+// the feature is off, and on a node that already serves.
+//
+// Raft is not hooked up: with a Raft group per partition, leading one
+// partition does not make a node shard 0's leader, and nothing reports who
+// leads partition 0. Config failover is Paxos-only.
 //
 // @unsafe - storage index, RPC server bind, background thread creation.
 void PromoteClusterConfigLeader();
