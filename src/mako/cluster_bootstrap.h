@@ -34,38 +34,41 @@ namespace janus {
 // leaves the feature off rather than running half-wired.
 //
 // When active, branches on this node's identity:
-//   - Shard 0's leader opens its __mako_config__ index, wraps it in an
-//     OrderedIndexKvStore behind an in-memory mirror, seeds it from the shared shard config (shard
-//     count + per-shard replicas, leader, status and replica addresses;
-//     no per-table policy), primes and watches its own routing cache, and
-//     stands up a dedicated ConfigKvService RPC server so other nodes can
-//     read config keys.
+//   - Shard 0's leader seeds the config table (__mako_config__, the
+//     reserved table id mako::CONFIG_TABLE_ID) from the shared shard
+//     config (shard count + per-shard replicas, leader, status and replica
+//     addresses; no per-table policy), primes and watches its own routing
+//     cache, and stands up a dedicated ConfigKvService RPC server so other
+//     nodes can read config keys.
 //   - Every other node wraps an RPC client to that service in a
 //     RemoteKvStore and starts a ConfigWatcher. The client tries shard 0's
 //     replicas in turn, so it keeps retrying until shard 0 serves and moves
 //     to a promoted replica after a failover.
-// On shard 0's leader the store writes through to the Mako index and an
-// in-memory mirror; the watcher and the service handler read the mirror,
-// so no thread outside the transaction engine touches the index.
+// One thread registered with the transaction engine owns the config
+// table and runs every read and write of it for the other threads here.
+// Each write is a one-key transaction that goes into shard 0's replication
+// log at once (Paxos partition 0, and the leader's log persistence), so
+// shard 0's followers replay the table like any other.
 //
-// Not covered here: the config table is written only on shard 0's leader
-// and is neither replicated nor persisted (a promoted replica re-seeds it,
-// see PromoteClusterConfigLeader), and there is no runtime write path
-// (shardmaster commands).
+// Not covered here: there is no runtime write path (shardmaster commands),
+// and writes are one-key transactions, ordered by __version__ written last,
+// not one transaction per config change.
 //
 // @unsafe - RPC I/O, storage index open, background thread creation.
 void BootstrapClusterConfig(abstract_db* db);
 
 // Take over serving the cluster config when this process becomes shard 0's
 // leader after startup (a Paxos learner or p1 taking over, or a Raft
-// leadership change). The replica stops reading the old leader, rebuilds
-// the config from the shared shard config with itself as shard 0's leader
-// and a version above the last one it saw, and serves it at its own
-// endpoint; other nodes find it by trying shard 0's replicas. While nothing
-// changes the config at runtime this loses nothing. No-op off shard 0,
-// when the feature is off, and on a node that already serves.
+// leadership change). The replica stops reading the old leader and serves
+// its own copy of the config table, which it received through the
+// replication log, after naming itself shard 0's leader in it; if no
+// complete copy arrived (promoted before the seed replicated), it rebuilds
+// the config from the shared shard config. The version continues above the
+// last one it saw, so every watcher reloads. Other nodes find it by trying
+// shard 0's replicas. No-op off shard 0, when the feature is off, and on a
+// node that already serves.
 //
-// @unsafe - RPC server bind, background thread creation.
+// @unsafe - storage index, RPC server bind, background thread creation.
 void PromoteClusterConfigLeader();
 
 }  // namespace janus
