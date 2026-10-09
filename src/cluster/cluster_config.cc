@@ -178,8 +178,16 @@ uint32_t cc_route(const ClusterConfigState& s, const std::string& table, const s
 // RPC) and rebuilds the topology maps. Runs under the caller's held guard.
 bool cc_load_from_cm(ClusterConfigState& s, ConfigManager* cm) {
     if (cm == nullptr) return false;
+    // Over RPC (RemoteKvStore) an unreachable store reads as empty, every key
+    // absent, and a connection lost partway through reads as part config,
+    // part empty. A store that holds a config has a nonzero __version__, and
+    // every change rewrites it last, so read it before and after the rest: if
+    // it is zero or moved in between, there is no consistent snapshot and the
+    // loaded config stays as it was. (A change still in flight shows up as a
+    // new version on the next poll.)
+    const uint64_t ver = cm->get_version();
+    if (ver == 0) return false;
     uint32_t count = cm->get_shard_count();
-    uint64_t ver = cm->get_version();
     uint64_t ep = cm->get_epoch();
     // c529cd3d: BTreeMap has no default ctor; construct explicitly.
     btree_port::BTreeMap<uint32_t, ShardInfo> new_shards =
@@ -193,6 +201,7 @@ bool cc_load_from_cm(ClusterConfigState& s, ConfigManager* cm) {
         info.replacement = cm->get_shard_replacement(i);
         cc_shards_insert(new_shards, i, std::move(info));
     }
+    if (cm->get_version() != ver) return false;
     s.shard_count = count;
     s.version = ver;
     s.epoch = ep;
