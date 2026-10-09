@@ -2,10 +2,12 @@
 
 #include <stdlib.h>  // getenv, strtol, atol
 #include <string.h>  // strcmp
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -64,10 +66,14 @@ constexpr int kConfigThreadId = MAX_THREADS - 1;
 // id and a Masstree threadinfo), and the callers here are not engine
 // threads (the bootstrap and promotion threads, the ConfigWatcher poll
 // thread, the ConfigKvService handler thread), so they hand each op to the
-// table thread and wait for it. Every write is a one-key transaction whose
-// log entry the table thread pushes to shard 0's Paxos stream for partition
-// 0 as soon as it commits, so shard 0's followers replay the table like
-// any other and a replica promoted to leader already holds the config.
+// table thread and wait for it. Writes between begin_batch and end_batch
+// (one ConfigManager change, or a whole seed) stay with the writing thread,
+// which also reads them back, and the outermost end_batch commits them as
+// one transaction; a write outside a batch is a one-key transaction. The
+// table thread pushes each commit's log entry to shard 0's Paxos stream for
+// partition 0 at once, so shard 0's followers replay the table like any
+// other (a transaction travels as one log entry, so it arrives whole or not
+// at all) and a replica promoted to leader already holds the config.
 //
 // A removal is written as kRemovedMarker instead of deleting the key:
 // replay turns a deleted key into a tombstone value rather than removing
@@ -75,13 +81,20 @@ constexpr int kConfigThreadId = MAX_THREADS - 1;
 // @unsafe - engine thread, Mako index ops
 class ConfigTableStore : public KvStore {
 public:
-    explicit ConfigTableStore(abstract_ordered_index* idx)
-        : record_(idx), thread_([this] { run(); }) {
+    ConfigTableStore(abstract_db* db, abstract_ordered_index* idx)
+        : db_(db), idx_(idx), record_(idx), thread_([this] { run(); }) {
         thread_.detach();   // serves the config for the life of the process
     }
     ~ConfigTableStore() noexcept override {}
 
     rusty::Option<std::string> get(const std::string& key) override {
+        if (in_my_batch()) {
+            auto it = batch_.find(key);
+            if (it != batch_.end()) {
+                if (it->second == kRemovedMarker) return rusty::None;
+                return rusty::Some(it->second);
+            }
+        }
         rusty::Option<std::string> out = rusty::None;
         call([&] {
             auto v = record_.get(key);
@@ -91,14 +104,66 @@ public:
     }
 
     void put(const std::string& key, const std::string& value) override {
+        if (in_my_batch()) {
+            batch_[key] = value;
+            return;
+        }
         call([&] { record_.put(key, value); });
     }
 
     void remove(const std::string& key) override {
+        if (in_my_batch()) {
+            batch_[key] = kRemovedMarker;
+            return;
+        }
         call([&] { record_.put(key, kRemovedMarker); });
     }
 
+    // One writer's batch at a time; it holds batch_mu_ until it commits.
+    void begin_batch() override {
+        if (in_my_batch()) {
+            ++batch_depth_;
+            return;
+        }
+        batch_mu_.lock();
+        batch_owner_.store(std::this_thread::get_id());
+        batch_depth_ = 1;
+    }
+
+    void end_batch() override {
+        if (!in_my_batch() || --batch_depth_ > 0) return;
+        std::map<std::string, std::string> writes;
+        writes.swap(batch_);
+        batch_owner_.store(std::thread::id());
+        if (!writes.empty()) call([&] { CommitBatch(writes); });
+        batch_mu_.unlock();
+    }
+
 private:
+    bool in_my_batch() const { return batch_owner_.load() == std::this_thread::get_id(); }
+
+    // On the table thread: the batch as one transaction, retried on a
+    // conflict. A transactional put keeps a pointer to its encoded value
+    // until commit, so the encoded values live in `values` until then.
+    void CommitBatch(const std::map<std::string, std::string>& writes) {
+        std::vector<std::string> values;
+        values.reserve(writes.size());
+        for (const auto& kv : writes) values.push_back(mako::Encode(kv.second));
+        for (;;) {
+            try {
+                void* txn = db_->new_txn(0, arena_, nullptr);
+                size_t i = 0;
+                for (const auto& kv : writes) {
+                    idx_->tx_put(txn, lcdf::Str(kv.first.data(), kv.first.size()), values[i++]);
+                }
+                db_->commit_txn(txn);
+                return;
+            } catch (abstract_db::abstract_abort_exception&) {
+                if (Sto::in_progress()) db_->abort_txn(nullptr);
+            }
+        }
+    }
+
     struct Job {
         std::function<void()> op;
         bool done = false;
@@ -146,7 +211,16 @@ private:
 
     static inline const std::string kRemovedMarker = std::string("\0mako-config-removed\0", 21);
 
+    abstract_db* db_;
+    abstract_ordered_index* idx_;
     OrderedIndexKvStore record_;
+    str_arena arena_;   // table thread only
+
+    std::mutex batch_mu_;
+    std::atomic<std::thread::id> batch_owner_{};
+    int batch_depth_ = 0;                          // batch owner only
+    std::map<std::string, std::string> batch_;     // batch owner only
+
     std::mutex mu_;
     std::condition_variable cv_;
     std::deque<Job*> jobs_;
@@ -466,9 +540,11 @@ void StartShard0Leader(uint32_t nshards, const ConfigEndpoint& ep) {
                         mako::CONFIG_TABLE_ID);
         return;
     }
-    g_cfg_store = new ConfigTableStore(idx);
+    g_cfg_store = new ConfigTableStore(g_cfg_db, idx);
     g_cfg_cm = rusty::Some(rusty::make_box<ConfigManager>(g_cfg_store));
+    g_cfg_store->begin_batch();   // the whole seed as one transaction
     SeedTopology(g_cfg_cm.as_ref().unwrap().get(), nshards, std::string());
+    g_cfg_store->end_batch();
 
     // Local routing cache first, so this node routes by the config even if
     // the service below fails to bind.
@@ -564,7 +640,7 @@ void PromoteClusterConfigLeader() {
     g_cfg_watcher = rusty::None;
     const uint64_t last_seen = get_cluster_config().get_version();
 
-    g_cfg_store = new ConfigTableStore(idx);
+    g_cfg_store = new ConfigTableStore(g_cfg_db, idx);
     g_cfg_cm = rusty::Some(rusty::make_box<ConfigManager>(g_cfg_store));
     ConfigManager* cm = g_cfg_cm.as_ref().unwrap().get();
 
@@ -576,12 +652,14 @@ void PromoteClusterConfigLeader() {
     // continues above every one a watcher has seen, so all of them reload.
     const uint64_t replicated = cm->get_version();
     const bool complete = replicated > 0 && cm->get_shard_count() > 0;
+    g_cfg_store->begin_batch();   // one transaction
     if (last_seen > replicated) g_cfg_store->put("__version__", std::to_string(last_seen));
     if (complete) {
         cm->set_shard_leader(0, me);
     } else {
         SeedTopology(cm, g_cfg_nshards, me);
     }
+    g_cfg_store->end_batch();
     StartLocalWatcher(cm);
     StartConfigService(g_cfg_store, mine->port);
     srpc::Log_info("BootstrapClusterConfig: {} now leads shard 0 and serves the {} cluster config "

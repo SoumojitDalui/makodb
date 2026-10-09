@@ -42,6 +42,8 @@ public:
     virtual rusty::Option<std::string> get(const std::string& key) = 0;
     virtual void put(const std::string& key, const std::string& value) = 0;
     virtual void remove(const std::string& key) = 0;
+    virtual void begin_batch() = 0;
+    virtual void end_batch() = 0;
     KvStore(const KvStore&) = delete;
     KvStore& operator=(const KvStore&) = delete;
     KvStore(KvStore&&) = delete;

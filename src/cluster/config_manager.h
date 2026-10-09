@@ -23,15 +23,13 @@ export namespace janus {
  * unit-tests with no storage-engine headers. The metadata really lives
  * in the unified store; this is a decoupling seam, not a parallel one.
  *
- * Consistency: multi-key writes are applied as a sequence of point puts
- * with the __version__ key written LAST (bump_version, called after the
- * data writes), so a reader that observes a new __version__ is
- * guaranteed to see all keys of that version. This is not atomic across
- * keys the way a transaction would be, but config is single-writer
- * (shard 0's leader) and low-frequency; a reader that races an in-flight
- * change self-heals on its next version poll, and a transient misroute
- * is caught by the WrongShard-retry path. (Under the "shard 0 never
- * fails" assumption we don't replicate this table.)
+ * Consistency: each change is one batch. Its writes, ending with the
+ * __version__ bump, go to the store between begin_batch and end_batch, so
+ * a transactional store (the Mako config table on shard 0) commits them
+ * as one transaction, which shard 0's Paxos log replicates whole. Config
+ * is single-writer (shard 0's leader). A reader reads one key at a time,
+ * so it can still straddle a change; it reads __version__ before and
+ * after (ClusterConfig) and reloads on the next poll.
  *
  * Key schema:
  *   __version__             — monotonically increasing config version (uint64)
@@ -100,11 +98,20 @@ impl ConfigManager {
         }
         result
     }
-    // Write key=value then bump __version__ (written last).
+    // Open / close the batch that makes one change atomic (KvStore).
+    fn begin_change(&mut self) {
+        unsafe { (*(*self).kv).begin_batch(); }
+    }
+    fn end_change(&mut self) {
+        unsafe { (*(*self).kv).end_batch(); }
+    }
+    // Write key=value and bump __version__, as one change.
     fn put_versioned(&mut self, key: &std::string, value: &std::string) -> bool {
         if unsafe { cm_kv_absent((*self).kv) } { return false; }
+        self.begin_change();
         unsafe { (*(*self).kv).put(key, value); }
         self.bump_version();
+        self.end_change();
         true
     }
     // Read __version__, write it back incremented (the last visible write).
@@ -189,6 +196,7 @@ impl ConfigManager {
         let count: u32 = self.get_shard_count();
         let rkey: std::string = std::string("shard/") + std::to_string(shard_id) + std::string("/replicas");
         let rval: std::string = self.join_replicas(replicas);
+        self.begin_change();
         unsafe { (*(*self).kv).put(&rkey, &rval); }
         let skey: std::string = std::string("shard/") + std::to_string(shard_id) + std::string("/status");
         let sval: std::string = std::string("active");
@@ -197,6 +205,7 @@ impl ConfigManager {
         let cval: std::string = std::to_string(count + 1);
         unsafe { (*(*self).kv).put(&ckey, &cval); }
         self.bump_version();
+        self.end_change();
         true
     }
     // The next shard id the master will hand out. Monotonic and never reused,
@@ -221,8 +230,10 @@ impl ConfigManager {
         let id: u32 = self.next_shard_id();
         let nkey: std::string = std::string("next_shard_id");
         let nval: std::string = std::to_string(id + 1);
+        self.begin_change();
         unsafe { (*(*self).kv).put(&nkey, &nval); }
         self.add_shard(id, replicas);
+        self.end_change();
         id
     }
     fn remove_shard(&mut self, shard_id: u32) -> bool {
@@ -230,6 +241,7 @@ impl ConfigManager {
         let count: u32 = self.get_shard_count();
         if count == 0 { return false; }
         let rkey: std::string = std::string("shard/") + std::to_string(shard_id) + std::string("/replicas");
+        self.begin_change();
         unsafe { (*(*self).kv).remove(&rkey); }
         let lkey: std::string = std::string("shard/") + std::to_string(shard_id) + std::string("/leader");
         unsafe { (*(*self).kv).remove(&lkey); }
@@ -239,6 +251,7 @@ impl ConfigManager {
         let cval: std::string = std::to_string(count - 1);
         unsafe { (*(*self).kv).put(&ckey, &cval); }
         self.bump_version();
+        self.end_change();
         true
     }
     fn get_shard_replacement(&mut self, shard_id: u32) -> u32 {
@@ -259,6 +272,7 @@ impl ConfigManager {
         let epoch: u64 = self.get_epoch() + 1;
         let dkey: std::string = std::string("shard/") + std::to_string(dead_id) + std::string("/status");
         let dval: std::string = std::string("dead");
+        self.begin_change();
         unsafe { (*(*self).kv).put(&dkey, &dval); }
         let pkey: std::string = std::string("shard/") + std::to_string(dead_id) + std::string("/replacement");
         let pval: std::string = std::to_string(taker_id);
@@ -270,6 +284,7 @@ impl ConfigManager {
         let eval: std::string = std::to_string(epoch);
         unsafe { (*(*self).kv).put(&ekey, &eval); }
         self.bump_version();
+        self.end_change();
         true
     }
 
@@ -353,6 +368,7 @@ impl ConfigManager {
             i = i + 1;
         }
         let pkey: std::string = std::string("sharding/policy/") + *table;
+        self.begin_change();
         unsafe { (*(*self).kv).put(&pkey, serialized_policy); }
         if !present {
             tables.push_back(*table);
@@ -361,6 +377,7 @@ impl ConfigManager {
             unsafe { (*(*self).kv).put(&tkey, &tval); }
         }
         self.bump_version();
+        self.end_change();
         true
     }
     fn delete_sharding_policy(&mut self, table: &std::string) -> bool {
@@ -377,22 +394,26 @@ impl ConfigManager {
             return true;
         }
         let pkey: std::string = std::string("sharding/policy/") + *table;
+        self.begin_change();
         unsafe { (*(*self).kv).remove(&pkey); }
         let tkey: std::string = std::string("sharding/policy_tables");
         let tval: std::string = self.join_replicas(&pruned);
         unsafe { (*(*self).kv).put(&tkey, &tval); }
         self.bump_version();
+        self.end_change();
         true
     }
 }
 #endif
-/*RUSTYCPP:GEN-BEGIN id=config_manager.1 version=1 rust_sha256=11b2ff6cf88966c14f5e052f80aab7443884da2482b848ff7efe970938c6d3a2*/
+/*RUSTYCPP:GEN-BEGIN id=config_manager.1 version=1 rust_sha256=b01d9b86b151b25c4a55cec2ede2047c5f832ea91d7d732111c62df9b2610b48*/
 struct ConfigManager;
 
 struct ConfigManager {
     KvStore* kv;
 
     std::string join_replicas(const std::vector<std::string>& replicas) const;
+    void begin_change();
+    void end_change();
     bool put_versioned(const std::string& key, const std::string& value);
     void bump_version();
     uint64_t get_version();
@@ -438,15 +459,31 @@ inline std::string ConfigManager::join_replicas(const std::vector<std::string>& 
     return std::move(result);
 }
 
+inline void ConfigManager::begin_change() {
+    // @unsafe
+    {
+        ((rusty::detail::deref_if_pointer_like(((*this)).kv))).begin_batch();
+    }
+}
+
+inline void ConfigManager::end_change() {
+    // @unsafe
+    {
+        ((rusty::detail::deref_if_pointer_like(((*this)).kv))).end_batch();
+    }
+}
+
 inline bool ConfigManager::put_versioned(const std::string& key, const std::string& value) {
     if (cm_kv_absent(((*this)).kv)) {
         return false;
     }
+    this->begin_change();
     // @unsafe
     {
         ((rusty::detail::deref_if_pointer_like(((*this)).kv))).put(key, value);
     }
     this->bump_version();
+    this->end_change();
     return true;
 }
 
@@ -499,7 +536,7 @@ inline bool ConfigManager::set_shard_count(uint32_t count) {
 
 inline std::vector<std::string> ConfigManager::get_shard_replicas(uint32_t shard_id) {
     std::string value = std::string("");
-    if (!cm_kv_absent(((*this)).kv)) {
+    if (rusty::detail::rust_not(cm_kv_absent(((*this)).kv))) {
         const std::string key = (std::string("shard/") + std::to_string(std::move(shard_id))) + std::string("/replicas");
         rusty::Option<std::string> vopt = ((rusty::detail::deref_if_pointer_like(((*this)).kv))).get(key);
         if (vopt.is_some()) {
@@ -523,7 +560,7 @@ inline std::string ConfigManager::get_shard_leader(uint32_t shard_id) {
         return std::string("");
     }
     const std::string key = (std::string("shard/") + std::to_string(std::move(shard_id))) + std::string("/leader");
-    const rusty::Option<std::string> vopt = ((rusty::detail::deref_if_pointer_like(((*this)).kv))).get(key);
+    rusty::Option<std::string> vopt = ((rusty::detail::deref_if_pointer_like(((*this)).kv))).get(key);
     return vopt.unwrap_or(std::string(""));
 }
 
@@ -537,7 +574,7 @@ inline std::string ConfigManager::get_shard_status(uint32_t shard_id) {
         return std::string("");
     }
     const std::string key = (std::string("shard/") + std::to_string(std::move(shard_id))) + std::string("/status");
-    const rusty::Option<std::string> vopt = ((rusty::detail::deref_if_pointer_like(((*this)).kv))).get(key);
+    rusty::Option<std::string> vopt = ((rusty::detail::deref_if_pointer_like(((*this)).kv))).get(key);
     return vopt.unwrap_or(std::string(""));
 }
 
@@ -553,6 +590,7 @@ inline bool ConfigManager::add_shard(uint32_t shard_id, const std::vector<std::s
     const uint32_t count = this->get_shard_count();
     const std::string rkey = (std::string("shard/") + std::to_string(std::move(shard_id))) + std::string("/replicas");
     const std::string rval = this->join_replicas(replicas);
+    this->begin_change();
     // @unsafe
     {
         ((rusty::detail::deref_if_pointer_like(((*this)).kv))).put(rkey, rval);
@@ -570,6 +608,7 @@ inline bool ConfigManager::add_shard(uint32_t shard_id, const std::vector<std::s
         ((rusty::detail::deref_if_pointer_like(((*this)).kv))).put(ckey, cval);
     }
     this->bump_version();
+    this->end_change();
     return true;
 }
 
@@ -593,11 +632,13 @@ inline uint32_t ConfigManager::register_shard(const std::vector<std::string>& re
     uint32_t id = this->next_shard_id();
     const std::string nkey = std::string("next_shard_id");
     const std::string nval = std::to_string(rusty::detail::deref_if_pointer_like(id) + 1);
+    this->begin_change();
     // @unsafe
     {
         ((rusty::detail::deref_if_pointer_like(((*this)).kv))).put(nkey, nval);
     }
     this->add_shard(std::move(id), replicas);
+    this->end_change();
     return std::move(id);
 }
 
@@ -610,6 +651,7 @@ inline bool ConfigManager::remove_shard(uint32_t shard_id) {
         return false;
     }
     const std::string rkey = (std::string("shard/") + std::to_string(std::move(shard_id))) + std::string("/replicas");
+    this->begin_change();
     // @unsafe
     {
         ((rusty::detail::deref_if_pointer_like(((*this)).kv))).remove(rkey);
@@ -631,6 +673,7 @@ inline bool ConfigManager::remove_shard(uint32_t shard_id) {
         ((rusty::detail::deref_if_pointer_like(((*this)).kv))).put(ckey, cval);
     }
     this->bump_version();
+    this->end_change();
     return true;
 }
 
@@ -663,6 +706,7 @@ inline bool ConfigManager::kill_shard(uint32_t dead_id, uint32_t taker_id) {
     const uint64_t epoch = this->get_epoch() + static_cast<uint64_t>(1);
     const std::string dkey = (std::string("shard/") + std::to_string(std::move(dead_id))) + std::string("/status");
     const std::string dval = std::string("dead");
+    this->begin_change();
     // @unsafe
     {
         ((rusty::detail::deref_if_pointer_like(((*this)).kv))).put(dkey, dval);
@@ -686,6 +730,7 @@ inline bool ConfigManager::kill_shard(uint32_t dead_id, uint32_t taker_id) {
         ((rusty::detail::deref_if_pointer_like(((*this)).kv))).put(ekey, eval);
     }
     this->bump_version();
+    this->end_change();
     return true;
 }
 
@@ -717,7 +762,7 @@ inline std::string ConfigManager::get_node_addr(const std::string& site) {
         return std::string("");
     }
     const std::string key = ((std::string("node/") + site)) + std::string("/addr");
-    const rusty::Option<std::string> vopt = ((rusty::detail::deref_if_pointer_like(((*this)).kv))).get(key);
+    rusty::Option<std::string> vopt = ((rusty::detail::deref_if_pointer_like(((*this)).kv))).get(key);
     return vopt.unwrap_or(std::string(""));
 }
 
@@ -731,7 +776,7 @@ inline std::string ConfigManager::get_node_status(const std::string& site) {
         return std::string("");
     }
     const std::string key = ((std::string("node/") + site)) + std::string("/status");
-    const rusty::Option<std::string> vopt = ((rusty::detail::deref_if_pointer_like(((*this)).kv))).get(key);
+    rusty::Option<std::string> vopt = ((rusty::detail::deref_if_pointer_like(((*this)).kv))).get(key);
     return vopt.unwrap_or(std::string(""));
 }
 
@@ -745,7 +790,7 @@ inline std::string ConfigManager::get_sharding_mode() {
         return std::string("");
     }
     const std::string key = std::string("sharding/mode");
-    const rusty::Option<std::string> vopt = ((rusty::detail::deref_if_pointer_like(((*this)).kv))).get(key);
+    rusty::Option<std::string> vopt = ((rusty::detail::deref_if_pointer_like(((*this)).kv))).get(key);
     return vopt.unwrap_or(std::string(""));
 }
 
@@ -762,13 +807,13 @@ inline std::string ConfigManager::get_sharding_policy(const std::string& table) 
         return std::string("");
     }
     const std::string key = std::string("sharding/policy/") + table;
-    const rusty::Option<std::string> vopt = ((rusty::detail::deref_if_pointer_like(((*this)).kv))).get(key);
+    rusty::Option<std::string> vopt = ((rusty::detail::deref_if_pointer_like(((*this)).kv))).get(key);
     return vopt.unwrap_or(std::string(""));
 }
 
 inline std::vector<std::string> ConfigManager::list_sharding_policy_tables() {
     std::string value = std::string("");
-    if (!cm_kv_absent(((*this)).kv)) {
+    if (rusty::detail::rust_not(cm_kv_absent(((*this)).kv))) {
         const std::string key = std::string("sharding/policy_tables");
         rusty::Option<std::string> vopt = ((rusty::detail::deref_if_pointer_like(((*this)).kv))).get(key);
         if (vopt.is_some()) {
@@ -801,6 +846,7 @@ inline bool ConfigManager::set_sharding_policy(const std::string& table, const s
         i = rusty::detail::deref_if_pointer_like(i) + static_cast<size_t>(1);
     }
     const std::string pkey = std::string("sharding/policy/") + table;
+    this->begin_change();
     // @unsafe
     {
         ((rusty::detail::deref_if_pointer_like(((*this)).kv))).put(pkey, serialized_policy);
@@ -815,6 +861,7 @@ inline bool ConfigManager::set_sharding_policy(const std::string& table, const s
         }
     }
     this->bump_version();
+    this->end_change();
     return true;
 }
 
@@ -838,6 +885,7 @@ inline bool ConfigManager::delete_sharding_policy(const std::string& table) {
         return true;
     }
     const std::string pkey = std::string("sharding/policy/") + table;
+    this->begin_change();
     // @unsafe
     {
         ((rusty::detail::deref_if_pointer_like(((*this)).kv))).remove(pkey);
@@ -849,6 +897,7 @@ inline bool ConfigManager::delete_sharding_policy(const std::string& table) {
         ((rusty::detail::deref_if_pointer_like(((*this)).kv))).put(tkey, tval);
     }
     this->bump_version();
+    this->end_change();
     return true;
 }
 /*RUSTYCPP:GEN-END id=config_manager.1*/

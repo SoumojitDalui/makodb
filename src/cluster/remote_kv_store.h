@@ -57,6 +57,8 @@ impl KvStore for RemoteKvStore {
     // Read-only consumer: writes are not permitted (no-op).
     fn put(&mut self, key: &std::string, value: &std::string) {}
     fn remove(&mut self, key: &std::string) {}
+    fn begin_batch(&mut self) {}
+    fn end_batch(&mut self) {}
 }
 #endif
 /*RUSTYCPP:GEN-BEGIN id=remote_kv_store.1 version=1 rust_sha256=fccf08dd94fb20623f53a392fa432035dfc309953b1dd94cef9b7d35f249a619*/
@@ -71,6 +73,8 @@ struct RemoteKvStore : public KvStore {
     rusty::Option<std::string> get(const std::string& key);
     void put(const std::string& key, const std::string& value);
     void remove(const std::string& key);
+    void begin_batch();
+    void end_batch();
 };
 
 
@@ -82,6 +86,12 @@ inline void RemoteKvStore::put(const std::string& key, const std::string& value)
 }
 
 inline void RemoteKvStore::remove(const std::string& key) {
+}
+
+inline void RemoteKvStore::begin_batch() {
+}
+
+inline void RemoteKvStore::end_batch() {
 }
 /*RUSTYCPP:GEN-END id=remote_kv_store.1*/
 
