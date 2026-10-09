@@ -14,9 +14,9 @@
 //
 // Each op runs a one-op STO transaction, so callers must be threads
 // registered with the transaction engine (abstract_db::thread_init), as
-// workers and RPC helpers are. The cluster bootstrap therefore never
-// lets its watcher or RPC-handler threads call this directly; they read
-// a mirror instead (cluster_bootstrap.cc, MirroredConfigStore).
+// workers and RPC helpers are. The cluster bootstrap therefore runs every
+// op on one engine-registered thread (cluster_bootstrap.cc,
+// ConfigTableStore) rather than on its watcher or RPC-handler threads.
 
 import cluster;   // config/sharding metadata module (was #include "cluster/...")
 #include "storage/abstract_ordered_index.h"
