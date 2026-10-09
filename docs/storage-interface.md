@@ -130,9 +130,10 @@ The cluster component's dependency on storage is a three-method
 `KvStore` port (`get`/`put`/`remove`, string keys, raw byte values).
 It is authored in this same DSL — a `pub trait KvStore` — and is in the
 `regen_storage_dsl.sh` FILES list, so the drift guard covers it. In
-production the port binds to the unified store via `OrderedIndexKvStore`
-(the `__mako_config__` system table on shard 0); tests bind an
-`InMemoryKvStore` fake. See
+production the port binds to the unified store through `ConfigTableStore`
+(`src/mako/cluster_bootstrap.cc`), which owns the `__mako_config__` table on
+shard 0 on one engine thread and commits each `begin_batch` / `end_batch`
+change as one transaction; tests bind an `InMemoryKvStore` fake. See
 [mako-book §3](mako-book.md#3-configuration-manager-master-shard) for
 the sharding design.
 

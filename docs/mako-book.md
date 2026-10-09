@@ -174,7 +174,7 @@ mako/
 
 ## 3. Configuration Manager (Master Shard)
 
-Mako uses **shard 0** as a dedicated **master shard** that stores system-wide configuration — cluster membership, shard topology, routing metadata — as regular replicated key-value entries. Config changes are ACID transactions with the same durability guarantees as application data.
+Mako uses **shard 0** as a dedicated **master shard** that stores system-wide configuration — cluster membership, shard topology, routing metadata — in a reserved table that shard 0 replicates through its Paxos log like application data. Each config change is one transaction.
 
 ### Why a Master Shard?
 
@@ -183,11 +183,11 @@ YAML config files define the initial cluster topology at first boot. Once the cl
 - Runtime config changes (adding shards, updating replicas) without editing files on every node and restarting.
 - A single, replicated source of truth that cannot drift between nodes.
 
-By storing config in shard 0 (replicated via Raft), config changes are:
+By storing config in shard 0 (replicated through shard 0's Paxos log), config changes are:
 - **Replicated** automatically — no separate replication path.
 - **Transactional** — atomic updates to membership and topology.
 - **Discoverable** — other shards bootstrap by reading from shard 0.
-- **Versioned** — automatic via Raft log index, enabling cache invalidation.
+- **Versioned** — every change bumps `__version__`, which watchers poll to invalidate their caches.
 
 ### Architecture
 
@@ -209,7 +209,7 @@ By storing config in shard 0 (replicated via Raft), config changes are:
               |  | node/s1/addr       | 10.0.1.1   |    |
               |  +--------------------+------------+    |
               |                                          |
-              |  Replicated via Raft (3+ replicas)       |
+              |  Replicated via shard 0's Paxos log      |
               +------------------------------------------+
                     |              |              |
               Shard 1         Shard 2        Clients
@@ -219,7 +219,7 @@ By storing config in shard 0 (replicated via Raft), config changes are:
 
 ### Config Table Schema
 
-All configuration lives in a reserved table `__mako_config__` on shard 0, accessed via the standard `ITable::Put/Get/Delete` API.
+All configuration lives in a reserved table `__mako_config__` on shard 0, with the reserved table id `mako::CONFIG_TABLE_ID` (200, shard 0's last; `open_index` never hands it out), so it is the same table on every shard-0 replica and replay lands its entries there. Other nodes read it over the `ConfigKvService` RPC (`ReadConfigKey`).
 
 | Key Pattern | Value | Description |
 |-------------|-------|-------------|
@@ -231,7 +231,7 @@ All configuration lives in a reserved table `__mako_config__` on shard 0, access
 | `shard/<id>/leader` | string | Current leader site name |
 | `shard/<id>/status` | string | `active`, `draining`, `adding`, `removing` |
 | `epoch` | uint64 | Global speculative epoch number (all shards converge to this) |
-| `shard/<id>/replacement` | uint32 | For `status=dead`: taker shard whose Raft group inherits routing that would hash to this shard. Chased transitively with a cycle guard. |
+| `shard/<id>/replacement` | uint32 | For `status=dead`: taker shard whose replica group inherits routing that would hash to this shard. Chased transitively with a cycle guard. |
 | `sharding/mode` | string | `hash` (default) or `range` — the routing mode Path A of `get_shard_for_key` uses when no per-table policy is registered |
 | `sharding/policy/<table>` | bytes | Serialized `TableShardingPolicy` for one table — its `KeyExtractor` plus a sorted vector of `RangeMapping`s. Absence means "fall back to `sharding/mode`". |
 | `node/<site>/addr` | string | Node address (`ip:port`) |
@@ -241,28 +241,30 @@ All configuration lives in a reserved table `__mako_config__` on shard 0, access
 
 ### Key Components
 
-**ConfigManager**: Typed configuration over a `KvStore` port (`get`/`put`/`remove`), not a bespoke store. Provides methods like `get_shard_replicas()`, `add_shard()`, `set_shard_leader()`, `advance_epoch()`. Every write increments `__version__` (written last). On shard 0's leader the port binds to the unified `FullOrderedIndex` — the `__mako_config__` system table — via the `OrderedIndexKvStore` adapter; other nodes bind a `RemoteKvStore` that reads shard 0 over RPC; unit tests bind an in-memory fake. The port keeps `cluster/` standalone-testable with no storage-engine dependency (see [The Storage Interface](storage-interface.md#cluster-metadata-port-srcclusterkv_storeh)).
+**ConfigManager**: Typed configuration over a `KvStore` port (`get`/`put`/`remove`), not a bespoke store. Provides methods like `get_shard_replicas()`, `add_shard()`, `set_shard_leader()`, `advance_epoch()`. Each change is one batch on the port (`begin_batch` / `end_batch`): its writes and the `__version__` bump, which a transactional store commits as one transaction; batches nest (`register_shard` runs `add_shard` inside its own). On the replica that serves shard 0's config the port binds to the `__mako_config__` table through `ConfigTableStore` (`src/mako/cluster_bootstrap.cc`), which commits each batch as one Mako transaction; other nodes bind a `RemoteKvStore` that reads shard 0 over RPC; unit tests bind an in-memory fake. The port keeps `cluster/` standalone-testable with no storage-engine dependency (see [The Storage Interface](storage-interface.md#cluster-metadata-port-srcclusterkv_storeh)).
 
 **ClusterConfig**: In-memory cache of the full cluster topology. Every node holds a local copy. Includes a `get_shard_for_key()` routing helper.
 
-**ConfigWatcher**: Background fiber on non-master shards. Polls shard 0's `__version__` key periodically (default: 1 second). On version change, fetches the full `ClusterConfig` and invokes a callback to update local routing.
+**ConfigWatcher**: Background thread on every node. Polls `__version__` (default: every second) — over RPC on most nodes, from its own store on the replica that serves the config. On a version change it reloads the full `ClusterConfig` and invokes a callback to update local routing.
 
 ### Bootstrap Protocol
 
-**First boot**: Shard 0 leader loads the static YAML config, populates `__mako_config__`, sets `__version__ = 1`. Other shards connect to shard 0 (via a static seed list: `--master-addrs=s1:8100,s2:8101,s3:8102`) and fetch the config.
+**First boot**: Shard 0's leader seeds `__mako_config__` from the shared shard config (`--shard-config`, the YAML file every process loads) in one transaction. Every other node finds shard 0's replicas in the same file and reads the config from whichever one serves it.
 
-**Subsequent boots**: Shard 0 recovers its Masstree from Raft log + snapshot. Config is immediately available from the replicated state — the original YAML is not re-read. Other shards fetch the latest version from shard 0.
+**Restart**: the config table's entries are in shard 0's replication log and in the leader's persisted log, like application data. dbtest does not reload tables from that log when it starts (`rocksdb_replay_app` replays it offline), so a restarted cluster re-seeds the config from the shard config file.
 
-**Runtime wiring** (`src/mako/cluster_bootstrap.cc`): `BootstrapClusterConfig(db)` runs once from `init_env()` after the RPC servers are up. It is the single seam that constructs and connects the read-side components on a live node, and is gated twice — no-op unless `MAKO_CLUSTER_CONFIG=1` **and** `nshards > 1` — so single-shard / unsharded runs keep the legacy routing path untouched. When active it branches on node identity (`BenchmarkConfig::getShardIndex/getLeaderConfig`):
+**Runtime wiring** (`src/mako/cluster_bootstrap.cc`): `BootstrapClusterConfig(db)` runs once from `init_env()` after the RPC servers are up. It is the single seam that constructs and connects the config components on a live node, and is gated twice — no-op unless `MAKO_CLUSTER_CONFIG=1` **and** `nshards > 1` — so single-shard / unsharded runs keep the legacy routing path untouched. When active it branches on node identity (`BenchmarkConfig::getShardIndex/getLeaderConfig`):
 
-- **Shard 0's leader** opens its `__mako_config__` index, wraps it in an `OrderedIndexKvStore`, seeds it from the shared shard config (`--shard-config`, the file every process loads: per shard its replicas, leader, status and replica addresses, leader first), primes and watches its own routing cache, and stands up a dedicated `ConfigKvService` RPC server.
-- **Every other node** (shard-0 followers + all non-zero shards) wraps a reconnecting RPC client to that service in a `RemoteKvStore`. A node that starts before shard 0 serves (shard 0's own followers usually do) retries every second instead of giving up.
+- **Shard 0's leader** seeds the config table from the shared shard config (per shard its replicas, leader, status and replica addresses, leader first) in one transaction, primes and watches its own routing cache, and serves the table over a dedicated `ConfigKvService` RPC server.
+- **Every other node** (shard-0 followers + all non-zero shards) reads it over RPC through a `RemoteKvStore` and watches it.
 
-Every node finds the service the same way: shard 0's preferred-leader host from the shared shard config, at `MAKO_CLUSTER_CONFIG_PORT` or 90 above that leader's base port. (The local Paxos config only describes the node's own shard, so it cannot locate shard 0, and the Paxos ports sit too high for a fixed offset.) If the endpoint cannot be determined safely the node logs an error and leaves the feature off. On shard 0's leader the store writes through to the Mako index and an in-memory mirror, and the leader's watcher and the service handler read only the mirror: an index op needs transaction-engine thread state, and the mirror keeps those two mostly idle threads from having to register with the engine. Writes must therefore come from an engine-registered thread; today the bootstrap thread is the only writer.
+**The config table.** One thread registered with the transaction engine owns the table on the serving replica (`ConfigTableStore`): an index op needs engine thread state, and the callers — the watcher, the RPC handler, the bootstrap — are not engine threads, so they hand each op to that thread. It runs with a reserved engine thread id (`MAX_THREADS - 1`; on a follower, replay threads take ids `0..nthreads-1` directly) and logs to shard 0's Paxos stream for partition 0, pushing each commit's entry at once (`TThread::push_log_each_commit`) instead of waiting for a full batch. So shard 0's followers replay the table like any other — a change travels as one log entry and arrives whole or not at all — and the leader persists it with the rest of its log. A removal is stored as a marker value, because replay turns a deleted key into a tombstone value rather than removing it.
 
-Both sides then run a `ConfigWatcher` that keeps the local `janus::get_cluster_config()` routing cache fresh. Routing (`compute_shard_for_key`) still places a key by table — the `ShardingPolicyCache`, else the table-ID home shard — and uses the config only for tables that have their own policy in it and to follow dead-shard replacement pointers; the `sharding/mode` hash default is not applied, because Mako does not place data by key hash. Every worker routes every remote key, so the router reads the config through lock-free routing hints (populated / has table policies / has a dead shard) that `ClusterConfig` republishes under its mutex on each change, and takes the mutex only when a policy or a dead shard exists. On a two-shard TPC-C bench (3 workers per shard) the per-key mutex had no measurable cost either way: throughput and commit-latency p50/p95/p99 match the config-off runs. Functional verification needs a live multi-shard cluster, e.g. `./docker_build.sh ci shard2Replication` with `MAKO_CLUSTER_CONFIG=1`.
+**Finding shard 0, and failover.** Every shard-0 replica has a config endpoint, derived the same way on every node from the shared shard config: the replica's base port + 90 (each shard and role has its own block of 100 ports, and a process's servers use the first `warehouses + rpc servers + 5`), or `MAKO_CLUSTER_CONFIG_PORT` plus its position in shard 0's replica list. If an endpoint cannot be determined safely the node logs an error and leaves the feature off. Remote nodes try the endpoints in turn, starting with the last one that answered; a replica that does not lead shard 0 does not listen. When a replica becomes shard 0's leader after startup — the Paxos learner takeover; the p1 takeover and Raft's "became leader" callback are wired too but not exercised — `PromoteClusterConfigLeader` stops its remote watcher, names itself shard 0's leader in its replicated copy of the table (a write that moves `__version__`, so every watcher reloads) and serves it; if no complete copy arrived, it re-seeds from the shard config. With shard 0's leader killed on the two-shard TPC-C setup, the learner served the replicated config about 2.4 s after the kill and every other node read it within about 3.6 s. A watcher that cannot read shard 0 keeps the config it has: a load is accepted only when `__version__` is nonzero and unchanged across it.
 
-**Current limits.** The wiring runs only in replicated mode (`init_env()` has no database to hand it otherwise). The config table is written only on shard 0's leader and is neither replicated nor persisted, so a shard-0 failover or restart loses it until the next bootstrap, and nothing serves config after a failover. The write side described below (`register_shard` and the other shardmaster commands) has no runtime caller yet.
+**Routing.** Every node's `ConfigWatcher` keeps its `janus::get_cluster_config()` routing cache fresh. Routing (`compute_shard_for_key`) still places a key by table — the `ShardingPolicyCache`, else the table-ID home shard — and uses the config only for tables that have their own policy in it and to follow dead-shard replacement pointers; the `sharding/mode` hash default is not applied, because Mako does not place data by key hash. Every worker routes every remote key, so the router reads the config through lock-free routing hints (populated / has table policies / has a dead shard) that `ClusterConfig` republishes under its mutex on each change, and takes the mutex only when a policy or a dead shard exists. On a two-shard TPC-C bench (3 workers per shard) the per-key mutex had no measurable cost either way: throughput and commit-latency p50/p95/p99 match the config-off runs. Functional verification needs a live multi-shard cluster, e.g. `./docker_build.sh ci shard2Replication` with `MAKO_CLUSTER_CONFIG=1`.
+
+**Current limits.** The wiring runs only in replicated mode (`init_env()` has no database to hand it otherwise). Nothing writes the config at runtime yet: the only config RPC is `ReadConfigKey`, and the shardmaster commands below have no RPC caller. A config write counts as done once it is committed and handed to Paxos, like any speculative transaction, so one in flight when shard 0's leader fails is lost. A full restart re-seeds the config (see Restart above).
 
 ### Config Change Protocol
 
@@ -270,7 +272,7 @@ All config changes are regular transactions on shard 0:
 
 1. A joining shard calls `ConfigManager::register_shard(replicas)`; the master allocates its id from `next_shard_id` and returns it.
 2. ConfigManager begins a transaction, writes `shard/<id>/replicas`, advances `next_shard_id`, increments `shard_count` and `__version__`.
-3. Transaction commits (replicated via Raft).
+3. Transaction commits; shard 0's Paxos log replicates it as one entry.
 4. ConfigWatcher on other shards detects the version bump, fetches the new config.
 5. Shard router updates routing table.
 
@@ -312,9 +314,9 @@ The full schema (KeyExtractor types, RangeMapping serialization, TableShardingPo
 
 #### Where the sharding policy lives
 
-The policy is **not** stored in a separate metadata service. It lives in the same `__mako_config__` system table on shard 0, under the `sharding/policy/<table>` key prefix — one key per table. Every shard and every client fetches the policy through **the standard KV interface** (`ITable::Get`), pointed at shard 0.
+The policy is **not** stored in a separate metadata service. It lives in the same `__mako_config__` system table on shard 0, under the `sharding/policy/<table>` key prefix — one key per table. Every node fetches it through the same `KvStore` port as the rest of the config (the `ReadConfigKey` RPC to shard 0).
 
-The one thing that has to be special-cased is *how you find shard 0 in the first place*. `__mako_config__` is **pinned to shard 0** by convention: any lookup against this table skips the normal hash routing and goes straight to shard 0's current leader (whose address the node knows from the initial YAML seed list). There is no chicken-and-egg problem because you know shard 0 before you know anything else.
+The one thing that has to be special-cased is *how you find shard 0 in the first place*. `__mako_config__` is **pinned to shard 0** by convention: any lookup against this table skips the normal routing and goes straight to shard 0, whose replicas the node knows from the shared shard config; it reads from whichever replica serves the config. There is no chicken-and-egg problem because you know shard 0 before you know anything else.
 
 Everything else flows from this:
 
@@ -323,15 +325,15 @@ Everything else flows from this:
 - If `__version__` bumped, the client re-fetches every table policy it cares about.
 - If the client has no cached policy for `T`, it uses the default `sharding/mode` (hash or range) plus `shard_count`.
 
-Because the storage medium is just replicated KV, everything about the policy is already **versioned, transactional, and durable** — no separate config-service RPC, no separate replication path.
+Because the storage medium is the replicated config table, everything about the policy is already **versioned and transactional**, and replicated with no separate replication path.
 
 #### Cache invalidation: version bumps + wrong-shard errors
 
 Two mechanisms keep every node's routing table converging on the current policy.
 
-**Version-based polling (background, sub-second staleness).** Each node runs a `ConfigWatcher` fiber. It calls `ITable::Get(__mako_config__, __version__)` on shard 0's leader, default every 1 second. When the returned version differs from its cached value, the watcher refreshes the cluster topology and every registered per-table policy, then invokes update callbacks so anything that depends on routing (client shard picker, coordinator, gossip) can react.
+**Version-based polling (background, sub-second staleness).** Each node runs a `ConfigWatcher` thread. It reads `__version__` from shard 0's serving replica, default every second. When the returned version differs from its cached value, the watcher refreshes the cluster topology and every registered per-table policy, then invokes update callbacks so anything that depends on routing (client shard picker, coordinator, gossip) can react.
 
-**Wrong-shard errors (foreground, single-request recovery).** Any shard that receives an RPC for a key it doesn't own returns a `WrongShard` error containing the `__version__` it thinks is current. The caller compares that version to its cached one:
+**Wrong-shard errors (foreground, single-request recovery).** *Design — not built: today the shard servers reject requests from an older epoch (`ShardReceiver`, `src/mako/lib/server.cc`), not requests for keys they don't own.* Any shard that receives an RPC for a key it doesn't own returns a `WrongShard` error containing the `__version__` it thinks is current. The caller compares that version to its cached one:
 
 - Caller's version is behind: refresh immediately, retry the RPC against the shard the new policy resolves to.
 - Caller's version is equal to or ahead of the shard's: means the caller is right about routing and the shard is stale. Wait briefly and retry — the shard's own `ConfigWatcher` will catch up in <1 second.
@@ -340,10 +342,10 @@ This is the "moved, retry" pattern from the resharding survey (`docs/reference/r
 
 #### Master API: the shardmaster commands
 
-Cluster-lifecycle changes are exposed as RPCs on **every shard**, not just shard 0, so a client (or an operator's admin CLI) can issue them on any node without knowing which shard is the master:
+*Design — the RPCs are not built yet: the only config RPC today is `ReadConfigKey`, and a ✅ below means the `ConfigManager` verb exists.* Cluster-lifecycle changes are exposed as RPCs on **every shard**, not just shard 0, so a client (or an operator's admin CLI) can issue them on any node without knowing which shard is the master:
 
 - **Non-shard-0 nodes** implement each RPC as a **forwarder**: they hold a client connection to shard 0's current leader and re-issue the RPC there. Return values propagate straight back.
-- **Shard 0's leader** implements the RPC as the actual mutation — it invokes the corresponding `ConfigManager` verb, which writes the atomic Raft batch to `__mako_config__`. Every write bumps `__version__`, which every other node's `ConfigWatcher` picks up.
+- **Shard 0's leader** implements the RPC as the actual mutation — it invokes the corresponding `ConfigManager` verb, which commits the change to `__mako_config__` as one transaction. Every write bumps `__version__`, which every other node's `ConfigWatcher` picks up.
 
 The command surface (✅ implemented today · 🟡 partial · ⬜ not yet built):
 
@@ -398,7 +400,7 @@ The router lives entirely inside `ClusterConfig`. `ClusterConfig::get_shard_for_
 
 Callers are in `src/cluster/` — `shard_router.{h,cc}` is the public dispatcher; `sharding_policy.h`, `sharding_policy_cache.h`, `sharding_policy_builder.h` are the pure data types, cache, and fluent builder respectively.
 
-`compute_shard_for_key(table_id, key)` (`shard_router.cc`) consults a **process-global `ClusterConfig`** (`janus::get_cluster_config()`, populated by the `ConfigWatcher`'s update callback) as the single source of truth once it has a nonzero `shard_count` — resolving the `table_id` to a table name via `TableRegistry` and delegating to `ClusterConfig::get_shard_for_key(table, key)`. Until the watcher populates that global (i.e. before the shard-0 config path is wired at a node), the router falls back to the legacy `ShardingPolicyCache` and, failing that, the table-ID heuristic `(table_id - 1) / NUM_TABLES_PER_SHARD`. This gate means the `ClusterConfig`-based path is a no-op until wired in, so it can land ahead of the runtime bootstrap without changing behavior.
+`compute_shard_for_key(table_id, key)` (`shard_router.cc`) places a key by table — the legacy `ShardingPolicyCache`, else the table-ID heuristic `(table_id - 1) / NUM_TABLES_PER_SHARD` — and consults the **process-global `ClusterConfig`** (`janus::get_cluster_config()`, populated by the `ConfigWatcher`) for two things only: a table with its own policy in the config routes by `ClusterConfig::get_shard_for_key(table, key)`, and every result follows dead-shard `replacement` pointers. The config's `sharding/mode` default is not applied, because Mako does not place data by key hash (see Runtime wiring). Until the watcher populates the config, routing is unchanged.
 
 The byte-key path (`compute_shard_for_key`) hard-codes the "first 8 bytes, big-endian" decoding for `FIELD_INDEX`; callers whose sharding field isn't at offset 0 should use `compute_shard_for_key_value` with the value pre-extracted.
 
@@ -406,7 +408,7 @@ For expected cross-shard ratios under TPC-C (the canonical benchmark), see `docs
 
 ### Data Migration Protocol (Online Resharding)
 
-Moving a key range (or hash bucket) from a **source** shard to a **destination** shard is the primitive under `move_range`, `remove_shard`/`drain_shard`, `rebalance`, and `set_sharding_policy`. Mako does it **online** — the source keeps serving the range until the very last moment — with a long background bulk copy followed by a short two-phase-commit cutover. Shard 0 (the master) is the coordinator; the source and destination are the participants. All phase state lives in `reshard/*` keys on `__mako_config__`, so it is replicated and crash-recoverable like any other config.
+*Design — not built yet (see the command status above).* Moving a key range (or hash bucket) from a **source** shard to a **destination** shard is the primitive under `move_range`, `remove_shard`/`drain_shard`, `rebalance`, and `set_sharding_policy`. Mako does it **online** — the source keeps serving the range until the very last moment — with a long background bulk copy followed by a short two-phase-commit cutover. Shard 0 (the master) is the coordinator; the source and destination are the participants. All phase state lives in `reshard/*` keys on `__mako_config__`, so it is replicated and crash-recoverable like any other config.
 
 Besides the master's global view, **each shard also keeps a small piece of local metadata**: the set of key ranges it is currently in charge of, and — for any migration it is participating in — its role (source or destination), the stage (copying vs. locked), and the attempt's generation. This participant-local state is what lets a shard reject a request for a key it no longer owns (a `WrongShard` error), freeze *its* range at LOCK, and cast its own prepare vote — without consulting the master on every request.
 
@@ -414,7 +416,7 @@ Besides the master's global view, **each shard also keeps a small piece of local
 - The source serves reads *and* writes for the range throughout the (potentially long) bulk copy — no availability hit while the data moves.
 - **No lost writes**: writes that arrive during the copy are captured and applied before cutover.
 - The unavailability window is bounded to the *final delta* (small), not the whole dataset.
-- Crash-recoverable: every phase transition is a durable, versioned Raft write on shard 0, so a coordinator or participant crash resumes or aborts cleanly.
+- Crash-recoverable: every phase transition is a versioned transaction on shard 0's replicated config table, so a coordinator or participant crash resumes or aborts cleanly.
 
 ```
              PREPARE            LOCK            COMMIT
@@ -427,7 +429,7 @@ Besides the master's global view, **each shard also keeps a small piece of local
           (async, online)   (stop the range)  (version bump)
 ```
 
-**Phase 0 — PREPARE (intent).** The master writes the migration intent in one atomic Raft batch — `reshard/active=1`, `reshard/src`, `reshard/dst`, `reshard/range=[lo,hi)`, `reshard/phase=copy` — bumping `__version__`. From here the operation is durable: a master crash re-reads the intent and resumes. The routing assignment still points at the **source**; the range is merely flagged *migrating*.
+**Phase 0 — PREPARE (intent).** The master writes the migration intent in one config transaction — `reshard/active=1`, `reshard/src`, `reshard/dst`, `reshard/range=[lo,hi)`, `reshard/phase=copy` — bumping `__version__`. From here the operation is durable: a master crash re-reads the intent and resumes. The routing assignment still points at the **source**; the range is merely flagged *migrating*.
 
 **Phase 1 — BACKGROUND COPY (source live).** The destination pulls a consistent snapshot of the range from the source and bulk-loads it, in the background. Meanwhile the source **keeps serving reads and writes** for the range. Writes that land on the range after the snapshot point are captured as a **delta** — the source dual-writes them into a change buffer the destination tails — so the destination converges toward the source. A **deletion is a tombstone** in that delta (a "null write"), so a key removed after the snapshot is propagated as a positive fact — the destination learns the key is *gone*, not merely "not copied." This phase is unbounded in time and fully online. It ends when the destination has caught up to "most of the data" (the outstanding delta is small).
 
@@ -445,7 +447,7 @@ This is the *only* window where the range is unavailable, and it covers just the
 
 **Stale votes are fenced by a generation.** Each migration attempt carries a monotonic **generation** id, and every prepare-ack the master accepts must match the current one. So if a timed-out participant's ack arrives *after* the master has already aborted (or moved on to a new attempt), the master sees a superseded generation and **ignores it** — a late "prepared" can never resurrect an aborted migration or wrongly count toward a later one. This is the classic 2PC coordinator rule: once the coordinator decides ABORT, no delayed vote can flip it.
 
-**Crash recovery.** The `reshard/*` keys (Raft-replicated on shard 0) are authoritative. On master restart mid-migration: `phase=copy` → restart the copy (idempotent — re-snapshot); `phase=lock`/`final_sync` → roll forward (re-run final sync + commit) or abort; `phase=committed` → finish cleanup. A participant crash during COPY just restarts the copy; during LOCK the master aborts and the source resumes, since no commit was reached.
+**Crash recovery.** The `reshard/*` keys (replicated through shard 0's log) are authoritative. On master restart mid-migration: `phase=copy` → restart the copy (idempotent — re-snapshot); `phase=lock`/`final_sync` → roll forward (re-run final sync + commit) or abort; `phase=committed` → finish cleanup. A participant crash during COPY just restarts the copy; during LOCK the master aborts and the source resumes, since no commit was reached.
 
 **How the master commands use it.**
 - `move_range(table, range, from, to)` — one migration, `from`→`to`.
@@ -459,11 +461,13 @@ Only the COMMIT of each migration bumps the routing version, so clients observe 
 
 The CM orchestrates recovery when a shard leader fails mid-speculation (Section 5.2 of the Mako paper).
 
-**Replication as a blind log layer.** The paper uses Paxos for replication, but our implementation uses Raft. This distinction does not matter for speculation recovery — both Paxos and Raft are treated as a **blind replicated log**. The speculative execution layer sits above the log layer, and epochs are managed independently of the consensus protocol.
+**Replication as a blind log layer.** Mako replicates with Multi-Paxos, as in the paper; Raft is an alternative mode (`ab: raft` in the replication config). This distinction does not matter for speculation recovery — both Paxos and Raft are treated as a **blind replicated log**. The speculative execution layer sits above the log layer, and epochs are managed independently of the consensus protocol.
 
-**Epochs.** Mako groups replicated log entries into **epochs**. An epoch is a **global** number — all shards converge to the same epoch during normal operation. The CM maintains the current epoch in the config table (`epoch`). A lagging shard may temporarily be on an older epoch, but it will catch up. When an epoch advances, the CM writes an **AdvanceSpecEpoch entry** to the Raft replicated log on shard 0. This entry is replicated to all shard 0 followers, and ConfigWatchers on other shards detect the version change.
+**Epochs.** Mako groups replicated log entries into **epochs**. An epoch is a **global** number — all shards converge to the same epoch during normal operation. The CM maintains the current epoch in the config table (`epoch`). A lagging shard may temporarily be on an older epoch, but it will catch up. When an epoch advances, the CM writes an **AdvanceSpecEpoch entry** to shard 0's replicated log. This entry is replicated to all shard 0 followers, and ConfigWatchers on other shards detect the version change.
 
-**Explicit epoch advance in the Raft log.** When the CM decides to advance the epoch (e.g., on leader failure), it does not just update a config key — it explicitly inserts an `AdvanceSpecEpoch(new_epoch)` entry into the Raft log. This ensures:
+*Design — not built: there is no `AdvanceSpecEpoch` entry and no CM-driven recovery today. When a shard leader fails, the shard's learner notices the missing heartbeat, takes over, closes the old epoch with no-op log entries and advances the epoch itself (`paxos_main_helper.cc`, `mako.hh`).*
+
+**Explicit epoch advance in the replicated log.** When the CM decides to advance the epoch (e.g., on leader failure), it does not just update a config key — it explicitly inserts an `AdvanceSpecEpoch(new_epoch)` entry into shard 0's replicated log. This ensures:
 - The epoch advance is **ordered** relative to other config changes in the log.
 - The epoch advance is **durable** — it survives CM crashes.
 - All replicas of shard 0 see the epoch advance in the same position in the log.
@@ -471,13 +475,13 @@ The CM orchestrates recovery when a shard leader fails mid-speculation (Section 
 
 **Recovery protocol.** When the CM detects a shard leader failure:
 
-1. **Advance epoch**: CM inserts `AdvanceSpecEpoch(epoch+1)` into the Raft log. Once committed, the new epoch is broadcast to all shards via ConfigWatcher polling.
+1. **Advance epoch**: CM inserts `AdvanceSpecEpoch(epoch+1)` into shard 0's log. Once committed, the new epoch is broadcast to all shards via ConfigWatcher polling.
 
 2. **Close old epoch on failed shard**: New leader retrieves replicated entries from peers, re-commits them, and issues no-ops for unrecoverable entries. Replicates an **INF shard clock** to signal epoch closure.
 
 3. **Close old epoch on healthy shards**: Healthy shards finish old-epoch work and replicate their own INF entries.
 
-4. **Global finalized watermark**: Each shard computes its finalized shard watermark (min clock across its Raft streams). The CM collects these and computes the global watermark = min across all shards — a single scalar timestamp providing a consistent global cutoff.
+4. **Global finalized watermark**: Each shard computes its finalized shard watermark (min clock across its log streams). The CM collects these and computes the global watermark = min across all shards — a single scalar timestamp providing a consistent global cutoff.
 
 5. **Rollback**: Speculative transactions above the global watermark that depended on lost transactions are rolled back. Unaffected transactions on healthy shards proceed normally.
 
@@ -492,10 +496,10 @@ This is conservative (may slightly delay visibility) but correct and scales to t
 
 ### Consistency Guarantees
 
-- **Config writes**: Serializable (regular transactions on shard 0, replicated via Raft).
-- **Config reads**: Linearizable from shard 0 leader, or eventually-consistent from watchers (bounded by poll interval).
-- **Version monotonicity**: Watchers only apply configs with strictly higher versions.
-- **Epoch ordering**: Epoch advances are ordered in the Raft log, ensuring all replicas agree on epoch transitions. The epoch is global — all shards converge to the same number.
+- **Config writes**: one transaction per change on shard 0's config table, from a single writer (the replica that serves the config), replicated through shard 0's Paxos log.
+- **Config reads**: a watcher reads key by key and accepts a load only when `__version__` is unchanged across it, so it sees whole changes; staleness is bounded by the poll interval.
+- **Version monotonicity**: watchers reload when `__version__` changes, and a promoted replica continues the version above the last one it saw, so versions only increase across a failover.
+- **Epoch ordering** (design): epoch advances are ordered in shard 0's log, ensuring all replicas agree on epoch transitions. The epoch is global — all shards converge to the same number.
 
 ---
 
@@ -658,7 +662,7 @@ With N replicas, Mako tolerates floor(N/2) failures:
 
 ### Replicated RocksDB (Raft State Machine)
 
-The Configuration Manager (Section 3) needs a **durable, replicated key-value store**. Rather than building a bespoke solution, Mako layers RocksDB on top of the Raft consensus module as a generic **replicated state machine**. This same pattern can serve any component that needs strongly-consistent replicated storage.
+Mako layers RocksDB on top of the Raft consensus module as a generic **replicated state machine** (`ReplicatedDB`, enabled with `MAKO_REPLICATED_DB=1`) for any component that needs strongly-consistent replicated storage. The Configuration Manager (Section 3) used it until it moved to the `__mako_config__` Mako table; see the end of this section.
 
 #### Architecture
 
@@ -726,17 +730,9 @@ class ReplicatedDB {
 };
 ```
 
-#### Configuration Manager Integration
+#### Configuration Manager (no longer stored here)
 
-The Config Manager (Section 3) uses `ReplicatedDB` as its storage backend on shard 0:
-
-- `ConfigManager::Put/Get` delegate to `ReplicatedDB::Put/Get`
-- Config keys (`__version__`, `shard/<id>/replicas`, etc.) are regular RocksDB keys
-- Config changes are Raft-replicated writes — no separate replication path
-- On leader failure, the new leader's RocksDB has the same committed state
-- Snapshot/recovery uses RocksDB checkpoints instead of log replay
-
-This means the `__mako_config__` table from Section 3 is physically stored in a RocksDB instance that is replicated via Raft.
+The Config Manager (Section 3) used to keep its keys in `ReplicatedDB` on shard 0. It now stores them in the `__mako_config__` Mako table on shard 0, behind the `KvStore` port (`src/cluster/kv_store.h`), and that table is replicated through shard 0's Paxos log like application data — see Section 3, "Runtime wiring". `ReplicatedDB` itself remains for its own tests.
 
 ---
 
@@ -1309,7 +1305,7 @@ perf report
 | **Leader** | Replica that proposes values and coordinates consensus |
 | **Local Timestamp** | Per-partition timestamp of most recently committed transaction |
 | **Mako** | Speculative distributed transaction system (named for the fast mako shark) |
-| **Master Shard** | Shard 0 — stores cluster configuration in `__mako_config__` table, replicated via Raft/Paxos |
+| **Master Shard** | Shard 0 — stores cluster configuration in the `__mako_config__` table, replicated through shard 0's Paxos log |
 | **Masstree** | In-memory concurrent B+tree storage engine |
 | **Multi-Paxos** | Optimized Paxos with stable leader skipping prepare phase |
 | **NO-OP** | Heartbeat/sync log entry in Paxos that triggers watermark computation |
