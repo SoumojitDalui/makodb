@@ -1833,6 +1833,12 @@ public:
     }
 
     int available_table_id = __sync_fetch_and_add(&availableTable_id[shard_index], 1);
+    if (available_table_id == mako::CONFIG_TABLE_ID) {
+      std::cout << "Table id " << available_table_id << " is reserved for the cluster-config table; "
+                << "shard 0 can open at most " << (mako::CONFIG_TABLE_ID - 1) << " tables (opening "
+                << name << ")" << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
 
     // table-id is between [shard_index*mako::NUM_TABLES_PER_SHARD+1, shard_index*mako::NUM_TABLES_PER_SHARD+1+mako::NUM_TABLES_PER_SHARD]
     if (!(available_table_id >= shard_index*mako::NUM_TABLES_PER_SHARD+1 
