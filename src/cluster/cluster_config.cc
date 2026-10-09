@@ -188,6 +188,7 @@ bool cc_load_from_cm(ClusterConfigState& s, ConfigManager* cm) {
     const uint64_t ver = cm->get_version();
     if (ver == 0) return false;
     uint32_t count = cm->get_shard_count();
+    if (count == 0) return false;   // no topology, or shard_count read failed
     uint64_t ep = cm->get_epoch();
     // c529cd3d: BTreeMap has no default ctor; construct explicitly.
     btree_port::BTreeMap<uint32_t, ShardInfo> new_shards =

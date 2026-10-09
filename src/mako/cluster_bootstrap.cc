@@ -2,6 +2,7 @@
 
 #include <stdlib.h>  // getenv, strtol, atol
 #include <string.h>  // strcmp
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -20,6 +21,7 @@
 #include "benchmarks/benchmark_config.h"   // BenchmarkConfig, transport::Configuration
 #include "lib/common.h"                    // mako::CONFIG_TABLE_ID
 #include "sto/function_pool.h"             // actual_directs (Masstree thread init), TThread
+#include "deptran/replication_helper.h"    // get_epoch
 
 import cluster;   // config/sharding metadata module (was #include "cluster/...")
 
@@ -470,7 +472,11 @@ private:
     // crashed but is still writing its core keeps its listening socket open
     // and times out every read. So state is logged on read outcomes, once
     // per transition, not on each connect. The next pass starts with the
-    // next replica, where a newly promoted leader would be.
+    // next replica, where a newly promoted leader would be, and waits one
+    // reconnect interval: a load must read every key over one connection,
+    // and reconnecting at once would let a load that missed one key carry
+    // on and still see a matching __version__ at the end. Waiting makes the
+    // rest of the load fail, so ClusterConfig rejects it.
     void drop() {
         if (serving_) {
             srpc::Log_warn("BootstrapClusterConfig: lost shard-0 config at {}; trying shard 0's "
@@ -483,6 +489,7 @@ private:
             client_ = rusty::None;
         }
         cur_ = (cur_ + 1) % addrs_.size();
+        next_attempt_ = std::chrono::steady_clock::now() + kConfigReconnectInterval;
     }
 
     std::vector<std::string> addrs_;   // shard 0's replicas, preferred leader first
@@ -618,11 +625,11 @@ void BootstrapClusterConfig(abstract_db* db) {
     g_cfg_active = true;
 }
 
+// The promotion itself; see PromoteClusterConfigLeader.
 // @unsafe - stops the remote watcher, storage index, RPC server bind, background threads
-void PromoteClusterConfigLeader() {
+static void PromoteNow() {
     std::lock_guard<std::mutex> lock(g_cfg_mu);
     if (!g_cfg_active || g_cfg_leading) return;
-    if (BenchmarkConfig::getInstance().getShardIndex() != 0) return;  // only shard 0 serves
 
     const std::string me = MyReplicaName();
     const ConfigEndpoint* mine = FindEndpoint(me);
@@ -649,11 +656,17 @@ void PromoteClusterConfigLeader() {
     // table is complete; this replica then only names itself shard 0's
     // leader. Otherwise (promoted before the seed replicated) it rebuilds
     // the config from the shared shard config. Either way the version
-    // continues above every one a watcher has seen, so all of them reload.
+    // continues above every one this replica has seen and above the new
+    // epoch shifted into the high half: each failover advances the Paxos
+    // epoch, so two promoted leaders never use the same version, even when
+    // an earlier one's writes never reached this replica. Every watcher
+    // then sees a version it has not loaded and reloads.
     const uint64_t replicated = cm->get_version();
     const bool complete = replicated > 0 && cm->get_shard_count() > 0;
+    const uint64_t epoch_floor = static_cast<uint64_t>(::get_epoch()) << 32;
+    const uint64_t base = std::max({last_seen, replicated, epoch_floor});
     g_cfg_store->begin_batch();   // one transaction
-    if (last_seen > replicated) g_cfg_store->put("__version__", std::to_string(last_seen));
+    if (base > replicated) g_cfg_store->put("__version__", std::to_string(base));
     if (complete) {
         cm->set_shard_leader(0, me);
     } else {
@@ -666,6 +679,18 @@ void PromoteClusterConfigLeader() {
                    "(version {}; replicated version {}, last seen {})", me.c_str(),
                    complete ? "replicated" : "re-seeded", get_cluster_config().get_version(),
                    replicated, last_seen);
+}
+
+// Called on a failover callback thread (the Paxos takeover), which must not
+// wait: stopping the old watcher can take a poll interval plus an RPC
+// timeout. So the promotion runs on its own thread, once per process.
+// @unsafe - background thread
+void PromoteClusterConfigLeader() {
+    if (!cluster_config_enabled()) return;
+    if (BenchmarkConfig::getInstance().getShardIndex() != 0) return;  // only shard 0 serves
+    static std::atomic<bool> requested{false};
+    if (requested.exchange(true)) return;
+    std::thread(PromoteNow).detach();
 }
 
 }  // namespace janus
