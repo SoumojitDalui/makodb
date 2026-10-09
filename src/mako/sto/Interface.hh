@@ -64,6 +64,10 @@ public:
     // it is just for the transaction counter
     static __thread int increment_id;
     static __thread bool is_worker_leader;
+    // Push this thread's Paxos log batch at every commit instead of when it
+    // fills. For a thread that commits rarely and must not leave entries
+    // waiting (the cluster-config table thread); workers leave it false.
+    static __thread bool push_log_each_commit;
 
     static void set_mode(int mode) {
         the_mode = mode;
