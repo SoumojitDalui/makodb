@@ -196,6 +196,23 @@ TEST_F(ConfigManagerTest, ClusterConfigLoadPublishesRoutingHints) {
     EXPECT_EQ(cc.resolve_live_shard(1), 0u);
 }
 
+// An unreachable remote store reads as empty. Loading it must keep the
+// config already loaded, which the router keeps routing by, not clear it.
+TEST_F(ConfigManagerTest, ClusterConfigKeepsConfigWhenStoreReadsEmpty) {
+    ASSERT_TRUE(cm_.add_shard(0, {"a"}));
+    ASSERT_TRUE(cm_.add_shard(1, {"b"}));
+    ClusterConfig cc = ClusterConfig::new_();
+    ASSERT_TRUE(cc.load_from_config_manager(&cm_));
+    const uint64_t v = cc.get_version();
+
+    InMemoryKvStore gone;   // every key absent, as an unreachable store reads
+    ConfigManager unreachable{&gone};
+    EXPECT_FALSE(cc.load_from_config_manager(&unreachable));
+    EXPECT_EQ(cc.get_shard_count(), 2u);
+    EXPECT_EQ(cc.get_version(), v);
+    EXPECT_EQ(cc.routing_hints(), CC_HINT_POPULATED);
+}
+
 TEST_F(ConfigManagerTest, ClusterConfigLoadFromNullManagerFails) {
     ClusterConfig cc = ClusterConfig::new_();
     EXPECT_FALSE(cc.load_from_config_manager(nullptr));
@@ -218,6 +235,45 @@ TEST_F(ConfigManagerTest, ClusterConfigShardForKeyIsStable) {
 // ===========================================================================
 // ConfigWatcher
 // ===========================================================================
+
+// A KvStore that can be switched to read as unreachable (every key absent),
+// like a RemoteKvStore whose shard-0 replica went away.
+class SwitchableKvStore : public KvStore {
+ public:
+    explicit SwitchableKvStore(KvStore* inner) : inner_(inner) {}
+    ~SwitchableKvStore() noexcept override {}
+    rusty::Option<std::string> get(const std::string& key) override {
+        if (down) return rusty::None;
+        return inner_->get(key);
+    }
+    void put(const std::string& key, const std::string& value) override { inner_->put(key, value); }
+    void remove(const std::string& key) override { inner_->remove(key); }
+    bool down = false;
+ private:
+    KvStore* inner_;
+};
+
+// While the store is unreachable the watcher keeps the last config, and it
+// loads the next one once the store answers again.
+TEST_F(ConfigManagerTest, WatcherKeepsConfigWhileStoreIsUnreachable) {
+    ASSERT_TRUE(cm_.add_shard(0, {"a"}));
+    SwitchableKvStore store(&kv_);
+    ConfigManager remote{&store};
+    ClusterConfig local = ClusterConfig::new_();
+    auto watcher = ConfigWatcher::new_(&remote, &local, /*poll_interval_ms=*/1000);
+    EXPECT_TRUE(watcher.poll());
+    const uint64_t v = local.get_version();
+
+    store.down = true;
+    EXPECT_FALSE(watcher.poll());
+    EXPECT_EQ(local.get_shard_count(), 1u);
+    EXPECT_EQ(local.get_version(), v);
+
+    store.down = false;
+    ASSERT_TRUE(cm_.add_shard(1, {"b"}));
+    EXPECT_TRUE(watcher.poll());
+    EXPECT_EQ(local.get_shard_count(), 2u);
+}
 
 TEST_F(ConfigManagerTest, WatcherPollDetectsVersionBump) {
     ASSERT_TRUE(cm_.add_shard(0, {"a"}));
