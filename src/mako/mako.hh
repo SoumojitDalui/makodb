@@ -626,6 +626,7 @@ static void setup_transport_callbacks()
         // 5. start the worker threads 
         // change the membership
         upgrade_p1_to_leader();
+        janus::PromoteClusterConfigLeader();  // no-op unless shard 0 with MAKO_CLUSTER_CONFIG
 
         string log = "no-ops:" + to_string(get_epoch());
         auto& benchConfig = BenchmarkConfig::getInstance();
@@ -655,6 +656,10 @@ static void setup_leader_election_callbacks()
     // happens on the learner for case 0 and case 2, 3
     uint32_t aa = mako::getCurrentTimeMillis();
     Warning("Receive a control command:%d, current ms: %llu", control, aa);
+    if (janus::is_using_raft() && control == 1) {
+      // Raft: became leader. Shard 0's new leader serves the cluster config.
+      janus::PromoteClusterConfigLeader();
+    }
     switch (control) {
 #if defined(FAIL_NEW_VERSION) && !defined(MAKO_USE_RAFT)
       case 0: {
@@ -674,6 +679,9 @@ static void setup_leader_election_callbacks()
           // Raft: Became leader - no action needed, Raft handles internally
           break;
         }
+        // This learner is its shard's new leader; on shard 0 it serves the
+        // cluster config from now on.
+        janus::PromoteClusterConfigLeader();
         // Wait for FVW in the old epoch (w * 10 + epoch); this is very important in our new implementation
         // Single timestamp system: collect all shard watermarks and use maximum
         uint32_t max_watermark = 0;
@@ -746,6 +754,7 @@ static void setup_leader_election_callbacks()
         break;
       }
       case 3: {  // COMMIT
+        janus::PromoteClusterConfigLeader();  // no-op unless shard 0 with MAKO_CLUSTER_CONFIG
         std::lock_guard<std::mutex> lk((sync_util::sync_logger::m));
         sync_util::sync_logger::toLeader = true ;
         std::cout << "notify a new leader is elected!\n" ;
