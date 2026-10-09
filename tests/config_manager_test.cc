@@ -213,6 +213,66 @@ TEST_F(ConfigManagerTest, ClusterConfigKeepsConfigWhenStoreReadsEmpty) {
     EXPECT_EQ(cc.routing_hints(), CC_HINT_POPULATED);
 }
 
+// Records the order of store calls, to check how ConfigManager groups its
+// writes into batches.
+class RecordingKvStore : public KvStore {
+ public:
+    explicit RecordingKvStore(KvStore* inner) : inner_(inner) {}
+    ~RecordingKvStore() noexcept override {}
+    rusty::Option<std::string> get(const std::string& key) override { return inner_->get(key); }
+    void put(const std::string& key, const std::string& value) override {
+        log.push_back("put " + key);
+        inner_->put(key, value);
+    }
+    void remove(const std::string& key) override {
+        log.push_back("remove " + key);
+        inner_->remove(key);
+    }
+    void begin_batch() override { log.push_back("begin"); }
+    void end_batch() override { log.push_back("end"); }
+    std::vector<std::string> log;
+ private:
+    KvStore* inner_;
+};
+
+// Every change is one batch with __version__ written last inside it, so a
+// transactional store commits the change as one transaction.
+TEST_F(ConfigManagerTest, EachChangeIsOneBatch) {
+    RecordingKvStore rec(&kv_);
+    ConfigManager cm{&rec};
+    ASSERT_TRUE(cm.add_shard(0, {"a"}));
+    ASSERT_TRUE(cm.add_shard(1, {"b"}));
+
+    rec.log.clear();
+    ASSERT_TRUE(cm.kill_shard(1, 0));
+    const std::vector<std::string> kill = {
+        "begin", "put shard/1/status", "put shard/1/replacement", "put shard/1/replicas",
+        "put epoch", "put __version__", "end"};
+    EXPECT_EQ(rec.log, kill);
+
+    rec.log.clear();
+    ASSERT_TRUE(cm.set_shard_leader(0, "a"));
+    const std::vector<std::string> single = {
+        "begin", "put shard/0/leader", "put __version__", "end"};
+    EXPECT_EQ(rec.log, single);
+
+    // register_shard nests add_shard's batch inside its own: one outermost
+    // batch around all of it.
+    rec.log.clear();
+    cm.register_shard({"c"});
+    ASSERT_FALSE(rec.log.empty());
+    EXPECT_EQ(rec.log.front(), "begin");
+    EXPECT_EQ(rec.log.back(), "end");
+    int depth = 0;
+    int outermost = 0;
+    for (const auto& e : rec.log) {
+        if (e == "begin" && depth++ == 0) ++outermost;
+        if (e == "end") --depth;
+    }
+    EXPECT_EQ(outermost, 1);
+    EXPECT_EQ(depth, 0);
+}
+
 TEST_F(ConfigManagerTest, ClusterConfigLoadFromNullManagerFails) {
     ClusterConfig cc = ClusterConfig::new_();
     EXPECT_FALSE(cc.load_from_config_manager(nullptr));
@@ -248,6 +308,8 @@ class SwitchableKvStore : public KvStore {
     }
     void put(const std::string& key, const std::string& value) override { inner_->put(key, value); }
     void remove(const std::string& key) override { inner_->remove(key); }
+    void begin_batch() override { inner_->begin_batch(); }
+    void end_batch() override { inner_->end_batch(); }
     bool down = false;
  private:
     KvStore* inner_;

@@ -57,6 +57,12 @@ public:
         }
     }
 
+    // Each op above is its own one-key transaction; this adapter does not
+    // group them. The cluster bootstrap's ConfigTableStore commits a batch
+    // as one transaction itself.
+    void begin_batch() override {}
+    void end_batch() override {}
+
 private:
     ::FullOrderedIndex* index_;
 };
