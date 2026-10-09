@@ -3,15 +3,21 @@
 #include <stdlib.h>  // getenv, strtol, atol
 #include <string.h>  // strcmp
 #include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include "storage/abstract_db.h"           // abstract_db, abstract_ordered_index
 #include "ordered_index_kv_store.h"        // OrderedIndexKvStore
 #include "benchmarks/benchmark_config.h"   // BenchmarkConfig, transport::Configuration
+#include "lib/common.h"                    // mako::CONFIG_TABLE_ID
+#include "sto/function_pool.h"             // actual_directs (Masstree thread init), TThread
 
 import cluster;   // config/sharding metadata module (was #include "cluster/...")
 
@@ -46,44 +52,105 @@ constexpr uint64_t kConfigPollIntervalMs = 1000;
 // of them answers.
 constexpr auto kConfigReconnectInterval = std::chrono::seconds(1);
 
-// Shard 0's config store as its leader uses it: every read is served from
-// an in-memory mirror, and every write goes to the mirror and, on the
-// preferred leader, to the __mako_config__ Mako index (the record). The
-// readers are the ConfigWatcher poll thread and the ConfigKvService handler
-// thread, which are not transaction-engine threads, and an index op needs
-// engine thread state (an STO thread id and a Masstree threadinfo); the
-// mirror keeps them off the index without registering them with the
-// engine. Writes to the record must come from an engine-registered thread;
-// today the only such writer is the bootstrap thread, which seeds the store
-// before any reader starts. A replica promoted after a failover keeps the
-// mirror only (null record): it has no copy of the old leader's index.
-// @unsafe - writes through to a Mako index
-class MirroredConfigStore : public KvStore {
+// The engine thread id the config-table thread runs as. On a follower,
+// replay threads set their ids directly (0..nthreads-1), so an id from the
+// shared counter in abstract_db::thread_init could collide with one; this
+// one is reserved.
+constexpr int kConfigThreadId = MAX_THREADS - 1;
+
+// Shard 0's config store: the config table (__mako_config__, the reserved
+// table id mako::CONFIG_TABLE_ID) owned by one thread registered with the
+// transaction engine. An index op needs engine thread state (an STO thread
+// id and a Masstree threadinfo), and the callers here are not engine
+// threads (the bootstrap and promotion threads, the ConfigWatcher poll
+// thread, the ConfigKvService handler thread), so they hand each op to the
+// table thread and wait for it. Every write is a one-key transaction whose
+// log entry the table thread pushes to shard 0's Paxos stream for partition
+// 0 as soon as it commits, so shard 0's followers replay the table like
+// any other and a replica promoted to leader already holds the config.
+//
+// A removal is written as kRemovedMarker instead of deleting the key:
+// replay turns a deleted key into a tombstone value rather than removing
+// it, while a marker reads the same on every replica.
+// @unsafe - engine thread, Mako index ops
+class ConfigTableStore : public KvStore {
 public:
-    explicit MirroredConfigStore(KvStore* record) : record_(record) {}
-    ~MirroredConfigStore() noexcept override {}
+    explicit ConfigTableStore(abstract_ordered_index* idx)
+        : record_(idx), thread_([this] { run(); }) {
+        thread_.detach();   // serves the config for the life of the process
+    }
+    ~ConfigTableStore() noexcept override {}
 
     rusty::Option<std::string> get(const std::string& key) override {
-        std::lock_guard<std::mutex> lock(mu_);
-        return mirror_.get(key);
+        rusty::Option<std::string> out = rusty::None;
+        call([&] {
+            auto v = record_.get(key);
+            if (v.is_some() && v.as_ref().unwrap() != kRemovedMarker) out = std::move(v);
+        });
+        return out;
     }
 
     void put(const std::string& key, const std::string& value) override {
-        if (record_ != nullptr) record_->put(key, value);
-        std::lock_guard<std::mutex> lock(mu_);
-        mirror_.put(key, value);
+        call([&] { record_.put(key, value); });
     }
 
     void remove(const std::string& key) override {
-        if (record_ != nullptr) record_->remove(key);
-        std::lock_guard<std::mutex> lock(mu_);
-        mirror_.remove(key);
+        call([&] { record_.put(key, kRemovedMarker); });
     }
 
 private:
-    KvStore* record_;   // non-owning: the OrderedIndexKvStore over the index, or null
+    struct Job {
+        std::function<void()> op;
+        bool done = false;
+    };
+
+    // Run op on the table thread and wait for it.
+    void call(std::function<void()> op) {
+        Job job{std::move(op)};
+        std::unique_lock<std::mutex> lock(mu_);
+        jobs_.push_back(&job);
+        cv_.notify_all();
+        cv_.wait(lock, [&] { return job.done; });
+    }
+
+    void run() {
+        RegisterEngineThread();
+        std::unique_lock<std::mutex> lock(mu_);
+        for (;;) {
+            cv_.wait(lock, [&] { return !jobs_.empty(); });
+            Job* job = jobs_.front();
+            jobs_.pop_front();
+            lock.unlock();
+            job->op();
+            lock.lock();
+            job->done = true;
+            cv_.notify_all();
+        }
+    }
+
+    // Engine thread state as replay threads get it (ThreadDBWrapperMbta),
+    // with the reserved id, shard 0's Paxos partition 0 for its log
+    // entries, and every commit pushed at once.
+    static void RegisterEngineThread() {
+        auto& bench = BenchmarkConfig::getInstance();
+        TThread::set_id(kConfigThreadId);
+        TThread::set_pid(0);
+        TThread::set_mode(0);
+        TThread::set_shard_index(bench.getShardIndex());
+        TThread::set_nshards(bench.getNshards());
+        TThread::set_warehouses(bench.getConfig()->warehouses);
+        TThread::disable_multiversion();
+        TThread::push_log_each_commit = true;
+        actual_directs::thread_init();
+    }
+
+    static inline const std::string kRemovedMarker = std::string("\0mako-config-removed\0", 21);
+
+    OrderedIndexKvStore record_;
     std::mutex mu_;
-    InMemoryKvStore mirror_;
+    std::condition_variable cv_;
+    std::deque<Job*> jobs_;
+    std::thread thread_;   // last: started once the members above exist
 };
 
 // One shard-0 replica's config-service endpoint. name matches the replica
@@ -109,8 +176,8 @@ uint32_t g_cfg_nshards = 0;
 std::vector<ConfigEndpoint> g_cfg_endpoints;   // shard 0's replicas, preferred leader first
 rusty::Option<rusty::Arc<srpc::PollThread>> g_cfg_poll;
 srpc::Server* g_cfg_server = nullptr;                          // config leader only
-rusty::Option<rusty::Box<OrderedIndexKvStore>> g_cfg_kv_record;  // preferred shard-0 leader
-rusty::Option<rusty::Box<MirroredConfigStore>> g_cfg_kv_local;   // config leader
+abstract_db* g_cfg_db = nullptr;                               // holds the config table
+ConfigTableStore* g_cfg_store = nullptr;                       // config leader; lives for the process
 rusty::Option<rusty::Box<RemoteKvStore>> g_cfg_kv_remote;        // other nodes
 rusty::Option<rusty::Box<ConfigManager>> g_cfg_cm;
 rusty::Option<rusty::Box<ConfigWatcher>> g_cfg_watcher;
@@ -381,28 +448,32 @@ void StartConfigService(KvStore* kv, int port) {
                    bind_addr.c_str());
 }
 
-// Shard 0's preferred leader: owns the config store, serves reads, and
-// keeps its own routing cache fresh from the local store.
-// @unsafe - storage index open, RPC server bind, background thread
-void StartShard0Leader(abstract_db* db, uint32_t nshards, const ConfigEndpoint& ep) {
-    abstract_ordered_index* idx = db->open_index("__mako_config__", /*shard_index=*/0);
+// The config table on this replica: the reserved id in the database the
+// replication log replays into, which is also where the bootstrap opens it
+// on the preferred leader.
+// @unsafe - storage lookup
+abstract_ordered_index* ConfigTable() {
+    return g_cfg_db == nullptr ? nullptr : g_cfg_db->get_index_by_table_id(mako::CONFIG_TABLE_ID);
+}
+
+// Shard 0's preferred leader: seeds the config table, serves reads, and
+// keeps its own routing cache fresh from it.
+// @unsafe - storage index, RPC server bind, background threads
+void StartShard0Leader(uint32_t nshards, const ConfigEndpoint& ep) {
+    abstract_ordered_index* idx = ConfigTable();
     if (idx == nullptr) {
-        srpc::Log_error("BootstrapClusterConfig: could not open __mako_config__ index; "
-                        "cluster config disabled");
+        srpc::Log_error("BootstrapClusterConfig: no config table (id {}); cluster config disabled",
+                        mako::CONFIG_TABLE_ID);
         return;
     }
-    g_cfg_kv_record = rusty::Some(rusty::make_box<OrderedIndexKvStore>(idx));
-    g_cfg_kv_local = rusty::Some(rusty::make_box<MirroredConfigStore>(
-        g_cfg_kv_record.as_ref().unwrap().get()));
-    KvStore* kv = g_cfg_kv_local.as_ref().unwrap().get();
-
-    g_cfg_cm = rusty::Some(rusty::make_box<ConfigManager>(kv));
+    g_cfg_store = new ConfigTableStore(idx);
+    g_cfg_cm = rusty::Some(rusty::make_box<ConfigManager>(g_cfg_store));
     SeedTopology(g_cfg_cm.as_ref().unwrap().get(), nshards, std::string());
 
     // Local routing cache first, so this node routes by the config even if
     // the service below fails to bind.
     StartLocalWatcher(g_cfg_cm.as_ref().unwrap().get());
-    StartConfigService(kv, ep.port);
+    StartConfigService(g_cfg_store, ep.port);
 }
 
 // Every other node (shard-0 followers + all non-zero shards): read shard
@@ -450,6 +521,7 @@ void BootstrapClusterConfig(abstract_db* db) {
 
     if (!ResolveConfigEndpoints(&g_cfg_endpoints)) return;
     g_cfg_nshards = nshards;
+    g_cfg_db = db;
 
     const bool is_shard0_leader =
         (bench.getShardIndex() == 0) && (bench.getLeaderConfig() != 0);
@@ -462,7 +534,7 @@ void BootstrapClusterConfig(abstract_db* db) {
                            MyReplicaName().c_str());
             mine = &g_cfg_endpoints.front();
         }
-        StartShard0Leader(db, nshards, *mine);
+        StartShard0Leader(nshards, *mine);
         g_cfg_leading = true;
     } else {
         StartRemoteWatcher(g_cfg_endpoints);
@@ -470,7 +542,7 @@ void BootstrapClusterConfig(abstract_db* db) {
     g_cfg_active = true;
 }
 
-// @unsafe - stops the remote watcher, RPC server bind, background thread
+// @unsafe - stops the remote watcher, storage index, RPC server bind, background threads
 void PromoteClusterConfigLeader() {
     std::lock_guard<std::mutex> lock(g_cfg_mu);
     if (!g_cfg_active || g_cfg_leading) return;
@@ -478,34 +550,44 @@ void PromoteClusterConfigLeader() {
 
     const std::string me = MyReplicaName();
     const ConfigEndpoint* mine = FindEndpoint(me);
-    if (mine == nullptr) {
-        srpc::Log_error("BootstrapClusterConfig: {} now leads shard 0 but is not in shard 0's "
-                        "replica list, so it cannot serve the cluster config", me.c_str());
+    abstract_ordered_index* idx = ConfigTable();
+    if (mine == nullptr || idx == nullptr) {
+        srpc::Log_error("BootstrapClusterConfig: {} now leads shard 0 but {}, so it cannot serve "
+                        "the cluster config", me.c_str(),
+                        mine == nullptr ? "is not in shard 0's replica list" : "has no config table");
         return;
     }
     g_cfg_leading = true;
 
-    // Stop following the old leader. Continuing from the last version this
-    // node saw keeps the version increasing, so every watcher reloads.
+    // Stop following the old leader.
     if (g_cfg_watcher.is_some()) g_cfg_watcher.as_ref().unwrap()->stop();
     g_cfg_watcher = rusty::None;
     const uint64_t last_seen = get_cluster_config().get_version();
 
-    // Rebuild the config the way the old leader seeded it, with this replica
-    // as shard 0's leader. Nothing changes the config at runtime yet, so the
-    // seed is the whole config. Mirror only: the old leader's index is not
-    // replicated, and this thread is not an engine thread that could write
-    // one.
-    g_cfg_kv_local = rusty::Some(rusty::make_box<MirroredConfigStore>(nullptr));
-    KvStore* kv = g_cfg_kv_local.as_ref().unwrap().get();
-    kv->put("__version__", std::to_string(last_seen));   // ConfigManager's version key
-    g_cfg_cm = rusty::Some(rusty::make_box<ConfigManager>(kv));
-    SeedTopology(g_cfg_cm.as_ref().unwrap().get(), g_cfg_nshards, me);
-    StartLocalWatcher(g_cfg_cm.as_ref().unwrap().get());
-    StartConfigService(kv, mine->port);
-    srpc::Log_info("BootstrapClusterConfig: {} now leads shard 0 and serves the re-seeded "
-                   "cluster config (version {}, after {})", me.c_str(),
-                   get_cluster_config().get_version(), last_seen);
+    g_cfg_store = new ConfigTableStore(idx);
+    g_cfg_cm = rusty::Some(rusty::make_box<ConfigManager>(g_cfg_store));
+    ConfigManager* cm = g_cfg_cm.as_ref().unwrap().get();
+
+    // The old leader's writes reached this replica's table through the log.
+    // shard_count is written last when seeding, so with it present the
+    // table is complete; this replica then only names itself shard 0's
+    // leader. Otherwise (promoted before the seed replicated) it rebuilds
+    // the config from the shared shard config. Either way the version
+    // continues above every one a watcher has seen, so all of them reload.
+    const uint64_t replicated = cm->get_version();
+    const bool complete = replicated > 0 && cm->get_shard_count() > 0;
+    if (last_seen > replicated) g_cfg_store->put("__version__", std::to_string(last_seen));
+    if (complete) {
+        cm->set_shard_leader(0, me);
+    } else {
+        SeedTopology(cm, g_cfg_nshards, me);
+    }
+    StartLocalWatcher(cm);
+    StartConfigService(g_cfg_store, mine->port);
+    srpc::Log_info("BootstrapClusterConfig: {} now leads shard 0 and serves the {} cluster config "
+                   "(version {}; replicated version {}, last seen {})", me.c_str(),
+                   complete ? "replicated" : "re-seeded", get_cluster_config().get_version(),
+                   replicated, last_seen);
 }
 
 }  // namespace janus
