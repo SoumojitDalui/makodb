@@ -57,24 +57,37 @@ namespace janus {
 // @unsafe - RPC I/O, storage index open, background thread creation.
 void BootstrapClusterConfig(abstract_db* db);
 
-// Take over serving the cluster config when this process becomes shard 0's
-// leader after startup (a Paxos learner or p1 taking over). The work runs on
-// its own thread so the failover callback is not held up; it happens once
-// per process. The replica stops reading the old leader and serves
+// Paxos: take over serving the cluster config when this process becomes
+// shard 0's leader after startup (a learner or p1 taking over). The work
+// runs on its own thread so the failover callback is not held up. The
+// replica stops reading the old leader and serves
 // its own copy of the config table, which it received through the
 // replication log, after naming itself shard 0's leader in it; if no
 // complete copy arrived (promoted before the seed replicated), it rebuilds
 // the config from the shared shard config. The version continues above the
-// last one it saw and above the new Paxos epoch shifted into the high half,
-// so every watcher reloads and no two promoted leaders share a version.
-// Other nodes find it by trying shard 0's replicas. No-op off shard 0, when
-// the feature is off, and on a node that already serves.
-//
-// Raft is not hooked up: with a Raft group per partition, leading one
-// partition does not make a node shard 0's leader, and nothing reports who
-// leads partition 0. Config failover is Paxos-only.
+// last one it saw and above a floor made of partition 0's replication term
+// (the Paxos epoch, or the Raft term) in the high half and the replica's
+// position in shard 0's replica list below it, so every watcher reloads and
+// no two leaders share a version. Other nodes find it by
+// trying shard 0's replicas. No-op under Raft, off shard 0, when the
+// feature is off, and on a node that already serves.
 //
 // @unsafe - storage index, RPC server bind, background thread creation.
 void PromoteClusterConfigLeader();
+
+// Raft: call on every leadership change (Raft reports them per
+// partition). Under Raft the shard-0 replica that leads partition 0 serves
+// the config, since only its writes enter the Raft log: every node starts
+// as a reader, the partition-0 leader promotes itself as above (the first
+// one seeds the table), and a replica that loses partition 0 stops serving
+// and reads from the new leader. Raft can briefly report a node as leader
+// after it moved to a newer term, so a promotion serves only if the node
+// still leads partition 0 in the term it started in. The check runs on its own thread and
+// reads the current leadership, so it does not matter which partition's
+// event triggered it. No-op under Paxos, off shard 0, and when the
+// feature is off.
+//
+// @unsafe - storage index, RPC server bind/teardown, background threads.
+void ClusterConfigLeadershipChanged();
 
 }  // namespace janus
