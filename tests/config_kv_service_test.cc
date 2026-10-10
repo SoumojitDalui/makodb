@@ -5,8 +5,9 @@
 // apply function, which on a live node checks leadership and then calls
 // ApplyConfigChangeTo. That logic is what we exercise here, over an
 // InMemoryKvStore, with no socket / DeferredReply. The wire transport
-// (both RPCs over a real connection, and the mako_config client) needs
-// a live cluster.
+// (both RPCs over a real connection, and the mako_config client) is
+// runtime-verified by examples/test_2shard_config_failover.sh against a
+// live cluster.
 
 #include <string>
 #include <vector>
