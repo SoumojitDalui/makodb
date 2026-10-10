@@ -101,15 +101,23 @@ abstract service ServerControl {
     defer server_heart_beat ( | );
 }
 
-// Config key-value read service - lets a non-shard-0 node read a single
-// key from shard 0's __mako_config__ system table (via a KvStore-backed
-// handler, i.e. an OrderedIndexKvStore over shard 0's FullOrderedIndex).
-// This is the transport for RemoteKvStore's ReadFn: cluster metadata
-// lives on shard 0, everyone else discovers it by reading these keys.
-// Distinct from ConfigService (which serves the c-node's ConfigStore).
+// Config key-value service - lets any node read a single key from shard
+// 0's __mako_config__ system table, and an operator or another node change
+// the cluster config there. Only the shard-0 replica that serves the
+// config listens. Reads are the transport for RemoteKvStore's ReadFn:
+// cluster metadata lives on shard 0, everyone else discovers it by reading
+// these keys. Distinct from ConfigService (which serves the c-node's
+// ConfigStore).
 abstract service ConfigKvService {
     // Point read of one config key. found=1 with value on hit, found=0
     // (empty value) on miss.
     defer ReadConfigKey(string key | i32 found, string value);
+
+    // Apply one cluster-config change on the shard-0 replica that serves
+    // the config, as one transaction. op names the change and args are its
+    // arguments (ApplyConfigChangeTo in config_kv_service.h lists them).
+    // status is a ConfigChangeStatus; message says why a change was
+    // rejected; version is the config version after the change.
+    ApplyConfigChange(string op, std::vector<std::string> args | i32 status, string message, i64 version);
 }
 %%

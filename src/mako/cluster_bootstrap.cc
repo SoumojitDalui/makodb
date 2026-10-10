@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -21,6 +22,7 @@
 #include "benchmarks/benchmark_config.h"   // BenchmarkConfig, transport::Configuration
 #include "lib/common.h"                    // mako::CONFIG_TABLE_ID
 #include "sto/function_pool.h"             // actual_directs (Masstree thread init), TThread
+#include "sto/sync_util.hh"                // sync_logger: commit counter, replicated timestamps
 #include "deptran/replication_helper.h"    // is_local_partition_leader, partition_term
 
 import cluster;   // config/sharding metadata module (was #include "cluster/...")
@@ -56,6 +58,10 @@ constexpr uint64_t kConfigPollIntervalMs = 1000;
 // of them answers.
 constexpr auto kConfigReconnectInterval = std::chrono::seconds(1);
 
+// How long a runtime config change waits to see shard 0's replicas hold it
+// before it is answered as applied but unconfirmed.
+constexpr auto kConfigChangeReplicationWait = std::chrono::seconds(5);
+
 // The engine thread id the config-table thread runs as. On a follower,
 // replay threads set their ids directly (0..nthreads-1), so an id from the
 // shared counter in abstract_db::thread_init could collide with one; this
@@ -67,8 +73,9 @@ constexpr int kConfigThreadId = MAX_THREADS - 1;
 // transaction engine. An index op needs engine thread state (an STO thread
 // id and a Masstree threadinfo), and the callers here are not engine
 // threads (the bootstrap and promotion threads, the ConfigWatcher poll
-// thread, the ConfigKvService handler thread), so they hand each op to the
-// table thread and wait for it. Writes between begin_batch and end_batch
+// thread, the ConfigKvService handler thread, the threads that apply
+// runtime changes), so they hand each op to the table thread and wait for
+// it. Writes between begin_batch and end_batch
 // (one ConfigManager change, or a whole seed) stay with the writing thread,
 // which also reads them back, and the outermost end_batch commits them as
 // one transaction; a write outside a batch is a one-key transaction. The
@@ -141,6 +148,9 @@ public:
         batch_mu_.unlock();
     }
 
+    // The log timestamp (timestamp*10 + term) of the last batch committed.
+    uint32_t last_commit_log_timestamp() const { return last_commit_log_ts_.load(); }
+
 private:
     bool in_my_batch() const { return batch_owner_.load() == std::this_thread::get_id(); }
 
@@ -159,6 +169,7 @@ private:
                     idx_->tx_put(txn, lcdf::Str(kv.first.data(), kv.first.size()), values[i++]);
                 }
                 db_->commit_txn(txn);
+                last_commit_log_ts_.store(TThread::last_log_timestamp);
                 return;
             } catch (abstract_db::abstract_abort_exception&) {
                 if (Sto::in_progress()) db_->abort_txn(nullptr);
@@ -217,6 +228,7 @@ private:
     abstract_ordered_index* idx_;
     OrderedIndexKvStore record_;
     str_arena arena_;   // table thread only
+    std::atomic<uint32_t> last_commit_log_ts_{0};
 
     std::mutex batch_mu_;
     std::atomic<std::thread::id> batch_owner_{};
@@ -504,22 +516,100 @@ private:
 
 RemoteConfigConnection* g_cfg_remote = nullptr;   // other nodes; lives for the process
 
+// Log each config version this node loads: the seed, takeovers and
+// runtime changes, so a few lines per run.
+// @unsafe - callback registration
+void LogLoads(ConfigWatcher* watcher) {
+    watcher->set_update_callback(CwCallback([](const ClusterConfig& cc) {
+        srpc::Log_info("BootstrapClusterConfig: loaded cluster config version {}",
+                       cc.get_version());
+    }));
+}
+
 // The config leader's routing cache, fed from its own store (no self-RPC).
 // @unsafe - background thread
 void StartLocalWatcher(ConfigManager* cm) {
     g_cfg_watcher = rusty::Some(rusty::make_box<ConfigWatcher>(
         ConfigWatcher::new_(cm, &get_cluster_config(), kConfigPollIntervalMs)));
+    LogLoads(g_cfg_watcher.as_ref().unwrap().get());
     g_cfg_watcher.as_ref().unwrap()->poll();   // prime the cache immediately
     g_cfg_watcher.as_ref().unwrap()->start();
 }
 
-// Dedicated RPC server for config reads (config_node_init.cc pattern).
+// Apply one runtime config change here, if this replica serves the config
+// (the ConfigKvService handler runs this on a thread of its own). The
+// change is one transaction, made under g_cfg_mu so it does not interleave
+// with a promotion or a demotion. The answer then waits until shard 0's
+// replicas hold it. The table thread pushes the commit's log entry to
+// partition 0 as it commits, and partition 0's replicated timestamp
+// (local_timestamp_[0], timestamp*10 + term) moves to each of its entries
+// as they commit, in log order. So the entry has committed once that
+// timestamp reads the entry's own, or, if a later entry moved it on first,
+// a timestamp above the commit counter (sync_logger::local_replica_id)
+// read after the change: every commit timestamp comes from that counter,
+// so such an entry was queued after this one. A change not seen committed
+// within kConfigChangeReplicationWait is answered as applied but
+// unconfirmed; that happens when partition 0's replicated timestamp stops
+// moving on this replica, which Mako's leaders do for some partitions
+// (seen for partition 0 with three workers per shard).
+// @unsafe - config store writes, replication state reads
+ConfigChangeResult ApplyConfigChangeOnLeader(const std::string& op,
+                                             const std::vector<std::string>& args) {
+    ConfigChangeResult result;
+    uint64_t counter_after = 0;
+    uint32_t own_entry = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_cfg_mu);
+        if (!g_cfg_active || !g_cfg_leading || g_cfg_cm.is_none() ||
+            !::is_local_partition_leader(0)) {
+            result.status = kConfigChangeNotLeader;
+            result.message = MyReplicaName() + " does not serve the cluster config";
+            return result;
+        }
+        ConfigManager* cm = g_cfg_cm.as_ref().unwrap().get();
+        const uint64_t before = cm->get_version();
+        result = ApplyConfigChangeTo(cm, op, args);
+        if (result.status != kConfigChangeApplied || result.version == before) return result;
+        own_entry = g_cfg_store->last_commit_log_timestamp();
+        counter_after = static_cast<uint64_t>(
+            __atomic_load_n(&sync_util::sync_logger::local_replica_id, __ATOMIC_ACQUIRE));
+    }
+    std::string change = op;
+    for (const auto& a : args) change += " " + a;
+    srpc::Log_info("BootstrapClusterConfig: applied config change '{}' (version {})",
+                   change.c_str(), result.version);
+
+    const auto deadline = std::chrono::steady_clock::now() + kConfigChangeReplicationWait;
+    while (!sync_util::sync_logger::local_timestamp_.empty() &&
+           std::chrono::steady_clock::now() < deadline) {
+        const uint32_t replicated =
+            sync_util::sync_logger::local_timestamp_[0].load(std::memory_order_acquire);
+        // A stream that has ended reads as the maximum, which says nothing
+        // about this entry.
+        if (replicated != std::numeric_limits<uint32_t>::max() &&
+            (replicated == own_entry || replicated / 10 > counter_after)) {
+            return result;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    result.status = kConfigChangeUnconfirmed;
+    result.message = "applied, but shard 0's replicas did not confirm it within " +
+                     std::to_string(std::chrono::duration_cast<std::chrono::seconds>(
+                         kConfigChangeReplicationWait).count()) + "s";
+    srpc::Log_warn("BootstrapClusterConfig: config change '{}' (version {}) not confirmed "
+                   "replicated", change.c_str(), result.version);
+    return result;
+}
+
+// Dedicated RPC server for config reads and changes (config_node_init.cc
+// pattern).
 // @unsafe - RPC server bind
 void StartConfigService(KvStore* kv, int port) {
     std::string bind_addr = "0.0.0.0:" + std::to_string(port);
     g_cfg_poll = rusty::Some(srpc::PollThread::create());
     g_cfg_server = new srpc::Server(srpc::Server::new_(rusty::Some(g_cfg_poll.as_ref().unwrap().clone())));
-    g_cfg_server->reg_service_typed(rusty::make_box<ConfigKvServiceImpl>(kv));
+    g_cfg_server->reg_service_typed(
+        rusty::make_box<ConfigKvServiceImpl>(kv, ConfigChangeFn(ApplyConfigChangeOnLeader)));
     if (g_cfg_server->start(reinterpret_cast<const int8_t*>(bind_addr.c_str())) != 0) {
         srpc::Log_error("BootstrapClusterConfig: config server failed to bind {}; other nodes "
                         "cannot read the cluster config", bind_addr.c_str());
@@ -583,6 +673,7 @@ void StartRemoteWatcher(const std::vector<ConfigEndpoint>& eps) {
         g_cfg_kv_remote.as_ref().unwrap().get()));
     g_cfg_watcher = rusty::Some(rusty::make_box<ConfigWatcher>(
         ConfigWatcher::new_(g_cfg_cm.as_ref().unwrap().get(), &get_cluster_config(), kConfigPollIntervalMs)));
+    LogLoads(g_cfg_watcher.as_ref().unwrap().get());
     g_cfg_watcher.as_ref().unwrap()->start();
     srpc::Log_info("BootstrapClusterConfig: watching shard-0 config at {}", all.c_str());
 }

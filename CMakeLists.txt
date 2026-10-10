@@ -1482,6 +1482,8 @@ add_apps(test_stress_partitioned_queues examples/test_stress_partitioned_queues.
 add_apps(makoCon examples/makoCon.cc)
 add_apps(makoConDBBench examples/makoConDBBench.cc)
 add_apps(makoConMultiTrd examples/makoConMultiTrd.cc)
+# Reads or changes a running cluster's config (MAKO_CLUSTER_CONFIG=1).
+add_apps(mako_config src/mako/tools/mako_config.cc)
 # Note: makoServer functionality has been consolidated into simpleTransactionRep.cc
 #       Use: ./simpleTransactionRep --server <args> for server-only mode
 
@@ -1674,10 +1676,11 @@ if(BUILD_TESTS)
     add_test(NAME test_tpcc_sharding COMMAND test_tpcc_sharding)
 
 
-    # ConfigKvService server-handler read-logic tests (Stage 3d). The
+    # ConfigKvService server-handler tests (Stage 3d). The
     # ConfigKvServiceImpl handler is generated from rcc_rpc.rpc, so this
-    # links the txlog stack (srpc); it exercises DoReadConfigKey over an
-    # InMemoryKvStore (no socket). The wire transport is CI-verified.
+    # links the txlog stack (srpc); it exercises DoReadConfigKey,
+    # DoApplyConfigChange and ApplyConfigChangeTo over an InMemoryKvStore
+    # (no socket); the wire transport needs a live cluster.
     add_executable(test_config_kv_service tests/config_kv_service_test.cc)
     target_include_directories(test_config_kv_service PRIVATE ${TEST_INCLUDE_DIRS} ${GTEST_INCLUDE_DIRS} src/deptran)
     target_compile_options(test_config_kv_service PRIVATE ${TEST_COMPILE_OPTIONS})

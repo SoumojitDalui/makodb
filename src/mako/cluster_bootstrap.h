@@ -2,7 +2,7 @@
 
 // Cluster-config runtime bootstrap.
 //
-// Ties the read-side cluster-config components together at node startup.
+// Ties the cluster-config components together at node startup.
 // Everything below this call already exists and is unit-tested in
 // isolation (OrderedIndexKvStore, RemoteKvStore, ConfigManager,
 // ConfigKvServiceImpl, ConfigWatcher, and the ClusterConfig routing
@@ -16,7 +16,7 @@ class abstract_db;
 
 namespace janus {
 
-// Wire the cluster-config read path. Call ONCE from init_env(), after
+// Wire the cluster-config path. Call ONCE from init_env(), after
 // the shard's RPC servers are up (post setup2()).
 //
 // Gated twice, so it is a no-op on the common CI paths:
@@ -46,13 +46,19 @@ namespace janus {
 //     to a promoted replica after a failover.
 // One thread registered with the transaction engine owns the config
 // table and runs every read and write of it for the other threads here.
-// Each write is a one-key transaction that goes into shard 0's replication
-// log at once (Paxos partition 0, and the leader's log persistence), so
-// shard 0's followers replay the table like any other.
+// Each config change (one ConfigManager write, or the whole seed) is one
+// transaction that goes into shard 0's replication log at once (partition
+// 0, and the leader's log persistence), so shard 0's followers replay the
+// table like any other.
 //
-// Not covered here: there is no runtime write path (shardmaster commands),
-// and writes are one-key transactions, ordered by __version__ written last,
-// not one transaction per config change.
+// The replica that serves the config also takes changes at runtime, from
+// an operator (the mako_config tool) or another process, through the
+// service's ApplyConfigChange RPC; ApplyConfigChangeTo in
+// config_kv_service.h lists them. Each change is one transaction, answered
+// once shard 0's replicas hold it, and every node loads it on its next
+// poll. Of these, kill_shard changes what nodes do (routing sends the dead
+// shard's keys to the shard that takes over); the rest record shard and
+// node metadata.
 //
 // @unsafe - RPC I/O, storage index open, background thread creation.
 void BootstrapClusterConfig(abstract_db* db);
