@@ -68,6 +68,10 @@ public:
     // fills. For a thread that commits rarely and must not leave entries
     // waiting (the cluster-config table thread); workers leave it false.
     static __thread bool push_log_each_commit;
+    // The log timestamp (timestamp*10 + term) of this thread's last commit
+    // that wrote a log entry, so a thread that pushes each commit can tell
+    // when its entry has replicated (the cluster-config table thread).
+    static __thread uint32_t last_log_timestamp;
 
     static void set_mode(int mode) {
         the_mode = mode;

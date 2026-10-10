@@ -41,6 +41,7 @@ __thread bool TThread::transget_without_throw;
 __thread bool TThread::transget_without_stable;
 __thread bool TThread::is_worker_leader;
 __thread bool TThread::push_log_each_commit;
+__thread uint32_t TThread::last_log_timestamp;
 __thread unsigned int TThread::trans_nosend_abort;
 __thread bool TThread::in_loading_phase;
 __thread int TThread::increment_id;
@@ -700,6 +701,7 @@ inline void Transaction::serialize_util(unsigned nwriteset, bool on_remote, int 
     uint32_t tmp = epoch + timestamp * 10;
     // Single timestamp system: no need to loop over shards
     instance->update_commit_id(tmp);
+    TThread::last_log_timestamp = tmp;
     // 1. copy current Commit ID (single timestamp)
     // memcpy(array + w, &instance->latest_commit_timestamp, sizeof(uint32_t));
     memcpy(array + w, &tmp, sizeof(uint32_t));
