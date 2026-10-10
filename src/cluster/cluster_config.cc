@@ -185,8 +185,14 @@ bool cc_load_from_cm(ClusterConfigState& s, ConfigManager* cm) {
     // it is zero or moved in between, there is no consistent snapshot and the
     // loaded config stays as it was. (A change still in flight shows up as a
     // new version on the next poll.)
+    //
+    // Versions only grow: each change bumps the version, and a replica that
+    // takes over shard 0 continues above every version it has seen and
+    // above a floor from its replication term. So a lower version comes
+    // from a replica that has lost shard 0 but not stepped down yet, and
+    // loading it would undo changes this node already has.
     const uint64_t ver = cm->get_version();
-    if (ver == 0) return false;
+    if (ver == 0 || ver < s.version) return false;
     uint32_t count = cm->get_shard_count();
     if (count == 0) return false;   // no topology, or shard_count read failed
     uint64_t ep = cm->get_epoch();
