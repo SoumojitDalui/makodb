@@ -848,6 +848,16 @@ int get_epoch() {
   return es ? es->get_epoch() : 0;
 }
 
+bool is_local_partition_leader(uint32_t par_id) {
+  auto* worker = find_worker(par_id);
+  return worker != nullptr && worker->IsLeader(par_id);
+}
+
+uint64_t partition_term(uint32_t par_id) {
+  auto* worker = find_worker(par_id);
+  return worker != nullptr ? worker->CurrentTerm(par_id) : 0;
+}
+
 // set_epoch updates ElectionState and propagates the value to all workers.
 void set_epoch(int epoch) {
   if (!es) {

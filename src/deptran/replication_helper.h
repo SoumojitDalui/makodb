@@ -70,6 +70,8 @@ void wait_for_submit(uint32_t);
 void pre_shutdown_step();
 int get_epoch();
 void set_epoch(int epoch);
+bool is_local_partition_leader(uint32_t par_id);
+uint64_t partition_term(uint32_t par_id);
 void upgrade_p1_to_leader();
 void worker_info_stats(size_t);
 // removed `microbench_paxos()` and
@@ -107,6 +109,8 @@ void wait_for_submit(uint32_t);
 void pre_shutdown_step();
 int get_epoch();
 void set_epoch(int epoch);
+bool is_local_partition_leader(uint32_t par_id);
+uint64_t partition_term(uint32_t par_id);
 void upgrade_p1_to_leader();
 void worker_info_stats(size_t);
 // removed `microbench_paxos()` and
@@ -144,6 +148,14 @@ void wait_for_submit(uint32_t);
 void pre_shutdown_step();
 int get_epoch();
 void set_epoch(int epoch = -1);
+// Whether this process currently leads replication partition par_id: its
+// Paxos worker for the partition is the leader, or it leads the Raft group
+// that carries the partition.
+bool is_local_partition_leader(uint32_t par_id);
+// Partition par_id's replication term as this process sees it: the Paxos
+// epoch, or the term of the Raft group carrying it. It grows with every
+// leadership change.
+uint64_t partition_term(uint32_t par_id);
 void upgrade_p1_to_leader();
 void worker_info_stats(size_t);
 // removed `microbench_paxos()` and
