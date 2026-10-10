@@ -281,10 +281,31 @@ TEST_F(ConfigManagerTest, ClusterConfigRejectsLoadWithoutShards) {
     ASSERT_TRUE(cc.load_from_config_manager(&cm_));
 
     InMemoryKvStore other;
+    other.put("__version__", std::to_string(cc.get_version() + 1));   // newer, no shard_count
     ConfigManager no_shards{&other};
-    ASSERT_TRUE(no_shards.set_sharding_mode("hash"));   // version 1, no shard_count
     EXPECT_FALSE(cc.load_from_config_manager(&no_shards));
     EXPECT_EQ(cc.get_shard_count(), 1u);
+}
+
+// A replica that has lost shard 0 but not stepped down yet can still serve
+// an older version. Loading it would undo changes this node has, so the
+// loaded config stays; a newer version still loads.
+TEST_F(ConfigManagerTest, ClusterConfigRejectsOlderVersion) {
+    ASSERT_TRUE(cm_.add_shard(0, {"a"}));
+    ASSERT_TRUE(cm_.add_shard(1, {"b"}));
+    ClusterConfig cc = ClusterConfig::new_();
+    ASSERT_TRUE(cc.load_from_config_manager(&cm_));
+
+    InMemoryKvStore stale_kv;
+    ConfigManager stale{&stale_kv};
+    ASSERT_TRUE(stale.add_shard(0, {"a"}));
+    ASSERT_LT(stale.get_version(), cc.get_version());
+    EXPECT_FALSE(cc.load_from_config_manager(&stale));
+    EXPECT_EQ(cc.get_shard_count(), 2u);
+
+    ASSERT_TRUE(cm_.kill_shard(1, 0));
+    EXPECT_TRUE(cc.load_from_config_manager(&cm_));
+    EXPECT_EQ(cc.resolve_live_shard(1), 0u);
 }
 
 TEST_F(ConfigManagerTest, ClusterConfigLoadFromNullManagerFails) {
