@@ -530,6 +530,50 @@ run_2shard_replication_simple_raft() {
     [ $test_result -eq 0 ] && [ $hanging_check -eq 0 ]
 }
 
+# ============================================================================
+# Cluster-config failover tests (opt-in: the cluster config is off by default)
+# ============================================================================
+
+# One config failover case, retried once like the replication tests.
+# Usage: run_config_failover_case <ci target> <paxos|raft> <kill|pause>
+run_config_failover_case() {
+    local target=$1 replication=$2 event=$3
+    local attempt=1
+    local max_attempts=2
+    while [ $attempt -le $max_attempts ]; do
+        cleanup_processes
+        set +e
+        bash ./examples/test_2shard_config_failover.sh "$replication" "$event"
+        local test_result=$?
+        set -e
+        check_for_hanging_processes "$target"
+        local hanging_check=$?
+        if [ $test_result -eq 0 ] && [ $hanging_check -eq 0 ]; then
+            return 0
+        fi
+        if [ $attempt -lt $max_attempts ]; then
+            echo "Retrying $target ($replication $event, attempt $((attempt + 1))/$max_attempts)..."
+        fi
+        attempt=$((attempt + 1))
+    done
+    return 1
+}
+
+run_2shard_config_failover() {
+    echo "========================================="
+    echo "Running: ./ci/ci.sh shard2ConfigFailover"
+    echo "========================================="
+    run_config_failover_case shard2ConfigFailover paxos kill
+}
+
+run_2shard_config_failover_raft() {
+    echo "========================================="
+    echo "Running: ./ci/ci.sh shard2ConfigFailoverRaft"
+    echo "========================================="
+    run_config_failover_case shard2ConfigFailoverRaft raft kill &&
+        run_config_failover_case shard2ConfigFailoverRaft raft pause
+}
+
 run_rocksdb_tests() {
     echo "========================================="
     echo "Running: ./ci/ci.sh rocksdbTests"
@@ -733,6 +777,12 @@ case "${1:-}" in
     shard2ReplicationSimpleRaft)
         run_2shard_replication_simple_raft
         ;;
+    shard2ConfigFailover)
+        run_2shard_config_failover
+        ;;
+    shard2ConfigFailoverRaft)
+        run_2shard_config_failover_raft
+        ;;
     rocksdbTests)
         run_rocksdb_tests
         ;;
@@ -792,6 +842,7 @@ case "${1:-}" in
         echo "  shard1ReplicationSimple, shard2ReplicationSimple,"
         echo "  shard1ReplicationRaft, shard2ReplicationRaft,"
         echo "  shard1ReplicationSimpleRaft, shard2ReplicationSimpleRaft,"
+        echo "  shard2ConfigFailover, shard2ConfigFailoverRaft,"
         echo "  rocksdbTests, multiShardSingleProcess,"
         echo "  shard2SingleProcess, shard2SingleProcessReplication,"
         echo "  srpcTests, cpuThrottlingScaling, clientServer, all"

@@ -1680,7 +1680,8 @@ if(BUILD_TESTS)
     # ConfigKvServiceImpl handler is generated from rcc_rpc.rpc, so this
     # links the txlog stack (srpc); it exercises DoReadConfigKey,
     # DoApplyConfigChange and ApplyConfigChangeTo over an InMemoryKvStore
-    # (no socket); the wire transport needs a live cluster.
+    # (no socket). The wire transport is checked end to end by
+    # examples/test_2shard_config_failover.sh.
     add_executable(test_config_kv_service tests/config_kv_service_test.cc)
     target_include_directories(test_config_kv_service PRIVATE ${TEST_INCLUDE_DIRS} ${GTEST_INCLUDE_DIRS} src/deptran)
     target_compile_options(test_config_kv_service PRIVATE ${TEST_COMPILE_OPTIONS})
