@@ -2152,8 +2152,42 @@ public:
     }
     friend inline srpc::BinaryReadArchive& operator >>(srpc::BinaryReadArchive& ar, RpcReadConfigKeyResponse& o) { deserialize(o, ar); return ar; }
 
+    struct RpcApplyConfigChangeRequest {
+        std::string op;
+        std::vector<std::string> args;
+    };
+    friend inline void serialize(const RpcApplyConfigChangeRequest& o, srpc::BinaryWriteArchive& ar) {
+        srpc::Serialize_::serialize(o.op, ar);
+        srpc::Serialize_::serialize(o.args, ar);
+    }
+    friend inline srpc::BinaryWriteArchive& operator <<(srpc::BinaryWriteArchive& ar, const RpcApplyConfigChangeRequest& o) { serialize(o, ar); return ar; }
+    friend inline void deserialize(RpcApplyConfigChangeRequest& o, srpc::BinaryReadArchive& ar) {
+        srpc::Deserialize_::deserialize(o.op, ar);
+        srpc::Deserialize_::deserialize(o.args, ar);
+    }
+    friend inline srpc::BinaryReadArchive& operator >>(srpc::BinaryReadArchive& ar, RpcApplyConfigChangeRequest& o) { deserialize(o, ar); return ar; }
+
+    struct RpcApplyConfigChangeResponse {
+        srpc::i32 status;
+        std::string message;
+        srpc::i64 version;
+    };
+    friend inline void serialize(const RpcApplyConfigChangeResponse& o, srpc::BinaryWriteArchive& ar) {
+        srpc::Serialize_::serialize(o.status, ar);
+        srpc::Serialize_::serialize(o.message, ar);
+        srpc::Serialize_::serialize(o.version, ar);
+    }
+    friend inline srpc::BinaryWriteArchive& operator <<(srpc::BinaryWriteArchive& ar, const RpcApplyConfigChangeResponse& o) { serialize(o, ar); return ar; }
+    friend inline void deserialize(RpcApplyConfigChangeResponse& o, srpc::BinaryReadArchive& ar) {
+        srpc::Deserialize_::deserialize(o.status, ar);
+        srpc::Deserialize_::deserialize(o.message, ar);
+        srpc::Deserialize_::deserialize(o.version, ar);
+    }
+    friend inline srpc::BinaryReadArchive& operator >>(srpc::BinaryReadArchive& ar, RpcApplyConfigChangeResponse& o) { deserialize(o, ar); return ar; }
+
     enum {
         READCONFIGKEY = 0x584cdad1,
+        APPLYCONFIGCHANGE = 0x14c1e3da,
     };
     // Registers RPC IDs with server using service index
     // @unsafe - calls srpc::Server::reg_rpc / unreg (not borrow-checked)
@@ -2162,21 +2196,28 @@ public:
         if ((ret = svr.reg_rpc(READCONFIGKEY, svc_index)) != 0) {
             goto err;
         }
+        if ((ret = svr.reg_rpc(APPLYCONFIGCHANGE, svc_index)) != 0) {
+            goto err;
+        }
         return 0;
     err:
         svr.unreg(READCONFIGKEY);
+        svr.unreg(APPLYCONFIGCHANGE);
         return ret;
     }
     // @safe - Dispatch for RPC requests
     void __dispatch__(srpc::i32 rpc_id, rusty::Box<srpc::Request> req, srpc::WeakServerConnection weak_sconn) const {
         switch (rpc_id) {
         case READCONFIGKEY: __ReadConfigKey__wrapper__(std::move(req), weak_sconn); break;
+        case APPLYCONFIGCHANGE: __ApplyConfigChange__wrapper__(std::move(req), weak_sconn); break;
         default: break;  // Unknown RPC ID, ignore
         }
     }
     // typed service signatures
     // @safe
     virtual void ReadConfigKey(const RpcReadConfigKeyRequest& req, RpcReadConfigKeyResponse& resp, srpc::DeferredReply defer) const = 0;
+    // @safe
+    virtual rusty::Result<RpcApplyConfigChangeResponse, srpc::i32> ApplyConfigChange(const RpcApplyConfigChangeRequest& req) const = 0;
     // these RPC handler functions need to be implemented by user
     // for 'raw' handlers, req is rusty::Box (auto-cleaned); weak_sconn requires lock() before use
 private:
@@ -2203,6 +2244,36 @@ private:
             this->ReadConfigKey(__typed_req__, *__typed_resp__, std::move(__defer__));
         }
     }
+    // @safe
+    void __ApplyConfigChange__wrapper__(rusty::Box<srpc::Request> req, srpc::WeakServerConnection weak_sconn) const {
+        // @unsafe
+        {
+            RpcApplyConfigChangeRequest __typed_req__;
+            srpc::BinaryReadArchive __req_ar__(srpc::make_source_proxy_buffer(&req->src));
+            srpc::Deserialize_::deserialize(__typed_req__.op, __req_ar__);
+            srpc::Deserialize_::deserialize(__typed_req__.args, __req_ar__);
+            if (__req_ar__.failed()) {
+                srpc::reject_malformed_request(*req, weak_sconn);
+                return;
+            }
+            auto __typed_result__ = this->ApplyConfigChange(__typed_req__);
+            auto sconn_opt = weak_sconn.upgrade();
+            if (sconn_opt.is_some()) {
+                auto sconn = sconn_opt.unwrap();
+                if (__typed_result__.is_err()) {
+                    const_cast<srpc::ServerConnection&>(*sconn).reply(*req, __typed_result__.unwrap_err(), srpc::ServerReplyFn{});
+                } else {
+                    auto __typed_resp__ = __typed_result__.unwrap();
+                    const_cast<srpc::ServerConnection&>(*sconn).reply(*req, 0, [&](srpc::BinaryWriteArchive& m) {
+                        srpc::Serialize_::serialize(__typed_resp__.status, m);
+                        srpc::Serialize_::serialize(__typed_resp__.message, m);
+                        srpc::Serialize_::serialize(__typed_resp__.version, m);
+                    });
+                }
+            }
+            // req automatically cleaned up by rusty::Box
+        }
+    }
 };
 
 class ConfigKvServiceProxy {
@@ -2213,6 +2284,8 @@ public:
     // Alias typed request/response structs from the sibling Service class.
     using RpcReadConfigKeyRequest = ConfigKvServiceService::RpcReadConfigKeyRequest;
     using RpcReadConfigKeyResponse = ConfigKvServiceService::RpcReadConfigKeyResponse;
+    using RpcApplyConfigChangeRequest = ConfigKvServiceService::RpcApplyConfigChangeRequest;
+    using RpcApplyConfigChangeResponse = ConfigKvServiceService::RpcApplyConfigChangeResponse;
     class ReadConfigKeyTypedFuture {
     private:
         rusty::Arc<srpc::Future> __fu__;
@@ -2256,6 +2329,54 @@ public:
         auto __typed_fu_result__ = this->async_ReadConfigKey(req);
         if (__typed_fu_result__.is_err()) {
             return rusty::Result<RpcReadConfigKeyResponse, srpc::i32>::Err(__typed_fu_result__.unwrap_err());
+        }
+        return __typed_fu_result__.unwrap().resolve();
+    }
+    class ApplyConfigChangeTypedFuture {
+    private:
+        rusty::Arc<srpc::Future> __fu__;
+    public:
+        explicit ApplyConfigChangeTypedFuture(rusty::Arc<srpc::Future> fu): __fu__(std::move(fu)) { }
+        bool ready() const {
+            return __fu__->ready();
+        }
+        void wait() const {
+            __fu__->wait();
+        }
+        srpc::i32 get_error_code() const {
+            return __fu__->get_error_code();
+        }
+        rusty::Arc<srpc::Future> raw_future() const {
+            return __fu__;
+        }
+        rusty::Result<RpcApplyConfigChangeResponse, srpc::i32> resolve() const {
+            srpc::i32 __ret__ = __fu__->get_error_code();
+            if (__ret__ != 0) {
+                return rusty::Result<RpcApplyConfigChangeResponse, srpc::i32>::Err(__ret__);
+            }
+            RpcApplyConfigChangeResponse __typed_resp__;
+            auto __reply_guard__ = __fu__->get_reply();
+            srpc::BinaryReadArchive __reply_ar__(srpc::make_source_proxy_buffer(&__reply_guard__->src));
+            srpc::Deserialize_::deserialize(__typed_resp__.status, __reply_ar__);
+            srpc::Deserialize_::deserialize(__typed_resp__.message, __reply_ar__);
+            srpc::Deserialize_::deserialize(__typed_resp__.version, __reply_ar__);
+            return rusty::Result<RpcApplyConfigChangeResponse, srpc::i32>::Ok(__typed_resp__);
+        }
+    };
+    rusty::Result<ApplyConfigChangeTypedFuture, srpc::i32> async_ApplyConfigChange(const RpcApplyConfigChangeRequest& req, const srpc::FutureAttr& __fu_attr__ = srpc::FutureAttr()) {
+        auto __fu_result__ = __cl__->request(ConfigKvServiceService::APPLYCONFIGCHANGE, __fu_attr__, [&](srpc::BinaryWriteArchive& __m__) {
+            srpc::Serialize_::serialize(req.op, __m__);
+            srpc::Serialize_::serialize(req.args, __m__);
+        });
+        if (__fu_result__.is_err()) {
+            return rusty::Result<ApplyConfigChangeTypedFuture, srpc::i32>::Err(__fu_result__.unwrap_err());
+        }
+        return rusty::Result<ApplyConfigChangeTypedFuture, srpc::i32>::Ok(ApplyConfigChangeTypedFuture(__fu_result__.unwrap()));
+    }
+    rusty::Result<RpcApplyConfigChangeResponse, srpc::i32> ApplyConfigChange(const RpcApplyConfigChangeRequest& req) {
+        auto __typed_fu_result__ = this->async_ApplyConfigChange(req);
+        if (__typed_fu_result__.is_err()) {
+            return rusty::Result<RpcApplyConfigChangeResponse, srpc::i32>::Err(__typed_fu_result__.unwrap_err());
         }
         return __typed_fu_result__.unwrap().resolve();
     }
