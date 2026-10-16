@@ -555,6 +555,10 @@ public:
 
   // weihai
   timepoint heartbeat_seen = std::chrono::high_resolution_clock::now();
+  // Run by step_down, outside the locks, when it deposes this node
+  // (register_step_down_callback). It runs on an RPC callback thread, so it
+  // must not block.
+  std::function<void()> stepped_down_cb{};
 
   //void operator=(const ElectionState &) = delete;
 
@@ -671,12 +675,19 @@ public:
     set_state(0);
     leader_id = -1;
     set_epoch(epoch);
+    bool was_leading = false;
     for(int i = 0 ; i < pxs_workers_g.size(); i++){
       pxs_workers_g[i]->election_state_lock.lock();
+      was_leading = was_leading || pxs_workers_g[i]->is_leader != 0;
       pxs_workers_g[i]->is_leader = 0;
       pxs_workers_g[i]->election_state_lock.unlock();
     }
     state_unlock();
+    // Every refused request calls this; only the first finds a worker
+    // still leading.
+    if(was_leading && stepped_down_cb){
+      stepped_down_cb();
+    }
   }
 };
 
