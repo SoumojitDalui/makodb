@@ -290,6 +290,12 @@ void register_leader_election_callback(std::function<void(int)> cb){
   leader_callback_ = cb;
 }
 
+// Paxos has no election callback for a leader that loses its place: it
+// learns only when an acceptor refuses it for a later epoch (step_down).
+void register_step_down_callback(std::function<void()> cb){
+  es->stepped_down_cb = cb;
+}
+
 void register_for_follower(std::function<void(const char*, int)> cb, uint32_t par_id) {
     for (auto& worker : pxs_workers_g) {
         if (worker->IsPartition(par_id) && !worker->IsLeader(par_id)) {
