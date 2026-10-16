@@ -753,9 +753,9 @@ void PromoteLocked() {
                    replicated, last_seen);
 }
 
-// Raft only (g_cfg_mu held): this replica no longer leads partition 0. Stop
-// serving, so the other nodes move to the new leader, and follow it like
-// any other node. The table thread stays for a later promotion.
+// g_cfg_mu held: this replica no longer leads partition 0. Stop serving,
+// so the other nodes move to the new leader, and follow it like any other
+// node. The table thread stays for a later promotion.
 // @unsafe - RPC server teardown, background threads
 void DemoteLocked() {
     if (!g_cfg_leading) return;
@@ -769,10 +769,10 @@ void DemoteLocked() {
                    "config from shard 0's replicas", MyReplicaName().c_str());
 }
 
-// Raft: bring serving in line with whether this replica leads partition 0
-// now. Raft reports leadership per partition, so the check asks about
-// partition 0 itself. It runs on its own thread, because the callbacks run
-// on Raft's threads and stopping a watcher can take a poll interval plus
+// Bring serving in line with whether this replica leads partition 0 now.
+// Raft reports leadership per partition, so the check asks about partition
+// 0 itself. It runs on its own thread, because the callbacks run on the
+// replication threads and stopping a watcher can take a poll interval plus
 // an RPC timeout. A check requested while one is still queued is folded
 // into it, since each check reads the current state.
 std::atomic<bool> g_cfg_check_queued{false};
@@ -844,7 +844,8 @@ void BootstrapClusterConfig(abstract_db* db) {
 
 // Paxos: called on a failover callback thread (the takeover), which must not
 // wait, so the promotion runs on its own thread. Raft reports through
-// ClusterConfigLeadershipChanged instead.
+// ClusterConfigLeadershipChanged instead, and so does a Paxos leader that
+// steps down.
 // @unsafe - background thread
 void PromoteClusterConfigLeader() {
     if (!cluster_config_enabled() || janus::is_using_raft()) return;
@@ -857,7 +858,7 @@ void PromoteClusterConfigLeader() {
 
 // @unsafe - background thread
 void ClusterConfigLeadershipChanged() {
-    if (!cluster_config_enabled() || !janus::is_using_raft()) return;
+    if (!cluster_config_enabled()) return;
     if (BenchmarkConfig::getInstance().getShardIndex() != 0) return;  // only shard 0 serves
     QueueLeadershipCheck();
 }
