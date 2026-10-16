@@ -3,7 +3,7 @@
 # Failover test for the cluster config (MAKO_CLUSTER_CONFIG=1) on a 2-shard
 # replicated run. Once every node reads the config from the shard-0 replica
 # that serves it, the test changes the config through mako_config, then
-# kills that replica (or, under Raft, pauses it and resumes it), and checks
+# kills that replica (or pauses it and resumes it), and checks
 # from the logs and the tool that:
 #   1. the change is applied, confirmed replicated, and loaded by every node,
 #   2. another shard-0 replica takes over and serves the config,
@@ -12,7 +12,7 @@
 #   5. the change is still in the config after the failover, and the new
 #      leader applies and confirms a change of its own,
 #   6. no node exited before the event, and no shard-0 replica after it.
-# Killing shard 0's leader also runs Mako's own cross-shard failover
+# Taking over from shard 0's leader also runs Mako's own cross-shard failover
 # handling, which can stop another shard's replicas; such exits are
 # reported as warnings, and at least one node outside shard 0 must stay up
 # and follow the new leader.
@@ -20,8 +20,8 @@
 # stops the run itself and judges only the config.
 #
 # Usage: test_2shard_config_failover.sh [paxos|raft] [kill|pause]
-#   pause needs Raft: a Paxos leader that resumes after a takeover has no path
-#   that makes it step down.
+#   A paused leader that resumes after a takeover must step down: Raft tells
+#   it through a newer term, Paxos through an acceptor that refuses it.
 # Env: MAKO_CFG_FAILOVER_PAUSE (seconds paused, default 12),
 #      MAKO_CFG_FAILOVER_TIMEOUT (seconds to converge after the event, default 60).
 
@@ -31,9 +31,9 @@ source "${SCRIPT_DIR}/simple_transaction_rep_port_utils.sh"
 replication="${1:-paxos}"
 event="${2:-kill}"
 case "$replication/$event" in
-    paxos/kill|raft/kill|raft/pause) ;;
+    paxos/kill|paxos/pause|raft/kill|raft/pause) ;;
     *)
-        echo "Usage: $0 [paxos|raft] [kill|pause]   (pause needs raft)"
+        echo "Usage: $0 [paxos|raft] [kill|pause]"
         exit 2
         ;;
 esac
@@ -519,7 +519,7 @@ if [ "${#shard0_died[@]}" -gt 0 ]; then
 fi
 if [ "${#others_died[@]}" -gt 0 ]; then
     echo "  ⚠ Exited after the $event, outside shard 0: ${others_died[*]}"
-    echo "    (killing shard 0's leader also runs Mako's own cross-shard failover handling)"
+    echo "    (taking over from shard 0's leader also runs Mako's own cross-shard failover handling)"
     report_exits "${others_died[@]}"
 fi
 
