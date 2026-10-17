@@ -1,5 +1,6 @@
 #include "cluster_bootstrap.h"
 
+#include <stdio.h>   // snprintf
 #include <stdlib.h>  // getenv, strtol, atol
 #include <string.h>  // strcmp
 #include <algorithm>
@@ -638,13 +639,48 @@ abstract_ordered_index* ConfigTable() {
     return g_cfg_db == nullptr ? nullptr : g_cfg_db->get_index_by_table_id(mako::CONFIG_TABLE_ID);
 }
 
+// Which cluster a config belongs to: MAKO_CLUSTER_ID when set, else a
+// fingerprint of the cluster's layout in the shard config (the shard count
+// and every replica's name and host; not ports, which a restart may move).
+// The seed stores it under kClusterIdKey, and a restart takes an earlier
+// log's config only when it holds the same one. Clusters laid out alike
+// share a fingerprint; MAKO_CLUSTER_ID keeps their logs apart.
+const std::string kClusterIdKey = "cluster/id";
+
+// @safe - reads the shard config
+std::string ClusterIdentity(uint32_t nshards) {
+    const char* id = getenv("MAKO_CLUSTER_ID");
+    if (id != nullptr && id[0] != '\0') return std::string("id:") + id;
+    transport::Configuration* tc = BenchmarkConfig::getInstance().getConfig();
+    uint64_t h = 1469598103934665603ULL;   // FNV-1a, field by field
+    auto mix = [&h](const std::string& field) {
+        for (unsigned char c : field) {
+            h ^= c;
+            h *= 1099511628211ULL;
+        }
+        h ^= 0xff;
+        h *= 1099511628211ULL;
+    };
+    mix(std::to_string(nshards));
+    for (uint32_t sid = 0; sid < nshards; ++sid) {
+        for (const auto& r : ShardReplicas(tc, sid)) {
+            mix(r.name);
+            mix(r.addr.substr(0, r.addr.rfind(':')));
+        }
+    }
+    char buf[32];
+    snprintf(buf, sizeof buf, "layout:%016llx", static_cast<unsigned long long>(h));
+    return buf;
+}
+
 // Shard 0's config as this node last persisted it before it started: the
 // last value of every config-table key in the newest earlier log, written
-// by a shard-0 leader process of a cluster with the same number of shards,
-// that holds a config (RocksDBPersistence keeps one log per process), with
-// a removal as kRemovedMarker. Only a process that persists its log (shard
-// 0's preferred leader) has earlier logs; empty there too when none holds a
-// config or with MAKO_CLUSTER_CONFIG_RECOVER=0.
+// by a shard-0 leader process of this cluster (same number of shards and
+// same ClusterIdentity), that holds a config (RocksDBPersistence keeps one
+// log per process), with a removal as kRemovedMarker. Only a process that
+// persists its log (shard 0's preferred leader) has earlier logs; empty
+// there too when none holds this cluster's config or with
+// MAKO_CLUSTER_CONFIG_RECOVER=0.
 struct PersistedConfig {
     std::string log;                            // where it came from
     std::map<std::string, std::string> keys;
@@ -667,6 +703,7 @@ PersistedConfig ReadPersistedConfig(uint32_t nshards) {
     if (mine.empty()) return PersistedConfig{};
     // This process's log is <prefix><pid>; earlier runs left theirs beside it.
     const std::string prefix = mine.substr(0, mine.find_last_not_of("0123456789") + 1);
+    const std::string identity = ClusterIdentity(nshards);
     size_t tried = 0;
     for (const std::string& log : mako::RocksDBPersistence::previousLogs(prefix, mine)) {
         if (tried++ == kEarlierLogsTried) break;
@@ -697,6 +734,14 @@ PersistedConfig ReadPersistedConfig(uint32_t nshards) {
         if (!read || !same_cluster || found.writes == 0) {
             srpc::Log_info("BootstrapClusterConfig: earlier log {} has no config for this cluster",
                            log.c_str());
+            continue;
+        }
+        auto id = found.keys.find(kClusterIdKey);
+        if (id == found.keys.end() || id->second != identity) {
+            srpc::Log_info("BootstrapClusterConfig: earlier log {} holds another cluster's config "
+                           "({}, this cluster is {})", log.c_str(),
+                           id == found.keys.end() ? "no cluster id" : id->second.c_str(),
+                           identity.c_str());
             continue;
         }
         if (malformed > 0) {
@@ -774,6 +819,7 @@ void StartShard0Leader(uint32_t nshards, const ConfigEndpoint& ep) {
     const PersistedConfig persisted = ReadPersistedConfig(nshards);
     g_cfg_store->begin_batch();   // the whole seed as one transaction
     SeedTopology(g_cfg_cm.as_ref().unwrap().get(), nshards, std::string());
+    g_cfg_store->put(kClusterIdKey, ClusterIdentity(nshards));
     if (!persisted.keys.empty()) RestorePersistedConfig(g_cfg_cm.as_ref().unwrap().get(), persisted);
     g_cfg_store->end_batch();
 
@@ -868,6 +914,7 @@ void PromoteLocked() {
         cm->set_shard_leader(0, me);
     } else {
         SeedTopology(cm, g_cfg_nshards, me);
+        g_cfg_store->put(kClusterIdKey, ClusterIdentity(g_cfg_nshards));
     }
     g_cfg_store->end_batch();
     if (janus::is_using_raft() &&
