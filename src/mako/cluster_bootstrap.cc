@@ -155,6 +155,7 @@ public:
     uint32_t last_commit_log_timestamp() const { return last_commit_log_ts_.load(); }
 
     static inline const std::string kRemovedMarker = std::string("\0mako-config-removed\0", 21);
+    static inline const std::string kVersionKey = "__version__";
 
 private:
     bool in_my_batch() const { return batch_owner_.load() == std::this_thread::get_id(); }
@@ -162,16 +163,32 @@ private:
     // On the table thread: the batch as one transaction, retried on a
     // conflict. A transactional put keeps a pointer to its encoded value
     // until commit, so the encoded values live in `values` until then.
+    // __version__ goes last: a follower replays the transaction's writes in
+    // log order, each as a transaction of its own, so a replica serving
+    // reads while it replays shows a new version only once the rest of the
+    // change is in (a reader that saw part of it then sees the version move
+    // and reloads).
     void CommitBatch(const std::map<std::string, std::string>& writes) {
+        std::vector<const std::pair<const std::string, std::string>*> order;
+        order.reserve(writes.size());
+        const std::pair<const std::string, std::string>* version = nullptr;
+        for (const auto& kv : writes) {
+            if (kv.first == kVersionKey) {
+                version = &kv;
+            } else {
+                order.push_back(&kv);
+            }
+        }
+        if (version != nullptr) order.push_back(version);
         std::vector<std::string> values;
-        values.reserve(writes.size());
-        for (const auto& kv : writes) values.push_back(mako::Encode(kv.second));
+        values.reserve(order.size());
+        for (const auto* kv : order) values.push_back(mako::Encode(kv->second));
         for (;;) {
             try {
                 void* txn = db_->new_txn(0, arena_, nullptr);
                 size_t i = 0;
-                for (const auto& kv : writes) {
-                    idx_->tx_put(txn, lcdf::Str(kv.first.data(), kv.first.size()), values[i++]);
+                for (const auto* kv : order) {
+                    idx_->tx_put(txn, lcdf::Str(kv->first.data(), kv->first.size()), values[i++]);
                 }
                 db_->commit_txn(txn);
                 last_commit_log_ts_.store(TThread::last_log_timestamp);
