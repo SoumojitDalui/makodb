@@ -377,6 +377,11 @@ bool ResolveConfigEndpoints(std::vector<ConfigEndpoint>* out) {
 std::string MyReplicaName() {
     auto& bench = BenchmarkConfig::getInstance();
     transport::Configuration* tc = bench.getConfig();
+    // A new-format process was started as a site name, which ShardReplicas
+    // lists; dbtest then keeps only its role in the proc name.
+    if (tc != nullptr && tc->is_new_format && !bench.getSiteName().empty()) {
+        return bench.getSiteName();
+    }
     if (tc != nullptr && tc->is_new_format) return bench.getPaxosProcName();
     return "shard" + std::to_string(bench.getShardIndex()) + "-" + bench.getCluster();
 }
