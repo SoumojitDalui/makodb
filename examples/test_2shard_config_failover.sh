@@ -402,6 +402,20 @@ change_version=$CHANGE_VERSION
 echo "  ✓ Applied and confirmed replicated at version $change_version"
 
 if [ "$timing" = right-after ]; then
+    # The event must hit the replica that confirmed the change: if
+    # leadership moved while the change was retried, the case did not run.
+    moved=""
+    for i in "${!NODES[@]}"; do
+        n=${NODES[$i]}
+        [[ "$n" == shard0-* ]] && [ "$n" != "$event_node" ] || continue
+        if tail -n +"$((LINES_BEFORE[$i] + 1))" "$(log_of "$n")" | grep -a -q "now leads shard 0 and serves"; then
+            moved="$moved $n"
+        fi
+    done
+    if ! serves_config "$event_node" || [ "$(pid_of "$event_node")" != "$event_pid" ] || [ -n "$moved" ]; then
+        echo "  ✗ $event_node no longer served the config when the change was confirmed (took over:${moved:- none}); the right-after case did not run"
+        exit 1
+    fi
     echo "  (the $event follows at once, before every node loads the change)"
 else
     waited=0
