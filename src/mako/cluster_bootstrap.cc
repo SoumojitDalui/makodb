@@ -640,11 +640,12 @@ abstract_ordered_index* ConfigTable() {
 }
 
 // Which cluster a config belongs to: MAKO_CLUSTER_ID when set, else a
-// fingerprint of the cluster's layout in the shard config (the shard count
-// and every replica's name and host; not ports, which a restart may move).
-// The seed stores it under kClusterIdKey, and a restart takes an earlier
-// log's config only when it holds the same one. Clusters laid out alike
-// share a fingerprint; MAKO_CLUSTER_ID keeps their logs apart.
+// fingerprint of the cluster's addresses in the shard config (the shard
+// count and every replica's name and host:port). The seed stores it under
+// kClusterIdKey, and a restart takes an earlier log's config only when it
+// holds the same one. Ports are part of it: two clusters of one user can
+// share names and hosts and differ only in ports. So a cluster restarted
+// on other addresses is taken for a new one unless MAKO_CLUSTER_ID names it.
 const std::string kClusterIdKey = "cluster/id";
 
 // @safe - reads the shard config
@@ -665,12 +666,34 @@ std::string ClusterIdentity(uint32_t nshards) {
     for (uint32_t sid = 0; sid < nshards; ++sid) {
         for (const auto& r : ShardReplicas(tc, sid)) {
             mix(r.name);
-            mix(r.addr.substr(0, r.addr.rfind(':')));
+            mix(r.addr);
         }
     }
     char buf[32];
-    snprintf(buf, sizeof buf, "layout:%016llx", static_cast<unsigned long long>(h));
+    snprintf(buf, sizeof buf, "addrs:%016llx", static_cast<unsigned long long>(h));
     return buf;
+}
+
+// Whether a config persisted before configs carried kClusterIdKey is this
+// cluster's: without MAKO_CLUSTER_ID, when its seed (`seeded`, the first
+// value the log holds for each key) has this shard count and every replica
+// in the shard config at the same address. The seed wrote both from the
+// shard config its run started with, so a node address changed later at
+// runtime does not hide the cluster's own log.
+// @safe - reads the shard config
+bool LegacyConfigMatches(const std::map<std::string, std::string>& seeded, uint32_t nshards) {
+    const char* id = getenv("MAKO_CLUSTER_ID");
+    if (id != nullptr && id[0] != '\0') return false;
+    auto count = seeded.find("shard_count");
+    if (count == seeded.end() || count->second != std::to_string(nshards)) return false;
+    transport::Configuration* tc = BenchmarkConfig::getInstance().getConfig();
+    for (uint32_t sid = 0; sid < nshards; ++sid) {
+        for (const auto& r : ShardReplicas(tc, sid)) {
+            auto addr = seeded.find("node/" + r.name + "/addr");
+            if (addr == seeded.end() || addr->second != r.addr) return false;
+        }
+    }
+    return true;
 }
 
 // Shard 0's config as this node last persisted it before it started: the
@@ -684,6 +707,7 @@ std::string ClusterIdentity(uint32_t nshards) {
 struct PersistedConfig {
     std::string log;                            // where it came from
     std::map<std::string, std::string> keys;
+    std::map<std::string, std::string> seeded;  // each key's first value
     size_t writes = 0;                          // config-table writes read
 };
 
@@ -724,8 +748,10 @@ PersistedConfig ReadPersistedConfig(uint32_t nshards) {
                     entry, len, [&](uint32_t, unsigned short table, bool removed,
                                     std::string_view key, std::string_view value) {
                         if (table != mako::CONFIG_TABLE_ID) return;
-                        found.keys[std::string(key)] =
+                        std::string v =
                             removed ? ConfigTableStore::kRemovedMarker : std::string(value);
+                        found.seeded.emplace(std::string(key), v);
+                        found.keys[std::string(key)] = std::move(v);
                         ++found.writes;
                     });
                 if (!whole) ++malformed;
@@ -737,10 +763,17 @@ PersistedConfig ReadPersistedConfig(uint32_t nshards) {
             continue;
         }
         auto id = found.keys.find(kClusterIdKey);
-        if (id == found.keys.end() || id->second != identity) {
+        if (id == found.keys.end()) {
+            if (!LegacyConfigMatches(found.seeded, nshards)) {
+                srpc::Log_info("BootstrapClusterConfig: earlier log {} has no cluster id and other "
+                               "addresses; it is another cluster's", log.c_str());
+                continue;
+            }
+            srpc::Log_info("BootstrapClusterConfig: earlier log {} has no cluster id but this "
+                           "cluster's addresses", log.c_str());
+        } else if (id->second != identity) {
             srpc::Log_info("BootstrapClusterConfig: earlier log {} holds another cluster's config "
-                           "({}, this cluster is {})", log.c_str(),
-                           id == found.keys.end() ? "no cluster id" : id->second.c_str(),
+                           "({}, this cluster is {})", log.c_str(), id->second.c_str(),
                            identity.c_str());
             continue;
         }
