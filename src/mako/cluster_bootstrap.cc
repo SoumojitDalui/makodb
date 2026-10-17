@@ -566,22 +566,18 @@ void StartLocalWatcher(ConfigManager* cm) {
 // change is one transaction, made under g_cfg_mu so it does not interleave
 // with a promotion or a demotion. The answer then waits until shard 0's
 // replicas hold it. The table thread pushes the commit's log entry to
-// partition 0 as it commits, and partition 0's replicated timestamp
-// (local_timestamp_[0], timestamp*10 + term) moves to each of its entries
-// as they commit, in log order. So the entry has committed once that
-// timestamp reads the entry's own, or, if a later entry moved it on first,
-// a timestamp above the commit counter (sync_logger::local_replica_id)
-// read after the change: every commit timestamp comes from that counter,
-// so such an entry was queued after this one. A change not seen committed
-// within kConfigChangeReplicationWait is answered as applied but
-// unconfirmed; that happens when partition 0's replicated timestamp stops
-// moving on this replica, which Mako's leaders do for some partitions
-// (seen for partition 0 with three workers per shard).
+// partition 0 as it commits, and partition 0's leader callback records the
+// log timestamp (timestamp*10 + term) of each entry that commits
+// (sync_logger::record_commit). So the change has committed once its own
+// entry's timestamp shows up there. (Partition 0's replicated timestamp
+// moves past the entry within moments, and a later timestamp there shows
+// nothing: entry timestamps are not in log order, since a cross-shard
+// transaction takes a remote timestamp.) A change not seen committed within
+// kConfigChangeReplicationWait is answered as applied but unconfirmed.
 // @unsafe - config store writes, replication state reads
 ConfigChangeResult ApplyConfigChangeOnLeader(const std::string& op,
                                              const std::vector<std::string>& args) {
     ConfigChangeResult result;
-    uint64_t counter_after = 0;
     uint32_t own_entry = 0;
     {
         std::lock_guard<std::mutex> lock(g_cfg_mu);
@@ -596,8 +592,6 @@ ConfigChangeResult ApplyConfigChangeOnLeader(const std::string& op,
         result = ApplyConfigChangeTo(cm, op, args);
         if (result.status != kConfigChangeApplied || result.version == before) return result;
         own_entry = g_cfg_store->last_commit_log_timestamp();
-        counter_after = static_cast<uint64_t>(
-            __atomic_load_n(&sync_util::sync_logger::local_replica_id, __ATOMIC_ACQUIRE));
     }
     std::string change = op;
     for (const auto& a : args) change += " " + a;
@@ -605,16 +599,8 @@ ConfigChangeResult ApplyConfigChangeOnLeader(const std::string& op,
                    change.c_str(), result.version);
 
     const auto deadline = std::chrono::steady_clock::now() + kConfigChangeReplicationWait;
-    while (!sync_util::sync_logger::local_timestamp_.empty() &&
-           std::chrono::steady_clock::now() < deadline) {
-        const uint32_t replicated =
-            sync_util::sync_logger::local_timestamp_[0].load(std::memory_order_acquire);
-        // A stream that has ended reads as the maximum, which says nothing
-        // about this entry.
-        if (replicated != std::numeric_limits<uint32_t>::max() &&
-            (replicated == own_entry || replicated / 10 > counter_after)) {
-            return result;
-        }
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (sync_util::sync_logger::recently_committed(own_entry)) return result;
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     result.status = kConfigChangeUnconfirmed;
