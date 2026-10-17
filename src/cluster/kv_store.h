@@ -7,9 +7,9 @@ namespace janus {
 
 /**
  * KvStore — the minimal key-value port the cluster metadata component
- * depends on. Deliberately tiny (three methods, string keys and raw
- * byte values, stdlib only) so `cluster` compiles and unit-tests with
- * NO dependency on the storage engine.
+ * depends on. Deliberately tiny (get/put/remove plus batch brackets,
+ * string keys and raw byte values, stdlib only) so `cluster` compiles
+ * and unit-tests with NO dependency on the storage engine.
  *
  * This is a decoupling seam, not a parallel substrate. In production
  * the port is bound to Mako's unified FullOrderedIndex — the
@@ -32,10 +32,17 @@ pub trait KvStore {
     fn put(&mut self, key: &std::string, value: &std::string);
     // Point delete: no-op if the key is absent.
     fn remove(&mut self, key: &std::string);
+    // Writes between begin_batch and the matching end_batch form one
+    // change; a store that can commits them as one transaction at the
+    // outermost end_batch (batches nest). Others apply writes as made.
+    fn begin_batch(&mut self);
+    fn end_batch(&mut self);
 }
 #endif
 export {
-/*RUSTYCPP:GEN-BEGIN id=kv_store.1 version=1 rust_sha256=fcaaf367b94719c3db074bc9cef6ef83ad25c9a1fc53c9d2bcce23e6cad1f2d0*/
+/*RUSTYCPP:GEN-BEGIN id=kv_store.1 version=1 rust_sha256=bc526c445bb935f0315187ba8dbc062c05d78c4b30b1bb7c378debd88d7d94eb*/
+class KvStore;
+
 class KvStore {
 public:
     virtual ~KvStore() noexcept(false) {}
