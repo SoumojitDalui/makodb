@@ -93,6 +93,8 @@ inline std::string cc_shard_status(const ClusterConfigState& s, uint32_t id) {
 uint32_t cc_hash_key(const std::string& key);
 uint32_t cc_follow_replacement(const ClusterConfigState& s, uint32_t sid);
 int64_t cc_extract_key_value(KeyExtractor ext, const std::string& key);
+int32_t cc_policy_shard(const ClusterConfigState& s, const std::string& table,
+                        const std::string& key);
 uint32_t cc_route(const ClusterConfigState& s, const std::string& table,
                   const std::string& key);
 // Rebuild the topology from a ConfigManager (declared; defined in the .cc
@@ -184,6 +186,13 @@ impl ClusterConfig {
         let g = (*self).state.lock().unwrap();
         (*g).table_policies.contains_key(table)
     }
+    // The shard the table's own policy gives the key, before dead-shard
+    // replacement; -1 when the table has no policy or its ranges do not
+    // cover the key (routing then keeps the table's placement).
+    fn policy_shard_for_key(&self, table: &std::string, key: &std::string) -> i32 {
+        let g = (*self).state.lock().unwrap();
+        unsafe { cc_policy_shard((*g), table, key) }
+    }
     // The shard that serves `shard_id` now: itself, or the end of its
     // dead-shard replacement chain.
     fn resolve_live_shard(&self, shard_id: u32) -> u32 {
@@ -240,7 +249,7 @@ impl ClusterConfig {
     }
 }
 #endif
-/*RUSTYCPP:GEN-BEGIN id=cluster_config.1 version=1 rust_sha256=e1de5d35f4fd519f547c0f785281dc9d48210e877391636a31aefddd2b292863*/
+/*RUSTYCPP:GEN-BEGIN id=cluster_config.1 version=1 rust_sha256=9df084b94210363ba4c08a92566707fe59243e329daa8c5861e1c88d2e335254*/
 struct ClusterConfig;
 
 struct ClusterConfig {
@@ -254,6 +263,7 @@ struct ClusterConfig {
     void set_table_policy(const std::string& table, TableShardingPolicy policy);
     void clear_table_policy(const std::string& table);
     bool has_table_policy(const std::string& table) const;
+    int32_t policy_shard_for_key(const std::string& table, const std::string& key) const;
     uint32_t resolve_live_shard(uint32_t shard_id) const;
     uint32_t routing_hints() const;
     uint32_t get_shard_count() const;
@@ -311,6 +321,14 @@ void ClusterConfig::clear_table_policy(const std::string& table) {
 bool ClusterConfig::has_table_policy(const std::string& table) const {
     const auto&& g = rusty::deref_call(((*this)).state.lock(), rusty::detail::__mdisp_unwrap{});
     return (rusty::detail::deref_if_pointer_like(g)).table_policies.contains_key(table);
+}
+
+int32_t ClusterConfig::policy_shard_for_key(const std::string& table, const std::string& key) const {
+    const auto&& g = rusty::deref_call(((*this)).state.lock(), rusty::detail::__mdisp_unwrap{});
+    // @unsafe
+    {
+        return cc_policy_shard((rusty::detail::deref_if_pointer_like(g)), table, key);
+    }
 }
 
 uint32_t ClusterConfig::resolve_live_shard(uint32_t shard_id) const {
