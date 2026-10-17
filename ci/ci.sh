@@ -563,7 +563,8 @@ run_2shard_config_failover() {
     echo "========================================="
     echo "Running: ./ci/ci.sh shard2ConfigFailover"
     echo "========================================="
-    run_config_failover_case shard2ConfigFailover paxos kill
+    run_config_failover_case shard2ConfigFailover paxos kill &&
+        run_config_failover_case shard2ConfigFailover paxos pause
 }
 
 run_2shard_config_failover_raft() {
