@@ -14,6 +14,8 @@
 # restored and its own change: all of them are still there.
 #
 # Usage: test_2shard_config_restart.sh
+# Exit status: 0 passed, 1 a check failed, 3 the first run never came up
+# (startup or setup), which is the only case worth retrying.
 # Env: MAKO_CFG_RESTART_SETTLE (seconds between the last change and the
 #      crash, default 3: shard 0's leader persists its log asynchronously).
 
@@ -59,8 +61,11 @@ for bin in "./${BUILD_DIR:-build}/dbtest" "$tool_path"; do
     fi
 done
 
+# The cluster never got as far as the test.
+SETUP_FAILED=3
+
 if ! ensure_paxos_replication_configs "$trd" 2; then
-    exit 1
+    exit $SETUP_FAILED
 fi
 
 # Stops every process of the current run with SIGKILL, as a crash would.
@@ -223,8 +228,8 @@ leader_log() {
 }
 
 # ---- run 1: change the config, then crash -------------------------------
-start_cluster || exit 1
-wait_ready || exit 1
+start_cluster || exit $SETUP_FAILED
+wait_ready || exit $SETUP_FAILED
 echo "  ✓ Run 1: every node loaded version $SERVED_VERSION from shard 0's leader"
 if grep -a -q "restored [0-9]* of" "$(log_of shard0-localhost)"; then
     echo "  ✗ Run 1: shard 0's leader restored a config on a fresh start"
