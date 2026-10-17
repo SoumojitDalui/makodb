@@ -195,13 +195,18 @@ bool cc_load_from_cm(ClusterConfigState& s, ConfigManager* cm) {
     // loaded config stays as it was. (A change still in flight shows up as a
     // new version on the next poll.)
     //
-    // Versions only grow: each change bumps the version, and a replica that
-    // takes over shard 0 continues above every version it has seen and
-    // above a floor from its replication term. So a lower version comes
-    // from a replica that has lost shard 0 but not stepped down yet, and
-    // loading it would undo changes this node already has.
+    // A replica that takes over shard 0 moves the version to a newer term:
+    // the shard-0 bootstrap puts partition 0's replication term in a
+    // version's high 32 bits (term << 32 | (replica position + 1) << 24 |
+    // count), and each change bumps it. So a version from an older term
+    // comes from a replica that has lost shard 0 but not stepped down yet,
+    // and loading it would undo changes this node already has. Two replicas
+    // can claim the same term (Mako's Raft can let that happen); their
+    // versions are told apart by position, not ordered, so one of the same
+    // term is loaded even when it is lower, or nodes that saw the other
+    // first would never take the replica that stays leader.
     const uint64_t ver = cm->get_version();
-    if (ver == 0 || ver < s.version) return false;
+    if (ver == 0 || (ver >> 32) < (s.version >> 32)) return false;
     uint32_t count = cm->get_shard_count();
     if (count == 0) return false;   // no topology, or shard_count read failed
     uint64_t ep = cm->get_epoch();
