@@ -82,23 +82,29 @@ pub fn cc_extract_key_value(ext: KeyExtractor, key: &std::string) -> i64 {
 }
 // Full routing: per-table policy -> range shard, else hash-mod; then chase
 // any dead-shard replacement. Returns 0 when there are no shards.
+// The shard a table's own policy gives the key, before dead-shard
+// replacement; -1 when the table has no policy or its ranges do not
+// cover the key.
+pub fn cc_policy_shard(s: &ClusterConfigState, table: &std::string, key: &std::string) -> i32 {
+    if table.empty() || !s.table_policies.contains_key(table) {
+        return -1;
+    }
+    let kv: i64 = janus::cc_extract_key_value(s.table_policies.get(table).unwrap().key_extractor, key);
+    s.table_policies.get(table).unwrap().get_shard(kv)
+}
+
 pub fn cc_route(s: &ClusterConfigState, table: &std::string, key: &std::string) -> u32 {
     if s.shard_count == 0 {
         return 0;
     }
-    if !table.empty() {
-        if s.table_policies.contains_key(table) {
-            let kv: i64 = janus::cc_extract_key_value(s.table_policies.get(table).unwrap().key_extractor, key);
-            let sid: i32 = s.table_policies.get(table).unwrap().get_shard(kv);
-            if sid >= 0 {
-                return janus::cc_follow_replacement(s, sid as u32);
-            }
-        }
+    let sid: i32 = janus::cc_policy_shard(s, table, key);
+    if sid >= 0 {
+        return janus::cc_follow_replacement(s, sid as u32);
     }
     janus::cc_follow_replacement(s, janus::cc_hash_key(key) % s.shard_count)
 }
 #endif
-/*RUSTYCPP:GEN-BEGIN id=cluster_config.1 version=1 rust_sha256=a5983ec6e8c4afa923e9219fec7150d4423047fb466f4e5bd8467b1778d8914f*/
+/*RUSTYCPP:GEN-BEGIN id=cluster_config.1 version=1 rust_sha256=9d9b3aa88dc12180adca87360d505752e0534f79ba56ef9c34eedb77d90c8ab2*/
 uint32_t cc_hash_key(const std::string& key);
 
 uint32_t cc_hash_key(const std::string& key) {
@@ -157,18 +163,21 @@ int64_t cc_extract_key_value(KeyExtractor ext, const std::string& key) {
     return std::move(value);
 }
 
+int32_t cc_policy_shard(const ClusterConfigState& s, const std::string& table, const std::string& key) {
+    if (table.empty() || rusty::detail::rust_not(s.table_policies.contains_key(table))) {
+        return -1;
+    }
+    const int64_t kv = janus::cc_extract_key_value(s.table_policies.get(table).unwrap().key_extractor, key);
+    return s.table_policies.get(table).unwrap().get_shard(std::move(kv));
+}
+
 uint32_t cc_route(const ClusterConfigState& s, const std::string& table, const std::string& key) {
     if (rusty::detail::deref_if_pointer_like(s.shard_count) == 0) {
         return static_cast<uint32_t>(0);
     }
-    if (rusty::detail::rust_not(table.empty())) {
-        if (s.table_policies.contains_key(table)) {
-            const int64_t kv = janus::cc_extract_key_value(s.table_policies.get(table).unwrap().key_extractor, key);
-            const int32_t sid = s.table_policies.get(table).unwrap().get_shard(std::move(kv));
-            if (rusty::detail::deref_if_pointer_like(sid) >= 0) {
-                return janus::cc_follow_replacement(s, static_cast<uint32_t>(sid));
-            }
-        }
+    const int32_t sid = janus::cc_policy_shard(s, table, key);
+    if (rusty::detail::deref_if_pointer_like(sid) >= 0) {
+        return janus::cc_follow_replacement(s, static_cast<uint32_t>(sid));
     }
     return janus::cc_follow_replacement(s, janus::cc_hash_key(key) % rusty::detail::deref_if_pointer_like(s.shard_count));
 }

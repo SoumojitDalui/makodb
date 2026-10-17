@@ -40,9 +40,10 @@ namespace mako {
 // 0's __mako_config__), it refines that in two ways only: a table with its
 // own policy in the config routes by that policy, and every result is
 // passed through the config's dead-shard replacement pointers. The config's
-// hash-mod default is deliberately NOT applied to tables without a policy:
-// Mako does not place data by key hash, so hashing would send requests to
-// shards that do not hold the table.
+// hash-mod default is deliberately NOT applied, neither to tables without a
+// policy nor to keys a table's policy does not cover: Mako does not place
+// data by key hash, so hashing would send requests to shards that do not
+// hold the table.
 //
 // Every worker routes every remote key through here, so the config is
 // consulted through its lock-free routing hints: the config's mutex is
@@ -64,10 +65,13 @@ pub fn compute_shard_for_key(table_id: i32, key: &std::string) -> i32 {
         }
     }
 
-    if cc_policies && has_name
-        && janus::get_cluster_config().has_table_policy(&table_name) {
-        // Policy shard, then any dead-shard replacement.
-        return janus::get_cluster_config().get_shard_for_key(&table_name, key) as i32;
+    if cc_policies && has_name {
+        // The table's own policy, when it covers the key, then any
+        // dead-shard replacement.
+        let sid: i32 = janus::get_cluster_config().policy_shard_for_key(&table_name, key);
+        if sid >= 0 {
+            return janus::get_cluster_config().resolve_live_shard(sid as u32) as i32;
+        }
     }
 
     // Placement: ShardingPolicyCache, else the table-ID home shard.
@@ -122,7 +126,7 @@ pub fn get_policy_num_shards() -> i32 {
     0
 }
 #endif
-/*RUSTYCPP:GEN-BEGIN id=shard_router.1 version=1 rust_sha256=57b93b8e14bd1f3167077072ff50f58f1948dd2de51382fa2d6c697658afaaaf*/
+/*RUSTYCPP:GEN-BEGIN id=shard_router.1 version=1 rust_sha256=70454f9a29bfdad308aced0b1fd0cb40ea66860d46d267b7ebbc1af653d5905e*/
 int32_t compute_shard_for_key(int32_t table_id, const std::string& key);
 int32_t compute_shard_for_key_value(int32_t table_id, const std::string& table_name, int64_t key_value);
 bool has_policy_routing(const std::string& table_name);
@@ -143,8 +147,11 @@ int32_t compute_shard_for_key(int32_t table_id, const std::string& key) {
             has_name = true;
         }
     }
-    if ((rusty::detail::deref_if_pointer_like(cc_policies) && rusty::detail::deref_if_pointer_like(has_name)) && janus::get_cluster_config().has_table_policy(table_name)) {
-        return static_cast<int32_t>(janus::get_cluster_config().get_shard_for_key(table_name, key));
+    if (rusty::detail::deref_if_pointer_like(cc_policies) && rusty::detail::deref_if_pointer_like(has_name)) {
+        const int32_t sid = janus::get_cluster_config().policy_shard_for_key(table_name, key);
+        if (rusty::detail::deref_if_pointer_like(sid) >= 0) {
+            return static_cast<int32_t>(janus::get_cluster_config().resolve_live_shard(static_cast<uint32_t>(sid)));
+        }
     }
     int32_t placed = ((rusty::detail::deref_if_pointer_like(table_id) - static_cast<int32_t>(1))) / rusty::detail::deref_if_pointer_like(SHARD_ROUTER_NUM_TABLES_PER_SHARD);
     if (((rusty::detail::deref_if_pointer_like(cache_on) && rusty::detail::deref_if_pointer_like(has_name)) && rusty::detail::rust_not(key.empty())) && janus::get_sharding_policy_cache().has_policy_for_table(table_name)) {
