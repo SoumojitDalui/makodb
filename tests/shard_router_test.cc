@@ -282,6 +282,28 @@ TEST_F(ShardRouterTest, ClusterConfigTablePolicyOverridesPlacement) {
     janus::get_cluster_config().clear_table_policy("CC_POLICY_T");
 }
 
+// A key that the table's config policy does not cover (no range, default
+// -1) keeps the table's placement; it is not hashed across shards, which
+// would send it to a shard that does not hold the table. Keys 6 and 8
+// hash to shard 1, while table 1 is placed on shard 0.
+TEST_F(ShardRouterTest, ClusterConfigPolicyMissKeepsPlacement) {
+    get_table_registry().register_table(1, "CC_POLICY_MISS_T");   // home shard 0
+    populate_two_active_shards();
+    janus::get_cluster_config().set_table_policy(
+        "CC_POLICY_MISS_T",
+        janus::make_table_policy("CC_POLICY_MISS_T", janus::KeyExtractor::by_field(0),
+                                 {{0, 5, 1}}));
+
+    char key3[] = {0, 0, 0, 0, 0, 0, 0, 3};
+    char key6[] = {0, 0, 0, 0, 0, 0, 0, 6};
+    char key8[] = {0, 0, 0, 0, 0, 0, 0, 8};
+    EXPECT_EQ(1, compute_shard_for_key(1, std::string(key3, 8)));
+    EXPECT_EQ(0, compute_shard_for_key(1, std::string(key6, 8)));
+    EXPECT_EQ(0, compute_shard_for_key(1, std::string(key8, 8)));
+
+    janus::get_cluster_config().clear_table_policy("CC_POLICY_MISS_T");
+}
+
 // A dead shard's keys follow its replacement pointer, also for tables
 // placed by table ID.
 TEST_F(ShardRouterTest, ComputeShardFollowsDeadShardReplacementViaClusterConfig) {

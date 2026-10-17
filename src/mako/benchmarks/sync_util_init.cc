@@ -31,6 +31,8 @@ std::condition_variable sync_util::sync_logger::cv;
 std::unordered_map<int, uint32_t> sync_util::sync_logger::hist_timestamp = {};
 std::atomic<uint32_t> sync_util::sync_logger::noops_cnt{0};
 std::atomic<uint32_t> sync_util::sync_logger::noops_cnt_hole{0};
+std::atomic<uint32_t> sync_util::sync_logger::recent_commits_[sync_util::sync_logger::kRecentCommits]{};
+std::atomic<uint64_t> sync_util::sync_logger::recent_commit_count_{0};
 int sync_util::sync_logger::exchange_refresh_cnt = 0;
 std::atomic<bool> sync_util::sync_logger::exchange_running{true};
 int sync_util::sync_logger::failed_shard_index = -1;
