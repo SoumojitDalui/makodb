@@ -69,6 +69,11 @@ public:
                     uint32_t shard_id = 0, uint32_t num_shards = 1);
     void shutdown();
 
+    // The path initialize was given; empty until it succeeds, so empty in a
+    // process that does not persist its log. (Out of line: most callers see
+    // the class through rocksdb_persistence_fwd.h, which has no members.)
+    const std::string& dbPath() const;
+
     // Persist data asynchronously with ordered callback execution
     // Callbacks are guaranteed to execute in sequence number order per partition
     std::future<bool> persistAsync(const char* data, size_t size,
@@ -97,6 +102,24 @@ public:
     static bool parseMetadata(const std::string& db_path, uint32_t& epoch, uint32_t& shard_id,
                               uint32_t& num_shards, size_t& num_partitions, size_t& num_workers,
                               int64_t& timestamp);
+
+    // Where shard_id's leader keeps its log: <prefix><pid>, one database per
+    // partition p at <prefix><pid>_partition<p>. Each process writes its own.
+    static std::string leaderLogPrefix(const std::string& user, uint32_t shard_id);
+
+    // The logs under prefix other than skip_path, newest first by the time
+    // their partition 0 last changed. Lists them without opening any.
+    static std::vector<std::string> previousLogs(const std::string& prefix,
+                                                 const std::string& skip_path);
+
+    // Opens partition `partition` of the log at db_path read-only and calls
+    // fn with each log entry, in the order they were persisted, until fn
+    // returns false. meta, if given, receives the metadata writeMetadata
+    // stored (in partition 0) before fn is first called. False if the log
+    // cannot be read.
+    static bool forEachLogEntry(const std::string& db_path, size_t partition,
+                                const std::function<bool(const char*, size_t)>& fn,
+                                std::map<std::string, std::string>* meta = nullptr);
 
 private:
     RocksDBPersistence();
@@ -144,6 +167,7 @@ private:
     uint32_t shard_id_{0};
     uint32_t num_shards_{0};
 
+    std::string db_path_;
     bool initialized_{false};
 };
 
