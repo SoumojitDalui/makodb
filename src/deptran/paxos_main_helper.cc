@@ -78,6 +78,20 @@ int get_epoch(){
   return x;
 }
 
+bool is_local_partition_leader(uint32_t par_id) {
+  for (auto& worker : pxs_workers_g) {
+    if (worker->site_info_->partition_id_ == par_id) {
+      return worker->is_leader != 0;
+    }
+  }
+  return false;
+}
+
+// Paxos keeps one epoch per process; every failover advances it.
+uint64_t partition_term(uint32_t /*par_id*/) {
+  return static_cast<uint64_t>(get_epoch());
+}
+
 void set_epoch(int v) {
   auto x = get_epoch();
   if (v==-1) {

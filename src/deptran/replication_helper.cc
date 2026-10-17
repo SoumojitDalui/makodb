@@ -280,6 +280,14 @@ void set_epoch(int epoch) {
     DISPATCH_VOID_RAFT_OR_PAXOS(set_epoch, epoch);  // @unsafe
 }
 
+bool is_local_partition_leader(uint32_t par_id) {
+    DISPATCH_RAFT_OR_PAXOS(is_local_partition_leader, par_id);  // @unsafe
+}
+
+uint64_t partition_term(uint32_t par_id) {
+    DISPATCH_RAFT_OR_PAXOS(partition_term, par_id);  // @unsafe
+}
+
 void upgrade_p1_to_leader() {
     DISPATCH_VOID_RAFT_OR_PAXOS(upgrade_p1_to_leader);  // @unsafe
 }

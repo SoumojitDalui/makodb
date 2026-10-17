@@ -160,6 +160,11 @@ public:
   // Leadership & Partition queries
   // @unsafe - uses raw pointers, dynamic_cast
   bool IsLeader(uint32_t par_id);
+  // The Raft term of the group carrying par_id, 0 if this worker does not
+  // carry it. Read without the server's lock: it only grows, and callers
+  // use it as an ordering hint.
+  // @unsafe - uses raw pointers, dynamic_cast
+  uint64_t CurrentTerm(uint32_t par_id);
   // @unsafe - uses raw pointers, dynamic_cast
   siteid_t GetLeaderHint();
   // @unsafe - uses raw pointers
