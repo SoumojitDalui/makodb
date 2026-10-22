@@ -32,7 +32,8 @@
 # other live node reads from it (it must, within the convergence timeout),
 # and at least MAKO_CFG_FAILOVER_PAUSE seconds.
 # Exit status: 0 passed, 1 a check failed, 3 the cluster never got as far
-# as the test (startup or setup), which is the only case worth retrying.
+# as the test (startup or setup, or under Paxos too late for the learner to
+# take over), which is the only case worth retrying.
 # Env: MAKO_CFG_FAILOVER_PAUSE (seconds paused at least, default 12),
 #      MAKO_CFG_FAILOVER_TIMEOUT (seconds to converge after the event, default 60).
 
@@ -443,6 +444,26 @@ else
     fi
 
     pick_event_node
+fi
+
+# Paxos: shard 0's learner takes a leader it loses more than 35 s after
+# its heartbeat monitor started for the end of the run, not a failure, and
+# stops without taking over (heartbeatMonitor2). A run that reaches the
+# event that late (a slow start on a loaded host) cannot test a takeover,
+# so it counts as a setup failure. Seconds since the monitor started, or
+# nothing if the learner has not logged it.
+learner_monitor_age() {
+    local started
+    started=$(grep -a -m1 -o -E "[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8}.*start a heartbeatBackground" \
+        "$(log_of shard0-learner)" 2>/dev/null | cut -c1-19)
+    [ -n "$started" ] && echo $(( $(date +%s) - $(date -d "$started" +%s) ))
+}
+if [ "$replication" = "paxos" ]; then
+    age=$(learner_monitor_age)
+    if [ -n "$age" ] && [ "$age" -ge 32 ]; then
+        echo "  ✗ Too late for a takeover: shard 0's learner started watching the leader ${age}s ago, and it takes a leader lost after 35s for the end of the run"
+        exit $SETUP_FAILED
+    fi
 fi
 
 if [ "$event" = "kill" ]; then
