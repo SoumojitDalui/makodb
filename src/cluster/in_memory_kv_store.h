@@ -39,6 +39,10 @@ public:
 
     void remove(const std::string& key) override { store_.remove(key); }
 
+    // Single-threaded test double: writes apply as they are made.
+    void begin_batch() override {}
+    void end_batch() override {}
+
     // ---- Test helpers (not part of the KvStore port) ----
     size_t size() const { return store_.len(); }
     bool contains(const std::string& key) const {

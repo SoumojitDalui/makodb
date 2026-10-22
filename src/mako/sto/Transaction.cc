@@ -40,6 +40,7 @@ __thread int TThread::the_debug_bit;
 __thread bool TThread::transget_without_throw;
 __thread bool TThread::transget_without_stable;
 __thread bool TThread::is_worker_leader;
+__thread bool TThread::push_log_each_commit;
 __thread unsigned int TThread::trans_nosend_abort;
 __thread bool TThread::in_loading_phase;
 __thread int TThread::increment_id;
@@ -791,7 +792,7 @@ inline void Transaction::serialize_util(unsigned nwriteset, bool on_remote, int 
     instance->update_ptr(w);
     size_t pos = 0;
     unsigned char *queueLog = instance->getLogOnly (pos);
-    if(instance->checkPushRequired()) {
+    if(instance->checkPushRequired() || TThread::push_log_each_commit) {
       assert(pos <= MAX_ARRAY_SIZE_IN_BYTES) ;
       if(pos!=0) {
           // 7. latest_commit_id: single timestamp*10+term

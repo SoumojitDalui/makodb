@@ -54,6 +54,11 @@ namespace mako
 
     const int ADVANCER_MARKER_NUM = 2;
     const int NUM_TABLES_PER_SHARD = 200; // for pre-allocated
+    // Shard 0's last table id is reserved for the cluster-config table
+    // (__mako_config__, src/mako/cluster_bootstrap.cc), so it has the same
+    // id on every shard-0 replica and replay lands it in the same table.
+    // open_index never hands it out.
+    const int CONFIG_TABLE_ID = NUM_TABLES_PER_SHARD;
 
   #if defined(MEGA_BENCHMARK)
     const int mega_batch_size = 100; // no more than max_batch_size?
