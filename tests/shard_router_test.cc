@@ -297,6 +297,36 @@ TEST_F(ShardRouterTest, ComputeShardFollowsDeadShardReplacementViaClusterConfig)
     EXPECT_EQ(0, compute_shard_for_key(201, "another-key"));
 }
 
+// Routing reads the config through its lock-free hints, so every mutation
+// that can change a routing decision must republish them: a stale hint
+// would skip a table policy or a dead shard's replacement.
+TEST_F(ShardRouterTest, ClusterConfigRoutingHintsTrackMutations) {
+    janus::ClusterConfig cc = janus::ClusterConfig::new_();
+    const uint32_t P = janus::CC_HINT_POPULATED;
+    EXPECT_EQ(0u, cc.routing_hints());
+
+    cc.set_shard_count(2);
+    EXPECT_EQ(P, cc.routing_hints());
+
+    janus::ShardInfo s1; s1.id = 1; s1.status = "dead"; s1.replacement = 0;
+    cc.update_shard(1, s1);
+    EXPECT_EQ(P | janus::CC_HINT_REDIRECTS, cc.routing_hints());
+    s1.status = "active";
+    cc.update_shard(1, s1);
+    EXPECT_EQ(P, cc.routing_hints());
+
+    cc.set_table_policy(
+        "CC_HINT_T",
+        janus::make_table_policy("CC_HINT_T", janus::KeyExtractor::by_field(0),
+                                 {{0, 10, 0}}, 0));
+    EXPECT_EQ(P | janus::CC_HINT_TABLE_POLICIES, cc.routing_hints());
+    cc.clear_table_policy("CC_HINT_T");
+    EXPECT_EQ(P, cc.routing_hints());
+
+    cc.set_shard_count(0);
+    EXPECT_EQ(0u, cc.routing_hints());
+}
+
 TEST_F(ShardRouterTest, EmptyClusterConfigFallsBackToLegacyPath) {
     // With an empty ClusterConfig (shard_count 0), routing must use the
     // legacy table-ID fallback, unchanged from before this wiring.
