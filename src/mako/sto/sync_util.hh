@@ -48,19 +48,22 @@ namespace sync_util {
         // it committed: local_timestamp_[0] moves on to the next entry within
         // moments, and entry timestamps are not in log order (a cross-shard
         // transaction takes a remote timestamp), so a later value there does
-        // not show that the entry before it committed.
+        // not show that the entry before it committed. A slot holds the
+        // timestamp plus one, so an unwritten slot (0) matches nothing, not
+        // even a log timestamp of 0: a replica that never led commits its
+        // first entries at timestamps from 0.
         static constexpr size_t kRecentCommits = 1024;
         static std::atomic<uint32_t> recent_commits_[kRecentCommits];
         static std::atomic<uint64_t> recent_commit_count_;
 
         static void record_commit(uint32_t ts) {
             const uint64_t i = recent_commit_count_.fetch_add(1, memory_order_relaxed);
-            recent_commits_[i % kRecentCommits].store(ts, memory_order_release);
+            recent_commits_[i % kRecentCommits].store(ts + 1, memory_order_release);
         }
 
         static bool recently_committed(uint32_t ts) {
             for (const auto& c : recent_commits_) {
-                if (c.load(memory_order_acquire) == ts) return true;
+                if (c.load(memory_order_acquire) == ts + 1) return true;
             }
             return false;
         }
