@@ -668,6 +668,11 @@ static void setup_leader_election_callbacks()
   // an acceptor refuses it; on shard 0 it then stops serving the cluster
   // config. Raft reports this through the election callback below.
   register_step_down_callback([] { janus::ClusterConfigLeadershipChanged(); });
+  // Raft: logged commits wait while a partition this process just started
+  // leading applies the entries of earlier terms (sync_logger::raft_catching_up_).
+  register_catch_up_callback([](int partitions) {
+    sync_util::sync_logger::raft_catching_up_.store(partitions, std::memory_order_release);
+  });
   register_leader_election_callback([&](int control) { // communicate with third party: Paxos
     // happens on the learner for case 0 and case 2, 3
     uint32_t aa = mako::getCurrentTimeMillis();
