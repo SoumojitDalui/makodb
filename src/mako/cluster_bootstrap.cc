@@ -969,6 +969,12 @@ void PromoteLocked() {
     const uint64_t position = static_cast<uint64_t>(mine - g_cfg_endpoints.data());
     const uint64_t version_floor = (term << 32) | ((position + 1) << 24);
     const uint64_t base = std::max({last_seen, replicated, version_floor});
+    // A replica that seeds the table keeps what the cluster's earlier run
+    // persisted, as StartShard0Leader does: under Raft the first leader
+    // seeds here, and when it is the preferred leader, which persists its
+    // log, it has the earlier runs' logs beside its own.
+    const PersistedConfig persisted =
+        complete ? PersistedConfig{} : ReadPersistedConfig(g_cfg_nshards);
     g_cfg_store->begin_batch();   // one transaction
     if (base > replicated) g_cfg_store->put("__version__", std::to_string(base));
     if (complete) {
@@ -976,6 +982,7 @@ void PromoteLocked() {
     } else {
         SeedTopology(cm, g_cfg_nshards, me);
         g_cfg_store->put(kClusterIdKey, ClusterIdentity(g_cfg_nshards));
+        if (!persisted.keys.empty()) RestorePersistedConfig(cm, persisted);
     }
     g_cfg_store->end_batch();
     if (janus::is_using_raft() &&
