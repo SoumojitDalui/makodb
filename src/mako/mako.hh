@@ -919,21 +919,16 @@ static abstract_db * init_env() {
     int ret2 = setup2(0, benchConfig.getShardIndex());
     sleep(3); // ensure that all get started
 
-    // Wire the cluster-config read path (shard-0 config service +
-    // per-node ConfigWatcher into the routing cache). No-op unless
-    // MAKO_CLUSTER_CONFIG=1 and the cluster has >1 shard.
-    // @unsafe { RPC I/O, storage index open, background thread }
-    janus::BootstrapClusterConfig(db);
-
 #ifndef DISABLE_DISK
     // Initialize RocksDB persistence layer ONLY on the leader
-    // Followers and learners don't need RocksDB since they only replay, not generate logs
+    // Followers and learners don't need RocksDB since they only replay, not generate logs.
+    // Before the cluster config's bootstrap, so the config table's seed is persisted too.
     if (benchConfig.getIsReplicated() && benchConfig.getLeaderConfig()) {
       auto& persistence = mako::RocksDBPersistence::getInstance();
       // Add username prefix to avoid conflicts when multiple users run on the same server
       std::string username = util::get_current_username();
-      std::string db_path = "/tmp/" + username + "_mako_rocksdb_shard" + std::to_string(benchConfig.getShardIndex())
-                            + "_leader_pid" + std::to_string(getpid());
+      std::string db_path = mako::RocksDBPersistence::leaderLogPrefix(username, benchConfig.getShardIndex())
+                            + std::to_string(getpid());
       size_t num_partitions = benchConfig.getNthreads();
       size_t num_threads = num_partitions;
       uint32_t shard_id = benchConfig.getShardIndex();
@@ -955,6 +950,12 @@ static abstract_db * init_env() {
       fprintf(stderr, "Disk persistence disabled by DISABLE_DISK flag\n");
     }
 #endif
+
+    // Wire the cluster-config read path (shard-0 config service +
+    // per-node ConfigWatcher into the routing cache). No-op unless
+    // MAKO_CLUSTER_CONFIG=1 and the cluster has >1 shard.
+    // @unsafe { RPC I/O, storage index open, background thread }
+    janus::BootstrapClusterConfig(db);
 
     // start a failure monitor on learners
     if (benchConfig.getCluster().compare(mako::LEARNER_CENTER)==0) { // learner cluster
