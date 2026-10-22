@@ -41,6 +41,29 @@ namespace sync_util {
         static std::unordered_map<int, uint32_t> hist_timestamp; // on the running shard
         static std::atomic<uint32_t> noops_cnt;
         static std::atomic<uint32_t> noops_cnt_hole;
+
+        // The log timestamps of partition 0's last kRecentCommits committed
+        // entries, recorded by its leader callback in commit order. A
+        // runtime cluster-config change looks its own entry up here to know
+        // it committed: local_timestamp_[0] moves on to the next entry within
+        // moments, and entry timestamps are not in log order (a cross-shard
+        // transaction takes a remote timestamp), so a later value there does
+        // not show that the entry before it committed.
+        static constexpr size_t kRecentCommits = 1024;
+        static std::atomic<uint32_t> recent_commits_[kRecentCommits];
+        static std::atomic<uint64_t> recent_commit_count_;
+
+        static void record_commit(uint32_t ts) {
+            const uint64_t i = recent_commit_count_.fetch_add(1, memory_order_relaxed);
+            recent_commits_[i % kRecentCommits].store(ts, memory_order_release);
+        }
+
+        static bool recently_committed(uint32_t ts) {
+            for (const auto& c : recent_commits_) {
+                if (c.load(memory_order_acquire) == ts) return true;
+            }
+            return false;
+        }
         static int exchange_refresh_cnt;
         static std::atomic<bool> exchange_running;
         static int failed_shard_index;

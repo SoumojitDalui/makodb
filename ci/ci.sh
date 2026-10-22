@@ -696,7 +696,9 @@ run_1shard_replication_raft_restart() {
 # Cluster-config failover tests (opt-in: the cluster config is off by default)
 # ============================================================================
 
-# One config failover case, retried once like the replication tests.
+# One config failover case. It is retried once only when the cluster never
+# got as far as the test (the script exits 3): a failed check after that is
+# the result, and retrying it would hide an intermittent failover bug.
 # Usage: run_config_failover_case <ci target> <paxos|raft> <kill|pause> [right-after]
 run_config_failover_case() {
     local target=$1 replication=$2 event=$3 timing=${4:-}
@@ -712,6 +714,11 @@ run_config_failover_case() {
         local hanging_check=$?
         if [ $test_result -eq 0 ] && [ $hanging_check -eq 0 ]; then
             return 0
+        fi
+        # Retried: the cluster did not start (3), or a passing run left
+        # processes behind.
+        if [ $test_result -ne 3 ] && [ $test_result -ne 0 ]; then
+            return 1
         fi
         if [ $attempt -lt $max_attempts ]; then
             echo "Retrying $target ($replication $event${timing:+ $timing}, attempt $((attempt + 1))/$max_attempts)..."
@@ -739,7 +746,8 @@ run_2shard_config_failover_raft() {
 }
 
 # The cluster config across a crash and restart of the whole cluster
-# (opt-in like the failover targets), retried once.
+# (opt-in like the failover targets), retried once only when the first run
+# never came up (the script exits 3).
 run_2shard_config_restart() {
     echo "========================================="
     echo "Running: ./ci/ci.sh shard2ConfigRestart"
@@ -755,6 +763,11 @@ run_2shard_config_restart() {
         local hanging_check=$?
         if [ $test_result -eq 0 ] && [ $hanging_check -eq 0 ]; then
             return 0
+        fi
+        # Retried: the cluster did not start (3), or a passing run left
+        # processes behind.
+        if [ $test_result -ne 3 ] && [ $test_result -ne 0 ]; then
+            return 1
         fi
         [ $attempt -eq 1 ] && echo "Retrying shard2ConfigRestart (attempt 2/2)..."
     done
