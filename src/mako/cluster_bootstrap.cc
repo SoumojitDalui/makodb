@@ -891,6 +891,26 @@ void StartRemoteWatcher(const std::vector<ConfigEndpoint>& eps) {
     srpc::Log_info("BootstrapClusterConfig: watching shard-0 config at {}", all.c_str());
 }
 
+// Raft (g_cfg_mu held): a replica learns it leads partition 0 before it
+// has applied the old leader's last entries. They commit with the first
+// entry of the new term and apply only then. So the new leader commits an
+// entry of its own (cluster/id, unchanged, which every leader writes the
+// same) and waits until it applies here: entries apply in log order, so
+// everything committed before it is then in this replica's table. False if
+// this replica stops leading partition 0 in `term` first.
+// @unsafe - config store writes, replication state reads
+bool WaitForRaftBarrier(uint64_t term) {
+    g_cfg_store->begin_batch();
+    g_cfg_store->put(kClusterIdKey, ClusterIdentity(g_cfg_nshards));
+    g_cfg_store->end_batch();
+    const uint32_t own_entry = g_cfg_store->last_commit_log_timestamp();
+    while (::is_local_partition_leader(0) && ::partition_term(0) == term) {
+        if (sync_util::sync_logger::recently_committed(own_entry)) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return false;
+}
+
 // Make this replica shard 0's config leader (g_cfg_mu held): serve its own
 // copy of the config table, which reached it through the replication log.
 // @unsafe - stops the remote watcher, storage index, RPC server bind, background threads
@@ -919,6 +939,14 @@ void PromoteLocked() {
     const uint64_t last_seen = get_cluster_config().get_version();
 
     if (g_cfg_store == nullptr) g_cfg_store = new ConfigTableStore(g_cfg_db, idx);
+    if (janus::is_using_raft() && !WaitForRaftBarrier(term)) {
+        g_cfg_leading = false;
+        StartRemoteWatcher(g_cfg_endpoints);
+        srpc::Log_warn("BootstrapClusterConfig: {} lost partition 0 before it caught up (term {} "
+                       "-> {}); reading the cluster config from shard 0's replicas", me.c_str(),
+                       term, ::partition_term(0));
+        return;
+    }
     g_cfg_cm = rusty::Some(rusty::make_box<ConfigManager>(g_cfg_store));
     ConfigManager* cm = g_cfg_cm.as_ref().unwrap().get();
 
