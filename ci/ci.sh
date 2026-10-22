@@ -742,7 +742,8 @@ run_2shard_config_failover_raft() {
     echo "Running: ./ci/ci.sh shard2ConfigFailoverRaft"
     echo "========================================="
     run_config_failover_case shard2ConfigFailoverRaft raft kill &&
-        run_config_failover_case shard2ConfigFailoverRaft raft pause
+        run_config_failover_case shard2ConfigFailoverRaft raft pause &&
+        run_config_failover_case shard2ConfigFailoverRaft raft kill right-after
 }
 
 # The cluster config across a crash and restart of the whole cluster
