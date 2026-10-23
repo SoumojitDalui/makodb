@@ -34,7 +34,8 @@
 # Exit status: 0 passed, 1 a check failed, 3 the cluster never got as far
 # as the test (startup or setup), which is the only case worth retrying.
 # Env: MAKO_CFG_FAILOVER_PAUSE (seconds paused at least, default 12),
-#      MAKO_CFG_FAILOVER_TIMEOUT (seconds to converge after the event, default 60).
+#      MAKO_CFG_FAILOVER_TIMEOUT (seconds to converge after the event, default 60),
+#      MAKO_BENCH_RUNTIME_SECONDS (the benchmark's run, default 120 here).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/simple_transaction_rep_port_utils.sh"
@@ -67,6 +68,10 @@ binary_path="./${BUILD_DIR:-build}/dbtest"
 tool_path="./${BUILD_DIR:-build}/mako_config"
 log_prefix="${script_name}_${replication}_${event}${timing:+_$timing}"
 export MAKO_CLUSTER_CONFIG=1
+# The replica that takes over shard 0 runs the benchmark for a run of its
+# own, and shard 0's replicas exit when it ends, so the run outlasts the
+# test, which stops the cluster itself.
+export MAKO_BENCH_RUNTIME_SECONDS="${MAKO_BENCH_RUNTIME_SECONDS:-120}"
 export LD_LIBRARY_PATH="$(pwd)/${BUILD_DIR:-build}:${LD_LIBRARY_PATH}"
 
 if [ "$replication" = "raft" ]; then
