@@ -1004,7 +1004,13 @@ void DemoteLocked() {
     if (!g_cfg_leading) return;
     if (g_cfg_watcher.is_some()) g_cfg_watcher.as_ref().unwrap()->stop();
     g_cfg_watcher = rusty::None;
-    delete g_cfg_server;   // closes the listener and its connections
+    // Close the listener here: deleting the server only queues its close on
+    // the poll thread, and in the failover tests the port still took
+    // connections long after. A change sent there went unanswered until the
+    // client gave up (15 s), so mako_config, which tries the replicas in
+    // turn, stalled on this one.
+    if (g_cfg_server != nullptr) g_cfg_server->stop_accepting();
+    delete g_cfg_server;   // closes its connections
     g_cfg_server = nullptr;
     g_cfg_leading = false;
     StartRemoteWatcher(g_cfg_endpoints);
