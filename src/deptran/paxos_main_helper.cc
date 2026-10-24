@@ -296,6 +296,9 @@ void register_step_down_callback(std::function<void()> cb){
   es->stepped_down_cb = cb;
 }
 
+// Raft only: a Paxos leader catches up before it takes over.
+void register_catch_up_callback(std::function<void(int)>) {}
+
 void register_for_follower(std::function<void(const char*, int)> cb, uint32_t par_id) {
     for (auto& worker : pxs_workers_g) {
         if (worker->IsPartition(par_id) && !worker->IsLeader(par_id)) {

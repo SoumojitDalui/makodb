@@ -254,6 +254,13 @@ static void register_paxos_follower_callback(TSharedThreadPoolMbta& replicated_d
         CommitInfo commit_info = get_latest_commit_info((char *) log, len);
         timestamp = commit_info.timestamp;  // Store for return value encoding
         sync_util::sync_logger::local_timestamp_[par_id].store(commit_info.timestamp, memory_order_release) ;
+        // Raft: a replica that becomes leader takes no Paxos-style takeover,
+        // which moves the epoch on. Keep its next commit timestamp past every
+        // entry it replays, so its own writes win over the old leader's on
+        // every replica (replay keeps the larger commit id, cmpFunc2_v2).
+        if (janus::is_using_raft()) {
+          sync_util::sync_logger::advance_local_replica_id(commit_info.timestamp / 10 + 1);
+        }
 #ifndef DISABLE_DISK
         // Followers don't persist to disk, so immediately update disk_timestamp_ too
         sync_util::sync_logger::disk_timestamp_[par_id].store(commit_info.timestamp, memory_order_release) ;
@@ -661,6 +668,11 @@ static void setup_leader_election_callbacks()
   // an acceptor refuses it; on shard 0 it then stops serving the cluster
   // config. Raft reports this through the election callback below.
   register_step_down_callback([] { janus::ClusterConfigLeadershipChanged(); });
+  // Raft: logged commits wait while a partition this process just started
+  // leading applies the entries of earlier terms (sync_logger::raft_catching_up_).
+  register_catch_up_callback([](int partitions) {
+    sync_util::sync_logger::raft_catching_up_.store(partitions, std::memory_order_release);
+  });
   register_leader_election_callback([&](int control) { // communicate with third party: Paxos
     // happens on the learner for case 0 and case 2, 3
     uint32_t aa = mako::getCurrentTimeMillis();

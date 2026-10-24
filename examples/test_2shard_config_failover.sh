@@ -10,8 +10,11 @@
 #   3. every live node then reads the config from one replica,
 #   4. no two takeovers served the same config version,
 #   5. the change is still in the config after the failover, and the new
-#      leader applies and confirms a change of its own,
+#      leader applies and confirms a change of its own, numbered above the
+#      version it took over with,
 #   6. no node exited before the event, and no shard-0 replica after it.
+# Under Raft, a pause then also pauses the replica that leads after it, and
+# checks that the replica leading next has the change that one made.
 # With right-after, the event follows the change as soon as it is confirmed,
 # before the other nodes load it, so check 1 covers only the confirmation
 # and check 5 shows that a confirmed change survives the failover.
@@ -31,7 +34,8 @@
 # Exit status: 0 passed, 1 a check failed, 3 the cluster never got as far
 # as the test (startup or setup), which is the only case worth retrying.
 # Env: MAKO_CFG_FAILOVER_PAUSE (seconds paused at least, default 12),
-#      MAKO_CFG_FAILOVER_TIMEOUT (seconds to converge after the event, default 60).
+#      MAKO_CFG_FAILOVER_TIMEOUT (seconds to converge after the event, default 60),
+#      MAKO_BENCH_RUNTIME_SECONDS (the benchmark's run, default 120 here).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/simple_transaction_rep_port_utils.sh"
@@ -64,6 +68,10 @@ binary_path="./${BUILD_DIR:-build}/dbtest"
 tool_path="./${BUILD_DIR:-build}/mako_config"
 log_prefix="${script_name}_${replication}_${event}${timing:+_$timing}"
 export MAKO_CLUSTER_CONFIG=1
+# The replica that takes over shard 0 runs the benchmark for a run of its
+# own, and shard 0's replicas exit when it ends, so the run outlasts the
+# test, which stops the cluster itself.
+export MAKO_BENCH_RUNTIME_SECONDS="${MAKO_BENCH_RUNTIME_SECONDS:-120}"
 export LD_LIBRARY_PATH="$(pwd)/${BUILD_DIR:-build}:${LD_LIBRARY_PATH}"
 
 if [ "$replication" = "raft" ]; then
@@ -555,6 +563,46 @@ if [ "$converge_ok" -eq 1 ]; then
         echo "  ✗ mako_config set_node_status after the $event exited $TOOL_RC: $TOOL_OUT"
         failed=1
     fi
+    # A change numbers its version above the one the leader took over
+    # with; a lower one means an older write replaced the takeover's.
+    took_over_at=$(new_lines "$final_leader" \
+        | grep -a -o -E "now leads shard 0 and serves the [a-z]+ cluster config \(version [0-9]+" \
+        | tail -1 | sed -E 's/.*version //')
+    if [ -n "$took_over_at" ] && [ -n "$CHANGE_VERSION" ]; then
+        if [ "$CHANGE_VERSION" -gt "$took_over_at" ]; then
+            echo "  ✓ Its change is version $CHANGE_VERSION, above the $took_over_at it took over with"
+        else
+            echo "  ✗ Its change is version $CHANGE_VERSION, not above the $took_over_at it took over with"
+            failed=1
+        fi
+    fi
+fi
+
+# Raft: pause the leader that took the change too, so a third replica
+# leads, and check that it has that change. It would not if the replicas
+# had dropped the second leader's writes.
+if [ "$replication" = "raft" ] && [ "$event" = "pause" ] && [ "$converge_ok" -eq 1 ] \
+    && [ -n "$CHANGE_VERSION" ]; then
+    second=$final_leader
+    second_pid=$(pid_of "$second")
+    echo "Pausing $second (pid $second_pid) as well..."
+    kill -STOP "$second_pid"
+    dead_node=$second
+    if wait_for_convergence "$converge_timeout" 2 skip; then
+        third=$CONFIG_LEADER
+        got=$("$tool_path" --endpoints "$endpoints" get "node/${change_site}/status" 2>&1)
+        if [ "$got" = "active" ]; then
+            echo "  ✓ $third took over while $second was paused and has its change: node/${change_site}/status is active"
+        else
+            echo "  ✗ $third took over while $second was paused, but node/${change_site}/status is '$got', expected $second's 'active'"
+            failed=1
+        fi
+    else
+        report_no_convergence "while $second was paused" "$converge_timeout"
+        failed=1
+    fi
+    dead_node=""
+    kill -CONT "$second_pid"
 fi
 
 died=$(missing_nodes)

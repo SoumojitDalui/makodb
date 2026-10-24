@@ -442,6 +442,17 @@ main(int argc, char **argv)
   benchConfig.setIsMicro(is_micro);
   benchConfig.setIsReplicated(is_replicated);
   benchConfig.setPaxosConfigFile(paxos_config_file);
+  // How long the benchmark runs (30 s by default); a test that needs the
+  // cluster up for longer sets MAKO_BENCH_RUNTIME_SECONDS.
+  if (const char* env = getenv("MAKO_BENCH_RUNTIME_SECONDS")) {
+    char* endptr = nullptr;
+    long parsed = strtol(env, &endptr, 10);
+    if (endptr != env && *endptr == '\0' && parsed > 0 && parsed <= 3600) {
+      benchConfig.setRuntime(static_cast<uint64_t>(parsed));
+    } else {
+      Warning("Invalid MAKO_BENCH_RUNTIME_SECONDS='%s'; ignoring", env);
+    }
+  }
   warn_if_replicated_role_may_block();
   startup_timeout_sec = resolve_startup_timeout_sec(startup_timeout_sec, startup_timeout_explicit);
   std::atomic<bool> startup_complete(false);
