@@ -414,6 +414,14 @@ static void register_paxos_leader_callback(vector<pair<uint32_t, uint32_t>>& adv
                                      std::to_string(local_w).c_str(),
                                      benchConfig.getConfig()->shard(0, benchConfig.getClusterRole()).host.c_str(),
                                      benchConfig.getConfig()->mports[benchConfig.getClusterRole()]);
+          // Also with the other shards' leaders, where every closed epoch's
+          // final watermarks can be found later (set_closed_epoch_cuts).
+          if (benchConfig.getClusterRole() != mako::LOCALHOST_CENTER_INT) {
+            mako::NFSSync::set_key(mako::NFSSync::failover_key("fvw", benchConfig.getShardIndex(), closed_epoch),
+                                   std::to_string(local_w).c_str(),
+                                   benchConfig.getConfig()->shard(0, mako::LOCALHOST_CENTER_INT).host.c_str(),
+                                   benchConfig.getConfig()->mports[mako::LOCALHOST_CENTER_INT]);
+          }
           std::cout<<"set fvw, " << benchConfig.getClusterRole() << ", fvw_"+std::to_string(benchConfig.getShardIndex())<<":"<<local_w<<std::endl;
 #endif
           sync_util::sync_logger::reset(); 
@@ -688,6 +696,29 @@ static void begin_shard_failover()
   sync_util::sync_logger::client_control(0, benchConfig.getShardIndex()); // in bench.cc register_fasttransport_for_bench
 }
 
+// The cut of every epoch closed before closed_epoch, from the final
+// watermarks each shard published for it with the leaders. This process may
+// have followed when those epochs closed, and its reads must cut them where
+// the replicas that led then did. An epoch whose watermarks are not all there
+// keeps the cut it has.
+static void set_closed_epoch_cuts(int closed_epoch)
+{
+  auto& benchConfig = BenchmarkConfig::getInstance();
+  auto* config = benchConfig.getConfig();
+  for (int epoch = 0; epoch < closed_epoch; epoch++) {
+    vector<uint32_t> fvw(benchConfig.getNshards());
+    bool all = true;
+    for (int i = 0; i < benchConfig.getNshards() && all; i++) {
+      std::string w_i = mako::NFSSync::get_key(mako::NFSSync::failover_key("fvw", i, epoch),
+                                               config->shard(0, mako::LOCALHOST_CENTER_INT).host.c_str(),
+                                               config->mports[mako::LOCALHOST_CENTER_INT]);
+      all = !w_i.empty();
+      if (all) fvw[i] = static_cast<uint32_t>(std::stoul(w_i));
+    }
+    if (all) sync_util::sync_logger::update_stable_timestamp_vec(epoch, fvw);
+  }
+}
+
 // Once this shard's old epoch is closed: take the stable cut from every
 // shard's final watermark, let the other shards move on (control 1), and
 // start this replica's workers (modeMonitorRun).
@@ -710,6 +741,7 @@ static void finish_shard_failover()
     fvw[i] = static_cast<uint32_t>(std::stoul(w_i));  // unsigned: a commit id can pass INT_MAX
   }
 
+  set_closed_epoch_cuts(closed_epoch);
   // The same cut as the other shards take (bench.cc, control 1).
   sync_util::sync_logger::update_stable_timestamp_vec(get_epoch()-1, fvw);
   sync_util::sync_logger::client_control(1, benchConfig.getShardIndex());

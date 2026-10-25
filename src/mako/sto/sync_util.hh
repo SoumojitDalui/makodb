@@ -192,9 +192,11 @@ namespace sync_util {
         // cut are rolled back. The paper (§5.2) keeps a transaction only if
         // it is below every shard's component; with one timestamp per
         // transaction that is the smallest component, on every shard alike.
+        // The watermarks are commit ids (timestamp * 10 + epoch); the cut is
+        // a bare timestamp, as a version's header holds (mvGET).
         static void update_stable_timestamp_vec(int epoch, vector<uint32_t> tt_vec) { 
            if (!tt_vec.empty()) {
-               hist_timestamp[epoch] = *std::min_element(tt_vec.begin(), tt_vec.end());
+               hist_timestamp[epoch] = *std::min_element(tt_vec.begin(), tt_vec.end()) / 10;
                std::cout<<"update_stable_timestamp_vec, epoch:"<<epoch<<",tt:"<<hist_timestamp[epoch]<<std::endl;
            }
         }

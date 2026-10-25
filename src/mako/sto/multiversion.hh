@@ -111,32 +111,36 @@ public:
             mako::Node *header = reinterpret_cast<mako::Node *>((char*)(val.data()+val.length()-mako::BITS_OF_NODE));
             
 #if defined(FAIL_NEW_VERSION)
-            // It's possible that hist_timestamp is not updated yet, and return it directly; and the remote server would do a check
-            if  (hist_timestamp.find(*time_term % 10)==hist_timestamp.end()) {
+            // A version of a closed epoch is kept if its bare timestamp is at
+            // or below that epoch's stable cut; one above it was rolled back
+            // by the failover that closed the epoch. An epoch without a cut
+            // yet keeps its versions (the remote server would do a check).
+            auto stable = [&hist_timestamp](const mako::Node *node, uint32_t node_time_term) {
+                auto cut = hist_timestamp.find(node_time_term % 10);
+                return cut == hist_timestamp.end() ||
+                       sync_util::sync_logger::safety_check(node->timestamp, cut->second);
+            };
+            if (stable(header, *time_term)) {
                 return !isDeleted(val);
             }
-            // check if the stored value is below the cached watermark
-            if (sync_util::sync_logger::safety_check(header->timestamp, hist_timestamp[*time_term % 10])) { // Single timestamp check
-                bool ret = !isDeleted(val);
-                if (!ret) {
-                    //Warning("XXXX par_id:%d,time_term:%d,cur_term:%d, watermark:%lld,len of v:%d",TThread::getGlobalPartitionID(),*time_term%10,current_term, hist_timestamp[*time_term % 10],val.length());
-                    //mako::printStringAsBit(val);
-                }
-                return ret;
-            }
-            // find the latest stable timestamp below the watermark within the past term e
+            // The newest version kept, each judged by its own timestamp.
             while (header->data_size > 0) {
                 time_term = reinterpret_cast<uint32_t*>((char*)(header->data+header->data_size-mako::EXTRA_BITS_FOR_VALUE));
-                if (sync_util::sync_logger::safety_check(header->timestamp, hist_timestamp[*time_term % 10])) { // Single timestamp check
+                mako::Node *older = reinterpret_cast<mako::Node *>((char*)(header->data+header->data_size-mako::BITS_OF_NODE));
+                if (stable(older, *time_term)) {
                     val.assign(header->data, (int)header->data_size); // rewrite val with next block value
-                    header = reinterpret_cast<mako::Node *>((char*)(val.data()+val.length()-mako::BITS_OF_NODE));
-                    if (isDeleted(val)) {
-                        return false;
-                    }
-                    break;
+                    return !isDeleted(val);
                 }
-                header = reinterpret_cast<mako::Node *>((char*)(header->data+header->data_size-mako::BITS_OF_NODE));
+                header = older;
             }
+            // None is. If the oldest inserted the key, the key did not exist
+            // before the rolled-back writes. If older versions were reclaimed
+            // (lazyReclaim), the one to roll back to is gone, and the newest
+            // stays.
+            if (header->data == mako::kNodeInserted) {
+                return false;
+            }
+            return !isDeleted(val);
         }
 #else
             if (header->timestamp / 10 <= hist_timestamp[*time_term % 10]) { // Single timestamp check
@@ -181,6 +185,7 @@ public:
             // Set single timestamp
             header->timestamp = TThread::txn->tid_unique_;
             header->data_size = 0;  // indicate no next block
+            header->data = mako::kNodeInserted;
             memcpy(oldval_str+oldval_len-mako::EXTRA_BITS_FOR_VALUE, &time_term, mako::BITS_OF_TT);
         } else {  // update or delete
             char* new_vv = (char*)malloc(newval.length());

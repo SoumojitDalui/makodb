@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <sys/file.h>
 #include <mutex>
@@ -127,6 +128,12 @@ namespace mako
         int16_t data_size;
         char *data;
     };
+
+    // Node::data of a version that inserted its key, so it has no older
+    // version (data_size 0). A version whose older ones were reclaimed also
+    // has data_size 0, with a stale pointer here; a failover's rollback
+    // (mvGET) must tell the two apart.
+    inline char *const kNodeInserted = reinterpret_cast<char *>(static_cast<uintptr_t>(1));
 
     // TODO: you have to do anyway; data stored here;
     // extra bytes for stored value: actual value + (timestamp, term) + sizeof(node)

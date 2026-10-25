@@ -746,6 +746,38 @@ protected:
     }
   }
 
+  // Whether the key's newest version is from a closed epoch and the key
+  // reads as absent there (mvGET): deleted, or every version above that
+  // epoch's stable cut, rolled back by a failover. An insert then writes it,
+  // as it would a new key; keeping the rolled-back value would drop the
+  // insert. Without a failover every version is in the current epoch.
+  static bool readsRolledBack(versioned_value *e) {
+#if defined(FAIL_NEW_VERSION)
+    if (!TThread::is_multiversion())
+      return false;
+    // Not atomicRead: it aborts on a locked key and leaves
+    // transget_without_throw set for a later read to find. A key being
+    // written is treated as before; the insert's read check catches it.
+    Version v2;
+    value_type v;
+    do {
+      v2 = e->version();
+      if (is_locked(v2))
+        return false;
+      fence();
+      assign_val(v, e->read_value());
+      fence();
+    } while (e->version() != v2);
+    const uint8_t term = TThread::txn->get_current_term();
+    const uint32_t *tt = reinterpret_cast<const uint32_t *>(v.data() + v.length() - mako::EXTRA_BITS_FOR_VALUE);
+    if (*tt % 10 == term)
+      return false;
+    return !MultiVersionValue::mvGET(v, (char *)e->data(), term, sync_util::sync_logger::hist_timestamp);
+#else
+    return false;
+#endif
+  }
+
   // returns true if already in tree, false otherwise
   // handles a transactional put when the given key is already in the tree
   template <bool INSERT, bool SET, typename ValueType>
@@ -770,7 +802,7 @@ protected:
       return false;
     }
 #endif
-    if (SET) {
+    if (SET || (INSERT && readsRolledBack(e))) {
       reallyHandlePutFound(item, e, key, value);
     }
     // Observe version AFTER reallyHandlePutFound. If a resize occurred,
