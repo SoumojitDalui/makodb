@@ -108,8 +108,12 @@ size_t getFileContentNew_OneLogOptimized_mbta_v2(char *buffer, /* K-V pairs */
         //keystore_encode3_v2 (value, cid);
         // A replayed value that inserts its key has no older version here
         // (mako::kNodeInserted). An update resets the timestamp to 0 instead
-        // (RESET_NODE_BY_E), so a failover's rollback always keeps it.
-        reinterpret_cast<mako::Node *>((char *)(obj_v.data() + obj_v.length() - mako::BITS_OF_NODE))->data = mako::kNodeInserted;
+        // (RESET_NODE_BY_E), so a failover's rollback always keeps it, as it
+        // keeps a loaded row (timestamp 0, as mvInstall gives one).
+        mako::Node *node = reinterpret_cast<mako::Node *>((char *)(obj_v.data() + obj_v.length() - mako::BITS_OF_NODE));
+        node->data = mako::kNodeInserted;
+        if (TThread::in_loading_phase)
+            node->timestamp = 0;
 
         // 7. put it into actual tables
         int try_cnt = 1 ;

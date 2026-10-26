@@ -1639,6 +1639,10 @@ public:
     static std::atomic<size_t> partition_seq[kMaxLocalShards];
     TThread::set_id(__sync_fetch_and_add(&tidcounter, 1));
     TThread::set_mode(0); // checking in-progress
+    // A bench loader's rows (loader, source 0; the RPC helper servers pass
+    // loader too, with source 1) are replicated before the run starts, so
+    // no failover rolls them back (MultiVersionValue::mvInstall).
+    TThread::in_loading_phase = loader && source == 0;
     TThread::set_num_rpc_server(BenchmarkConfig::getInstance().getNumRpcServer());
     TThread::set_is_micro(BenchmarkConfig::getInstance().getIsMicro());
 #if defined(DISABLE_MULTI_VERSION)

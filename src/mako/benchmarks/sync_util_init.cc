@@ -13,6 +13,7 @@ import std;
 // Define all sync_util::sync_logger static variables once
 int sync_util::sync_logger::shardIdx = 0;
 std::vector<std::atomic<uint32_t>> sync_util::sync_logger::local_timestamp_(80);
+std::vector<std::atomic<bool>> sync_util::sync_logger::partition_loaded_(80);
 #ifndef DISABLE_DISK
 std::vector<std::atomic<uint32_t>> sync_util::sync_logger::disk_timestamp_(80);
 #endif

@@ -21,6 +21,9 @@ namespace sync_util {
         // latest timestamp for disk persistence per partition
         static vector<std::atomic<uint32_t>> disk_timestamp_; // timestamp*10+epoch
 #endif
+        // Whether each partition's advancer marker has applied on this
+        // follower: the entries before it are the load.
+        static vector<std::atomic<bool>> partition_loaded_;
         // Single watermark for the entire system
         static std::atomic<uint32_t> single_watermark_; // timestamp*10+epoch
         

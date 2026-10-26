@@ -195,9 +195,13 @@ static void register_paxos_follower_callback(TSharedThreadPoolMbta& replicated_d
     Sto::update_threadid();
     bool noops = false;
     int closed_epoch = -1;  // the epoch a no-op closes
+    // The entries before this partition's advancer marker are the load:
+    // replay gives their rows timestamp 0, as a loader does (mvInstall).
+    TThread::in_loading_phase = !sync_util::sync_logger::partition_loaded_[par_id].load(std::memory_order_acquire);
 
     if (len==mako::ADVANCER_MARKER_NUM) { // start a advancer
       status = mako::PaxosStatus::STATUS_REPLAY_DONE;
+      sync_util::sync_logger::partition_loaded_[par_id].store(true, std::memory_order_release);
       if (par_id==0 && benchConfig.getNshards() > 1){
         std::cout << "we can start a advancer" << std::endl;
         sync_util::sync_logger::start_advancer();

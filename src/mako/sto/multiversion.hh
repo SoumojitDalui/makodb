@@ -189,10 +189,15 @@ public:
         char *oldval_str=(char*)e->data();
         int oldval_len=e->length();
         uint32_t time_term = TThread::txn->tid_unique_ * 10 + TThread::txn->current_term_;
+        // A loaded row is replicated before the run starts: timestamp 0, at
+        // or below every stable cut. A cut takes the smallest shard's final
+        // watermark, and the shards' clocks are not in step, so it can fall
+        // below another shard's load.
+        const uint32_t timestamp = TThread::in_loading_phase ? 0 : TThread::txn->tid_unique_;
         if (isInsert) { // insert
             mako::Node* header = reinterpret_cast<mako::Node*>(oldval_str+oldval_len-mako::BITS_OF_NODE);
             // Set single timestamp
-            header->timestamp = TThread::txn->tid_unique_;
+            header->timestamp = timestamp;
             header->data_size = 0;  // indicate no next block
             header->data = mako::kNodeInserted;
             memcpy(oldval_str+oldval_len-mako::EXTRA_BITS_FOR_VALUE, &time_term, mako::BITS_OF_TT);
@@ -203,7 +208,7 @@ public:
                                 &time_term, mako::BITS_OF_TT);
             mako::Node* header = reinterpret_cast<mako::Node*>(new_vv+newval.length()-mako::BITS_OF_NODE);
             // Set single timestamp
-            header->timestamp = TThread::txn->tid_unique_;
+            header->timestamp = timestamp;
             header->data_size = oldval_len;
             header->data = e->data();
             e->modifyData(new_vv);
