@@ -197,7 +197,10 @@ namespace sync_util {
         static void update_stable_timestamp_vec(int epoch, vector<uint32_t> tt_vec) { 
            if (!tt_vec.empty()) {
                hist_timestamp[epoch] = *std::min_element(tt_vec.begin(), tt_vec.end()) / 10;
-               std::cout<<"update_stable_timestamp_vec, epoch:"<<epoch<<",tt:"<<hist_timestamp[epoch]<<std::endl;
+               // One write (unbuffered cerr), so another thread's output
+               // cannot land inside the line; the failover test reads it.
+               std::cerr << "update_stable_timestamp_vec, epoch:" + std::to_string(epoch) +
+                            ",tt:" + std::to_string(hist_timestamp[epoch]) + "\n";
            }
         }
         
