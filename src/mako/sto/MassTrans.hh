@@ -89,6 +89,9 @@ public:
       // just advance blindly because of the way Masstree uses epochs
       globalepoch++;
     };
+    MultiVersionValue::retire = [] (void *data) {
+      mythreadinfo.ti->deallocate_rcu(data, 0, memtag_value);
+    };
   }
 
   const std::string& get_table_name() const { return table_name_; }

@@ -42,6 +42,12 @@ public:
         return ret;
     }
 
+    // How lazyReclaim frees a reclaimed version. A read that rolls back
+    // after a failover (mvGET) walks older versions without a lock, so
+    // MassTrans frees them through Masstree's RCU, once no transaction
+    // that could hold one is running; ::free if unset.
+    static inline void (*retire)(void *data) = nullptr;
+
     // Lazy reclamation with optimized watermark checking
     // Reclaims old versions that are safe to delete (below watermark)
     static void lazyReclaim(uint32_t time_term, uint32_t current_term, mako::Node *root) {
@@ -93,7 +99,10 @@ public:
             
             // Batch free old nodes
             for (auto* node : to_free) {
-                ::free(node->data);
+                if (retire)
+                    retire(node->data);
+                else
+                    ::free(node->data);
             }
         }
     }
