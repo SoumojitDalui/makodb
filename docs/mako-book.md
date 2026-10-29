@@ -300,7 +300,8 @@ error and leaves the config table off when both are set.
 
 Tests: `examples/test_2shard_config_failover.sh`,
 `examples/test_2shard_config_restart.sh` (ci targets `shard2ConfigFailover`,
-`shard2ConfigRestart`), `test_config_manager`, `test_config_kv_service`.
+`shard2ConfigFailoverRaft`, `shard2ConfigRestart`, `shard2ConfigRestartRaft`),
+`test_config_manager`, `test_config_kv_service`.
 
 ### Bootstrap Protocol
 

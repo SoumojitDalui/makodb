@@ -892,6 +892,20 @@ void StartRemoteWatcher(const std::vector<ConfigEndpoint>& eps) {
     srpc::Log_info("BootstrapConfigTable: watching shard-0 config at {}", all.c_str());
 }
 
+// Raft (g_cfg_mu held): a replica learns it leads partition 0 before it
+// has applied the old leader's last entries; they commit with the first
+// entry of the new term and apply only then. The Raft worker counts this
+// replica as catching up from the moment it becomes leader until its
+// catch-up marker applies, which is after all of them (RaftWorker::
+// BeginCatchUp), so the promotion waits for that before it reads the
+// table. Losing leadership ends the catch-up too. False if this replica no
+// longer leads partition 0 in `term`.
+// @unsafe - replication state reads
+bool WaitForRaftCatchUp(uint64_t term) {
+    sync_util::sync_logger::wait_raft_catch_up();
+    return ::is_local_partition_leader(0) && ::partition_term(0) == term;
+}
+
 // Make this replica shard 0's config leader (g_cfg_mu held): serve its own
 // copy of the config table, which reached it through the replication log.
 // @unsafe - stops the remote watcher, storage index, RPC server bind, background threads
@@ -920,6 +934,14 @@ void PromoteLocked() {
     const uint64_t last_seen = get_cluster_config().get_version();
 
     if (g_cfg_store == nullptr) g_cfg_store = new ConfigTableStore(g_cfg_db, idx);
+    if (janus::is_using_raft() && !WaitForRaftCatchUp(term)) {
+        g_cfg_leading = false;
+        StartRemoteWatcher(g_cfg_endpoints);
+        srpc::Log_warn("BootstrapConfigTable: {} lost partition 0 before it caught up (term {} "
+                       "-> {}); reading the cluster config from shard 0's replicas", me.c_str(),
+                       term, ::partition_term(0));
+        return;
+    }
     g_cfg_cm = rusty::Some(rusty::make_box<ConfigManager>(g_cfg_store));
     ConfigManager* cm = g_cfg_cm.as_ref().unwrap().get();
 
@@ -942,6 +964,12 @@ void PromoteLocked() {
     const uint64_t position = static_cast<uint64_t>(mine - g_cfg_endpoints.data());
     const uint64_t version_floor = (term << 32) | ((position + 1) << 24);
     const uint64_t base = std::max({last_seen, replicated, version_floor});
+    // A replica that seeds the table keeps what the cluster's earlier run
+    // persisted, as StartShard0Leader does: under Raft the first leader
+    // seeds here, and when it is the preferred leader, which persists its
+    // log, it has the earlier runs' logs beside its own.
+    const PersistedConfig persisted =
+        complete ? PersistedConfig{} : ReadPersistedConfig(g_cfg_nshards);
     g_cfg_store->begin_batch();   // one transaction
     if (base > replicated) g_cfg_store->put("__version__", std::to_string(base));
     if (complete) {
@@ -949,6 +977,7 @@ void PromoteLocked() {
     } else {
         SeedTopology(cm, g_cfg_nshards, me);
         g_cfg_store->put(kClusterIdKey, ClusterIdentity(g_cfg_nshards));
+        if (!persisted.keys.empty()) RestorePersistedConfig(cm, persisted);
     }
     g_cfg_store->end_batch();
     if (janus::is_using_raft() &&
@@ -976,7 +1005,13 @@ void DemoteLocked() {
     if (!g_cfg_leading) return;
     if (g_cfg_watcher.is_some()) g_cfg_watcher.as_ref().unwrap()->stop();
     g_cfg_watcher = rusty::None;
-    delete g_cfg_server;   // closes the listener and its connections
+    // Close the listener here: deleting the server only queues its close on
+    // the poll thread, and in the failover tests the port still took
+    // connections long after. A change sent there went unanswered until the
+    // client gave up (15 s), so mako_config, which tries the replicas in
+    // turn, stalled on this one.
+    if (g_cfg_server != nullptr) g_cfg_server->stop_accepting();
+    delete g_cfg_server;   // closes its connections
     g_cfg_server = nullptr;
     g_cfg_leading = false;
     StartRemoteWatcher(g_cfg_endpoints);
