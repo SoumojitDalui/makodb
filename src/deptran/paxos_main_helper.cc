@@ -296,6 +296,9 @@ void register_step_down_callback(std::function<void()> cb){
   es->stepped_down_cb = cb;
 }
 
+// Raft only: a Paxos leader catches up before it takes over.
+void register_catch_up_callback(std::function<void(int)>) {}
+
 void register_for_follower(std::function<void(const char*, int)> cb, uint32_t par_id) {
     for (auto& worker : pxs_workers_g) {
         if (worker->IsPartition(par_id) && !worker->IsLeader(par_id)) {
@@ -903,6 +906,19 @@ void* heartbeatBackground(void* arg) {
 // branch of `setup2()` (`Pthread_create(..., heartbeatBackground2, ...)`)
 // and the constant gating that branch was hard-coded `false`.
 
+// How long into the learner's life a silent leader is failed over; after
+// that, the leader has finished its run. The run is 30 s unless
+// MAKO_BENCH_RUNTIME_SECONDS sets it (as dbtest reads it), plus 5 s.
+static time_t learner_failover_window_seconds() {
+  long runtime = 30;
+  if (const char* env = getenv("MAKO_BENCH_RUNTIME_SECONDS")) {
+    char* end = nullptr;
+    long parsed = strtol(env, &end, 10);
+    if (end != env && *end == '\0' && parsed > 0 && parsed <= 3600) runtime = parsed;
+  }
+  return static_cast<time_t>(runtime + 5);
+}
+
 // learner maintains heartbeat with the leader (connect to the first PaxosWorker::SetupHeartbeat())
 void* heartbeatMonitor2(void* arg) { // happens on the learner
   time_t st = time(NULL);
@@ -914,7 +930,7 @@ void* heartbeatMonitor2(void* arg) { // happens on the learner
     if (duration2.count()/1000.0/1000.0 > 1000) { // timeout: 1s
      Log_info("the time for the heartbeat: {:f} ms", duration2.count()/1000.0/1000.0);
      time_t end = time (NULL);
-     if (end - st > 35) {
+     if (end - st > learner_failover_window_seconds()) {
        Log_info("Let's stop it automatically without failover!!!");
        std::quick_exit( EXIT_SUCCESS );
      }
