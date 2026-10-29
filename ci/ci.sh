@@ -737,6 +737,29 @@ run_2shard_config_failover_raft() {
         run_config_failover_case shard2ConfigFailoverRaft raft pause
 }
 
+# The cluster config across a crash and restart of the whole cluster
+# (opt-in like the failover targets), retried once.
+run_2shard_config_restart() {
+    echo "========================================="
+    echo "Running: ./ci/ci.sh shard2ConfigRestart"
+    echo "========================================="
+    local attempt
+    for attempt in 1 2; do
+        cleanup_processes
+        set +e
+        bash ./examples/test_2shard_config_restart.sh
+        local test_result=$?
+        set -e
+        check_for_hanging_processes shard2ConfigRestart
+        local hanging_check=$?
+        if [ $test_result -eq 0 ] && [ $hanging_check -eq 0 ]; then
+            return 0
+        fi
+        [ $attempt -eq 1 ] && echo "Retrying shard2ConfigRestart (attempt 2/2)..."
+    done
+    return 1
+}
+
 run_rocksdb_tests() {
     echo "========================================="
     echo "Running: ./ci/ci.sh rocksdbTests"
@@ -961,6 +984,9 @@ case "${1:-}" in
     shard2ConfigFailoverRaft)
         run_2shard_config_failover_raft
         ;;
+    shard2ConfigRestart)
+        run_2shard_config_restart
+        ;;
     rocksdbTests)
         run_rocksdb_tests
         ;;
@@ -1025,7 +1051,7 @@ case "${1:-}" in
         echo "  shard1ReplicationRaft, shard2ReplicationRaft,"
         echo "  shard1ReplicationSimpleRaft, shard2ReplicationSimpleRaft,"
         echo "  raftLabTest, raftKillTest, shard1ReplicationRaftRestart (disk trees),"
-        echo "  shard2ConfigFailover, shard2ConfigFailoverRaft,"
+        echo "  shard2ConfigFailover, shard2ConfigFailoverRaft, shard2ConfigRestart,"
         echo "  rocksdbTests, multiShardSingleProcess,"
         echo "  shard2SingleProcess, shard2SingleProcessReplication,"
         echo "  srpcTests, cpuThrottlingScaling, clientServer, all"
