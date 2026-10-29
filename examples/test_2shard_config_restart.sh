@@ -1,19 +1,24 @@
 #!/bin/bash
 
 # Restart test for the cluster config (MAKO_CONFIG_TABLE=1) on a 2-shard
-# Paxos run. It starts the cluster three times, each time on new ports, and
-# crashes every process (SIGKILL) between starts. In the first run it
-# changes the config through mako_config: a node's status, shard 1's status
-# and a node's address. After the second start it checks that:
+# Paxos run. It starts the cluster four times and crashes every process
+# (SIGKILL) between starts; the first three runs use the same ports, the
+# fourth new ones. In the first run it changes the config through
+# mako_config: a node's status, shard 1's status and a node's address.
+# After the second start it checks that:
 #   1. shard 0's leader restored the config from the first run's log,
 #   2. both status changes are still there, while the node address is the
-#      one in the new shard config, not the changed one (a restart takes the
+#      one in the shard config, not the changed one (a restart takes the
 #      topology from the shard config it starts with),
 #   3. every node loads the restored config, and the leader takes a change.
 # After the third start it checks that the second run persisted what it
-# restored and its own change: all of them are still there.
+# restored and its own change: all of them are still there. The fourth
+# start, on other addresses, is a different cluster: shard 0's leader must
+# pass over the earlier logs and start from the shard config.
 #
 # Usage: test_2shard_config_restart.sh
+# Exit status: 0 passed, 1 a check failed, 3 the first run never came up
+# (startup or setup), which is the only case worth retrying.
 # Env: MAKO_CFG_RESTART_SETTLE (seconds between the last change and the
 #      crash, default 3: shard 0's leader persists its log asynchronously).
 
@@ -21,7 +26,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/simple_transaction_rep_port_utils.sh"
 
 echo "========================================="
-echo "Testing cluster-config restart (paxos, crash and restart twice)"
+echo "Testing cluster-config restart (paxos, crash and restart three times)"
 echo "========================================="
 
 rm -f nfs_sync_*
@@ -59,20 +64,55 @@ for bin in "./${BUILD_DIR:-build}/dbtest" "$tool_path"; do
     fi
 done
 
+# The cluster never got as far as the test.
+SETUP_FAILED=3
+
 if ! ensure_paxos_replication_configs "$trd" 2; then
-    exit 1
+    exit $SETUP_FAILED
 fi
+
+# The TCP ports the current run's processes listen on.
+CLUSTER_PORTS=()
+record_ports() {
+    local pids
+    CLUSTER_PORTS=()
+    [ -n "$TEMP_CONFIG" ] || return 0
+    pids=$(pgrep -d'|' -f -- "$TEMP_CONFIG")
+    [ -n "$pids" ] || return 0
+    CLUSTER_PORTS=($(ss -Htlnp 2>/dev/null | grep -E "pid=(${pids})," \
+        | awk '{print $4}' | sed -E 's/.*:([0-9]+)$/\1/' | sort -u))
+}
 
 # Stops every process of the current run with SIGKILL, as a crash would.
 crash_cluster() {
     local pid
     if [ -n "$TEMP_CONFIG" ]; then
+        record_ports
         pkill -9 -f "$TEMP_CONFIG" 2>/dev/null || true
     fi
     for pid in "${WRAPPER_PIDS[@]}"; do
         wait "$pid" 2>/dev/null || true
     done
     WRAPPER_PIDS=()
+}
+
+# Waits up to 90 s until no socket uses the crashed run's ports, so the
+# next run can bind them again: connections the crash closed linger in
+# TIME_WAIT for about a minute.
+wait_ports_free() {
+    local waited=0 busy
+    while [ "$waited" -lt 90 ]; do
+        busy=$(ss -Htan 2>/dev/null | awk '{print $4}' | sed -E 's/.*:([0-9]+)$/\1/' | sort -u \
+            | grep -x -F -f <(printf '%s\n' "${CLUSTER_PORTS[@]}") | head -1)
+        [ -z "$busy" ] && return 0
+        sleep 2
+        waited=$((waited + 2))
+    done
+    echo "  (port $busy still in use after 90s)"
+    return 1
+}
+
+drop_configs() {
     [ -n "$TEMP_CONFIG" ] && rm -f "$TEMP_CONFIG"
     [ -n "$TEMP_PAXOS_DIR" ] && rm -rf "$TEMP_PAXOS_DIR"
     TEMP_CONFIG=""
@@ -81,6 +121,7 @@ crash_cluster() {
 
 cleanup() {
     crash_cluster
+    drop_configs
     rm -rf /tmp/${USERNAME}_mako_rocksdb_shard*
     unset MAKO_CONFIG MAKO_PAXOS_CONFIG_DIR
 }
@@ -105,12 +146,18 @@ loaded_version() {
         | tail -1 | sed -E 's/.* //'
 }
 
-# Starts the cluster on newly picked ports.
+# Starts the cluster: "same" on the previous run's ports, once they are
+# free; otherwise on newly picked ports.
 start_cluster() {
     local shard r
     run=$((run + 1))
-    TEMP_CONFIG=$(make_simple_txn_rep_config 2 "$trd") || return 1
-    TEMP_PAXOS_DIR=$(make_paxos_replication_configs 2 "$trd" paxos) || return 1
+    if [ "$1" = same ] && [ -n "$TEMP_CONFIG" ]; then
+        wait_ports_free || return 1
+    else
+        drop_configs
+        TEMP_CONFIG=$(make_simple_txn_rep_config 2 "$trd") || return 1
+        TEMP_PAXOS_DIR=$(make_paxos_replication_configs 2 "$trd" paxos) || return 1
+    fi
     export MAKO_CONFIG="$TEMP_CONFIG"
     export MAKO_PAXOS_CONFIG_DIR="$TEMP_PAXOS_DIR"
     rm -f nfs_sync_*
@@ -196,7 +243,7 @@ expect() {
             failed=1
         fi
     elif [ "$got" = "$want" ]; then
-        echo "  ✓ Run $run: $key is still $got"
+        echo "  ✓ Run $run: $key is $got"
     else
         echo "  ✗ Run $run: $key is '$got', expected '$want'"
         failed=1
@@ -216,6 +263,21 @@ expect_restored() {
     fi
 }
 
+# Checks shard 0's leader restored nothing and passed over the earlier
+# logs as another cluster's.
+expect_not_restored() {
+    local line passed
+    line=$(grep -a -o -E "restored [0-9]+ of [0-9]+ config entries from [^ ]+" \
+        "$(log_of shard0-localhost)" | head -1)
+    passed=$(grep -a -c "holds another cluster's config" "$(log_of shard0-localhost)")
+    if [ -z "$line" ] && [ "$passed" -gt 0 ]; then
+        echo "  ✓ Run $run: shard 0's leader passed over $passed earlier logs as another cluster's"
+    else
+        echo "  ✗ Run $run: shard 0's leader ${line:-restored nothing} (passed over $passed logs as another cluster's)"
+        failed=1
+    fi
+}
+
 # The log shard 0's leader persists to in the current run.
 leader_log() {
     grep -a -o -E "Leader initializing RocksDB at path: [^ ]+" "$(log_of shard0-localhost)" \
@@ -223,13 +285,14 @@ leader_log() {
 }
 
 # ---- run 1: change the config, then crash -------------------------------
-start_cluster || exit 1
-wait_ready || exit 1
+start_cluster || exit $SETUP_FAILED
+wait_ready || exit $SETUP_FAILED
 echo "  ✓ Run 1: every node loaded version $SERVED_VERSION from shard 0's leader"
 if grep -a -q "restored [0-9]* of" "$(log_of shard0-localhost)"; then
     echo "  ✗ Run 1: shard 0's leader restored a config on a fresh start"
     failed=1
 fi
+p2_addr=$("$tool_path" --endpoints "$ENDPOINTS" get node/shard1-p2/addr 2>&1)
 change set_node_status shard1-p1 draining
 change set_shard_status 1 draining
 change set_node_addr shard1-p2 "$bogus_addr"
@@ -239,13 +302,13 @@ echo "Crashing run 1..."
 crash_cluster
 
 # ---- run 2: restored from run 1, change once more, crash ----------------
-start_cluster || exit 1
+start_cluster same || exit 1
 wait_ready || exit 1
 echo "  ✓ Run 2: every node loaded version $SERVED_VERSION from shard 0's leader"
 expect_restored "$run1_log"
 expect node/shard1-p1/status draining
 expect shard/1/status draining
-expect node/shard1-p2/addr "$bogus_addr" not
+expect node/shard1-p2/addr "$p2_addr"
 change set_node_status shard1-learner draining
 run2_log=$(leader_log)
 sleep "$settle"
@@ -253,7 +316,7 @@ echo "Crashing run 2..."
 crash_cluster
 
 # ---- run 3: restored from run 2, which persisted run 1's changes --------
-start_cluster || exit 1
+start_cluster same || exit 1
 wait_ready || exit 1
 echo "  ✓ Run 3: every node loaded version $SERVED_VERSION from shard 0's leader"
 expect_restored "$run2_log"
@@ -261,6 +324,18 @@ expect node/shard1-p1/status draining
 expect shard/1/status draining
 expect node/shard1-learner/status draining
 change set_node_status shard1-p1 active
+sleep "$settle"
+echo "Crashing run 3..."
+crash_cluster
+
+# ---- run 4: other addresses, so a different cluster: nothing restored ----
+start_cluster new || exit 1
+wait_ready || exit 1
+echo "  ✓ Run 4: every node loaded version $SERVED_VERSION from shard 0's leader"
+expect_not_restored
+expect node/shard1-p1/status alive
+expect shard/1/status active
+expect node/shard1-learner/status alive
 
 echo ""
 echo "========================================="
