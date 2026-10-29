@@ -90,8 +90,11 @@ void PromoteConfigTableLeader();
 // after it moved to a newer term, so a promotion serves only if the node
 // still leads partition 0 in the term it started in. The check runs on its own thread and
 // reads the current leadership, so it does not matter which partition's
-// event triggered it. No-op under Paxos, off shard 0, and when the
-// feature is off.
+// event triggered it.
+// Paxos: call when this replica steps down (register_step_down_callback),
+// which happens when it resumes after a new leader took over, the first
+// time an acceptor refuses it; it stops serving the same way.
+// No-op off shard 0 and when the feature is off.
 //
 // @unsafe - storage index, RPC server bind/teardown, background threads.
 void ConfigTableLeadershipChanged();
