@@ -13,11 +13,14 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
 
 #include "storage/abstract_db.h"           // abstract_db, abstract_ordered_index
+#include "rocksdb_persistence_fwd.h"       // the leader's persisted log, read at a restart
+#include "sto/ReplayDB.h"                  // for_each_log_write
 #include "ordered_index_kv_store.h"        // OrderedIndexKvStore
 #include "benchmarks/benchmark_config.h"   // BenchmarkConfig, transport::Configuration
 #include "lib/common.h"                    // mako::CONFIG_TABLE_ID
@@ -153,6 +156,8 @@ public:
     // The log timestamp (timestamp*10 + term) of the last batch committed.
     uint32_t last_commit_log_timestamp() const { return last_commit_log_ts_.load(); }
 
+    static inline const std::string kRemovedMarker = std::string("\0mako-config-removed\0", 21);
+
 private:
     bool in_my_batch() const { return batch_owner_.load() == std::this_thread::get_id(); }
 
@@ -223,8 +228,6 @@ private:
         TThread::push_log_each_commit = true;
         actual_directs::thread_init();
     }
-
-    static inline const std::string kRemovedMarker = std::string("\0mako-config-removed\0", 21);
 
     abstract_db* db_;
     abstract_ordered_index* idx_;
@@ -628,8 +631,129 @@ abstract_ordered_index* ConfigTable() {
     return g_cfg_db == nullptr ? nullptr : g_cfg_db->get_index_by_table_id(mako::CONFIG_TABLE_ID);
 }
 
+// Shard 0's config as this node last persisted it before it started: the
+// last value of every config-table key in the newest earlier log, written
+// by a shard-0 leader process of a cluster with the same number of shards,
+// that holds a config (RocksDBPersistence keeps one log per process), with
+// a removal as kRemovedMarker. Only a process that persists its log (shard
+// 0's preferred leader) has earlier logs; empty there too when none holds a
+// config or with MAKO_CONFIG_TABLE_RECOVER=0.
+struct PersistedConfig {
+    std::string log;                            // where it came from
+    std::map<std::string, std::string> keys;
+    size_t writes = 0;                          // config-table writes read
+};
+
+// A leader's persistence starts just before the config bootstrap, so a run
+// that had the config on persisted its seed among its first entries; a log
+// without one there holds no config (the run had it off, or stopped before
+// seeding). And reading a log replays its write-ahead log, so only the
+// newest few are tried.
+constexpr size_t kSeedWithinEntries = 64;
+constexpr size_t kEarlierLogsTried = 4;
+
+// @unsafe - reads another process's persisted log
+PersistedConfig ReadPersistedConfig(uint32_t nshards) {
+    const char* recover = getenv("MAKO_CONFIG_TABLE_RECOVER");
+    if (recover != nullptr && strcmp(recover, "0") == 0) return PersistedConfig{};
+    const std::string& mine = mako::RocksDBPersistence::getInstance().dbPath();
+    if (mine.empty()) return PersistedConfig{};
+    // This process's log is <prefix><pid>; earlier runs left theirs beside it.
+    const std::string prefix = mine.substr(0, mine.find_last_not_of("0123456789") + 1);
+    size_t tried = 0;
+    for (const std::string& log : mako::RocksDBPersistence::previousLogs(prefix, mine)) {
+        if (tried++ == kEarlierLogsTried) break;
+        PersistedConfig found;
+        std::map<std::string, std::string> meta;
+        size_t entries = 0, malformed = 0;
+        bool same_cluster = true;
+        // Only the config-table thread writes the table, one entry per
+        // commit, so the entries for it come in commit order.
+        const bool read = mako::RocksDBPersistence::forEachLogEntry(
+            log, 0, [&](const char* entry, size_t len) {
+                if (entries++ == 0) {
+                    same_cluster = meta["shard_id"] == "0" &&
+                                   meta["num_shards"] == std::to_string(nshards);
+                    if (!same_cluster) return false;
+                }
+                const bool whole = for_each_log_write(
+                    entry, len, [&](uint32_t, unsigned short table, bool removed,
+                                    std::string_view key, std::string_view value) {
+                        if (table != mako::CONFIG_TABLE_ID) return;
+                        found.keys[std::string(key)] =
+                            removed ? ConfigTableStore::kRemovedMarker : std::string(value);
+                        ++found.writes;
+                    });
+                if (!whole) ++malformed;
+                return found.writes > 0 || entries < kSeedWithinEntries;
+            }, &meta);
+        if (!read || !same_cluster || found.writes == 0) {
+            srpc::Log_info("BootstrapConfigTable: earlier log {} has no config for this cluster",
+                           log.c_str());
+            continue;
+        }
+        if (malformed > 0) {
+            srpc::Log_warn("BootstrapConfigTable: {} entries of {} were cut short", malformed,
+                           log.c_str());
+        }
+        found.log = log;
+        return found;
+    }
+    return PersistedConfig{};
+}
+
+bool EndsWith(const std::string& s, const char* tail) {
+    const size_t n = strlen(tail);
+    return s.size() >= n && s.compare(s.size() - n, n, tail) == 0;
+}
+
+// Whether a restart keeps a persisted config entry: what changes at
+// runtime does (shard and node status, dead-shard redirects, the epoch,
+// sharding policies). The topology, that is the shard count, each live
+// shard's replicas and leader, and the node addresses, comes from the shard
+// config the cluster starts with, which is what its processes listen on. A
+// dead shard keeps its replica list too, which kill_shard emptied.
+bool KeptAcrossRestart(const std::string& key, const std::map<std::string, std::string>& persisted) {
+    if (key == "epoch" || key == "next_shard_id" || key.rfind("sharding/", 0) == 0) return true;
+    if (key.rfind("node/", 0) == 0) return EndsWith(key, "/status");
+    if (key.rfind("shard/", 0) != 0) return false;
+    if (EndsWith(key, "/status") || EndsWith(key, "/replacement")) return true;
+    if (EndsWith(key, "/replicas")) {
+        auto status = persisted.find(key.substr(0, key.size() - strlen("/replicas")) + "/status");
+        return status != persisted.end() && status->second == "dead";
+    }
+    return false;
+}
+
+// Inside the seed's batch: put back what a restart keeps from the
+// persisted config, and continue the version above the persisted one.
+// @unsafe - config store writes
+void RestorePersistedConfig(ConfigManager* cm, const PersistedConfig& persisted) {
+    size_t kept = 0;
+    for (const auto& [key, value] : persisted.keys) {
+        if (!KeptAcrossRestart(key, persisted.keys)) continue;
+        if (value == ConfigTableStore::kRemovedMarker) {
+            g_cfg_store->remove(key);
+        } else {
+            g_cfg_store->put(key, value);
+        }
+        ++kept;
+    }
+    uint64_t persisted_version = 0;
+    auto v = persisted.keys.find("__version__");
+    if (v != persisted.keys.end()) persisted_version = strtoull(v->second.c_str(), nullptr, 10);
+    const uint64_t version = std::max(cm->get_version(), persisted_version) + 1;
+    g_cfg_store->put("__version__", std::to_string(version));
+    srpc::Log_info("BootstrapConfigTable: restored {} of {} config entries from {} (its version "
+                   "{}, {} writes); serving version {}", kept, persisted.keys.size(),
+                   persisted.log.c_str(), persisted_version, persisted.writes, version);
+}
+
 // Shard 0's preferred leader: seeds the config table, serves reads, and
-// keeps its own routing cache fresh from it.
+// keeps its own routing cache fresh from it. After a restart it keeps the
+// runtime state its earlier run persisted (RestorePersistedConfig); the
+// seed and that state commit as one transaction, which also reaches the
+// followers and this run's own log.
 // @unsafe - storage index, RPC server bind, background threads
 void StartShard0Leader(uint32_t nshards, const ConfigEndpoint& ep) {
     abstract_ordered_index* idx = ConfigTable();
@@ -640,8 +764,10 @@ void StartShard0Leader(uint32_t nshards, const ConfigEndpoint& ep) {
     }
     g_cfg_store = new ConfigTableStore(g_cfg_db, idx);
     g_cfg_cm = rusty::Some(rusty::make_box<ConfigManager>(g_cfg_store));
+    const PersistedConfig persisted = ReadPersistedConfig(nshards);
     g_cfg_store->begin_batch();   // the whole seed as one transaction
     SeedTopology(g_cfg_cm.as_ref().unwrap().get(), nshards, std::string());
+    if (!persisted.keys.empty()) RestorePersistedConfig(g_cfg_cm.as_ref().unwrap().get(), persisted);
     g_cfg_store->end_batch();
 
     // Local routing cache first, so this node routes by the config even if

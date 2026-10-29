@@ -294,9 +294,13 @@ error and leaves the config table off when both are set.
   `set_shard_status`, `set_shard_leader`, `set_shard_replicas`,
   `set_node_addr`, `set_node_status`, `advance_epoch`) to shard 0's leader,
   which applies it as one transaction and confirms it once it is replicated.
+- **Restart**: shard 0's leader persists its log, so after a full restart it
+  restores the table from it (`MAKO_CONFIG_TABLE_RECOVER`) instead of
+  re-seeding, and runtime changes survive.
 
-Tests: `examples/test_2shard_config_failover.sh` (ci target
-`shard2ConfigFailover`), `test_config_manager`, `test_config_kv_service`.
+Tests: `examples/test_2shard_config_failover.sh`,
+`examples/test_2shard_config_restart.sh` (ci targets `shard2ConfigFailover`,
+`shard2ConfigRestart`), `test_config_manager`, `test_config_kv_service`.
 
 ### Bootstrap Protocol
 
