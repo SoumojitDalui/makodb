@@ -257,8 +257,10 @@ every node. It is separate from native sharding (`MAKO_CLUSTER_CONFIG=1`),
 which owns placement; the config table holds what placement does not:
 
 - per shard its replicas, leader, status and, for a dead shard, the shard
-  recorded as its replacement (`kill_shard`; metadata only, it redirects
-  nothing);
+  recorded as its replacement (`kill_shard`; with native sharding off, the
+  static router then sends the dead shard's requests to the end of its
+  replacement chain, through a hook the config table sets with
+  `mako::set_shard_redirect`);
 - per node its address and status;
 - the epoch and `__version__`.
 

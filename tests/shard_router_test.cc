@@ -61,6 +61,22 @@ TEST_F(ShardRouterTest, StaticTableAddressing) {
     EXPECT_EQ(-1, compute_shard_for_key(-1, "key"));
 }
 
+namespace {
+int redirect_shard_one_to_zero(int shard) { return shard == 1 ? 0 : shard; }
+} // namespace
+
+// The config table's dead-shard redirect applies to the static owner, and
+// clearing it restores the static addressing.
+TEST_F(ShardRouterTest, StaticAddressingFollowsShardRedirect) {
+    set_shard_redirect(&redirect_shard_one_to_zero);
+    EXPECT_EQ(0, compute_shard_for_key(1, "key"));
+    EXPECT_EQ(0, compute_shard_for_key(201, "key"));
+    EXPECT_EQ(2, compute_shard_for_key(401, "key"));
+    EXPECT_EQ(-1, compute_shard_for_key(0, "key"));
+    set_shard_redirect(nullptr);
+    EXPECT_EQ(1, compute_shard_for_key(201, "key"));
+}
+
 // @unsafe - canonical binding has an explicit kind and cannot be rebound.
 TEST_F(ShardRouterTest, CanonicalBindingIsImmutable) {
     auto& registry = get_table_registry();
