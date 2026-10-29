@@ -271,11 +271,16 @@ admission only accepts the tables in its catalog, so the bootstrap logs an
 error and leaves the config table off when both are set.
 
 - **Shard 0's leader** seeds the table from the shared shard config and serves
-  it with a `ConfigKvService` at `MAKO_CONFIG_TABLE_PORT` (default: 90 above
-  shard 0's preferred-leader base port).
+  it with a `ConfigKvService`.
 - **Every other node** reads it through a `RemoteKvStore`; a `ConfigWatcher`
   on each node polls `__version__` and reloads its `ClusterConfig` when it
   changes.
+- **Failover**: every shard-0 replica has a config-service endpoint (its base
+  port + 90, or `MAKO_CONFIG_TABLE_PORT` plus its position in shard 0's
+  replica list), and other nodes try them in turn. The replica that takes
+  over shard 0 (the Paxos learner, or a new Raft leader) serves the config
+  from then on (`PromoteConfigTableLeader`), at a version above the last one
+  it saw.
 
 Tests: `test_config_manager`.
 
