@@ -1,5 +1,6 @@
 #include "config_table_bootstrap.h"
 
+#include <stdio.h>   // snprintf
 #include <stdlib.h>  // getenv, strtol, atol
 #include <string.h>  // strcmp
 #include <algorithm>
@@ -157,6 +158,7 @@ public:
     uint32_t last_commit_log_timestamp() const { return last_commit_log_ts_.load(); }
 
     static inline const std::string kRemovedMarker = std::string("\0mako-config-removed\0", 21);
+    static inline const std::string kVersionKey = "__version__";
 
 private:
     bool in_my_batch() const { return batch_owner_.load() == std::this_thread::get_id(); }
@@ -164,16 +166,32 @@ private:
     // On the table thread: the batch as one transaction, retried on a
     // conflict. A transactional put keeps a pointer to its encoded value
     // until commit, so the encoded values live in `values` until then.
+    // __version__ goes last: a follower replays the transaction's writes in
+    // log order, each as a transaction of its own, so a replica serving
+    // reads while it replays shows a new version only once the rest of the
+    // change is in (a reader that saw part of it then sees the version move
+    // and reloads).
     void CommitBatch(const std::map<std::string, std::string>& writes) {
+        std::vector<const std::pair<const std::string, std::string>*> order;
+        order.reserve(writes.size());
+        const std::pair<const std::string, std::string>* version = nullptr;
+        for (const auto& kv : writes) {
+            if (kv.first == kVersionKey) {
+                version = &kv;
+            } else {
+                order.push_back(&kv);
+            }
+        }
+        if (version != nullptr) order.push_back(version);
         std::vector<std::string> values;
-        values.reserve(writes.size());
-        for (const auto& kv : writes) values.push_back(mako::Encode(kv.second));
+        values.reserve(order.size());
+        for (const auto* kv : order) values.push_back(mako::Encode(kv->second));
         for (;;) {
             try {
                 void* txn = db_->new_txn(0, arena_, nullptr);
                 size_t i = 0;
-                for (const auto& kv : writes) {
-                    idx_->tx_put(txn, lcdf::Str(kv.first.data(), kv.first.size()), values[i++]);
+                for (const auto* kv : order) {
+                    idx_->tx_put(txn, lcdf::Str(kv->first.data(), kv->first.size()), values[i++]);
                 }
                 db_->commit_txn(txn);
                 last_commit_log_ts_.store(TThread::last_log_timestamp);
@@ -379,6 +397,11 @@ bool ResolveConfigEndpoints(std::vector<ConfigEndpoint>* out) {
 std::string MyReplicaName() {
     auto& bench = BenchmarkConfig::getInstance();
     transport::Configuration* tc = bench.getConfig();
+    // A new-format process was started as a site name, which ShardReplicas
+    // lists; dbtest then keeps only its role in the proc name.
+    if (tc != nullptr && tc->is_new_format && !bench.getSiteName().empty()) {
+        return bench.getSiteName();
+    }
     if (tc != nullptr && tc->is_new_format) return bench.getPaxosProcName();
     return "shard" + std::to_string(bench.getShardIndex()) + "-" + bench.getCluster();
 }
@@ -545,22 +568,18 @@ void StartLocalWatcher(ConfigManager* cm) {
 // change is one transaction, made under g_cfg_mu so it does not interleave
 // with a promotion or a demotion. The answer then waits until shard 0's
 // replicas hold it. The table thread pushes the commit's log entry to
-// partition 0 as it commits, and partition 0's replicated timestamp
-// (local_timestamp_[0], timestamp*10 + term) moves to each of its entries
-// as they commit, in log order. So the entry has committed once that
-// timestamp reads the entry's own, or, if a later entry moved it on first,
-// a timestamp above the commit counter (sync_logger::local_replica_id)
-// read after the change: every commit timestamp comes from that counter,
-// so such an entry was queued after this one. A change not seen committed
-// within kConfigChangeReplicationWait is answered as applied but
-// unconfirmed; that happens when partition 0's replicated timestamp stops
-// moving on this replica, which Mako's leaders do for some partitions
-// (seen for partition 0 with three workers per shard).
+// partition 0 as it commits, and partition 0's leader callback records the
+// log timestamp (timestamp*10 + term) of each entry that commits
+// (sync_logger::record_commit). So the change has committed once its own
+// entry's timestamp shows up there. (Partition 0's replicated timestamp
+// moves past the entry within moments, and a later timestamp there shows
+// nothing: entry timestamps are not in log order, since a cross-shard
+// transaction takes a remote timestamp.) A change not seen committed within
+// kConfigChangeReplicationWait is answered as applied but unconfirmed.
 // @unsafe - config store writes, replication state reads
 ConfigChangeResult ApplyConfigChangeOnLeader(const std::string& op,
                                              const std::vector<std::string>& args) {
     ConfigChangeResult result;
-    uint64_t counter_after = 0;
     uint32_t own_entry = 0;
     {
         std::lock_guard<std::mutex> lock(g_cfg_mu);
@@ -575,8 +594,6 @@ ConfigChangeResult ApplyConfigChangeOnLeader(const std::string& op,
         result = ApplyConfigChangeTo(cm, op, args);
         if (result.status != kConfigChangeApplied || result.version == before) return result;
         own_entry = g_cfg_store->last_commit_log_timestamp();
-        counter_after = static_cast<uint64_t>(
-            __atomic_load_n(&sync_util::sync_logger::local_replica_id, __ATOMIC_ACQUIRE));
     }
     std::string change = op;
     for (const auto& a : args) change += " " + a;
@@ -584,16 +601,8 @@ ConfigChangeResult ApplyConfigChangeOnLeader(const std::string& op,
                    change.c_str(), result.version);
 
     const auto deadline = std::chrono::steady_clock::now() + kConfigChangeReplicationWait;
-    while (!sync_util::sync_logger::local_timestamp_.empty() &&
-           std::chrono::steady_clock::now() < deadline) {
-        const uint32_t replicated =
-            sync_util::sync_logger::local_timestamp_[0].load(std::memory_order_acquire);
-        // A stream that has ended reads as the maximum, which says nothing
-        // about this entry.
-        if (replicated != std::numeric_limits<uint32_t>::max() &&
-            (replicated == own_entry || replicated / 10 > counter_after)) {
-            return result;
-        }
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (sync_util::sync_logger::recently_committed(own_entry)) return result;
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     result.status = kConfigChangeUnconfirmed;
@@ -631,16 +640,75 @@ abstract_ordered_index* ConfigTable() {
     return g_cfg_db == nullptr ? nullptr : g_cfg_db->get_index_by_table_id(mako::CONFIG_TABLE_ID);
 }
 
+// Which cluster a config belongs to: MAKO_CLUSTER_ID when set, else a
+// fingerprint of the cluster's addresses in the shard config (the shard
+// count and every replica's name and host:port). The seed stores it under
+// kClusterIdKey, and a restart takes an earlier log's config only when it
+// holds the same one. Ports are part of it: two clusters of one user can
+// share names and hosts and differ only in ports. So a cluster restarted
+// on other addresses is taken for a new one unless MAKO_CLUSTER_ID names it.
+const std::string kClusterIdKey = "cluster/id";
+
+// @safe - reads the shard config
+std::string ClusterIdentity(uint32_t nshards) {
+    const char* id = getenv("MAKO_CLUSTER_ID");
+    if (id != nullptr && id[0] != '\0') return std::string("id:") + id;
+    transport::Configuration* tc = BenchmarkConfig::getInstance().getConfig();
+    uint64_t h = 1469598103934665603ULL;   // FNV-1a, field by field
+    auto mix = [&h](const std::string& field) {
+        for (unsigned char c : field) {
+            h ^= c;
+            h *= 1099511628211ULL;
+        }
+        h ^= 0xff;
+        h *= 1099511628211ULL;
+    };
+    mix(std::to_string(nshards));
+    for (uint32_t sid = 0; sid < nshards; ++sid) {
+        for (const auto& r : ShardReplicas(tc, sid)) {
+            mix(r.name);
+            mix(r.addr);
+        }
+    }
+    char buf[32];
+    snprintf(buf, sizeof buf, "addrs:%016llx", static_cast<unsigned long long>(h));
+    return buf;
+}
+
+// Whether a config persisted before configs carried kClusterIdKey is this
+// cluster's: without MAKO_CLUSTER_ID, when its seed (`seeded`, the first
+// value the log holds for each key) has this shard count and every replica
+// in the shard config at the same address. The seed wrote both from the
+// shard config its run started with, so a node address changed later at
+// runtime does not hide the cluster's own log.
+// @safe - reads the shard config
+bool LegacyConfigMatches(const std::map<std::string, std::string>& seeded, uint32_t nshards) {
+    const char* id = getenv("MAKO_CLUSTER_ID");
+    if (id != nullptr && id[0] != '\0') return false;
+    auto count = seeded.find("shard_count");
+    if (count == seeded.end() || count->second != std::to_string(nshards)) return false;
+    transport::Configuration* tc = BenchmarkConfig::getInstance().getConfig();
+    for (uint32_t sid = 0; sid < nshards; ++sid) {
+        for (const auto& r : ShardReplicas(tc, sid)) {
+            auto addr = seeded.find("node/" + r.name + "/addr");
+            if (addr == seeded.end() || addr->second != r.addr) return false;
+        }
+    }
+    return true;
+}
+
 // Shard 0's config as this node last persisted it before it started: the
 // last value of every config-table key in the newest earlier log, written
-// by a shard-0 leader process of a cluster with the same number of shards,
-// that holds a config (RocksDBPersistence keeps one log per process), with
-// a removal as kRemovedMarker. Only a process that persists its log (shard
-// 0's preferred leader) has earlier logs; empty there too when none holds a
-// config or with MAKO_CONFIG_TABLE_RECOVER=0.
+// by a shard-0 leader process of this cluster (same number of shards and
+// same ClusterIdentity), that holds a config (RocksDBPersistence keeps one
+// log per process), with a removal as kRemovedMarker. Only a process that
+// persists its log (shard 0's preferred leader) has earlier logs; empty
+// there too when none holds this cluster's config or with
+// MAKO_CONFIG_TABLE_RECOVER=0.
 struct PersistedConfig {
     std::string log;                            // where it came from
     std::map<std::string, std::string> keys;
+    std::map<std::string, std::string> seeded;  // each key's first value
     size_t writes = 0;                          // config-table writes read
 };
 
@@ -660,6 +728,7 @@ PersistedConfig ReadPersistedConfig(uint32_t nshards) {
     if (mine.empty()) return PersistedConfig{};
     // This process's log is <prefix><pid>; earlier runs left theirs beside it.
     const std::string prefix = mine.substr(0, mine.find_last_not_of("0123456789") + 1);
+    const std::string identity = ClusterIdentity(nshards);
     size_t tried = 0;
     for (const std::string& log : mako::RocksDBPersistence::previousLogs(prefix, mine)) {
         if (tried++ == kEarlierLogsTried) break;
@@ -680,8 +749,10 @@ PersistedConfig ReadPersistedConfig(uint32_t nshards) {
                     entry, len, [&](uint32_t, unsigned short table, bool removed,
                                     std::string_view key, std::string_view value) {
                         if (table != mako::CONFIG_TABLE_ID) return;
-                        found.keys[std::string(key)] =
+                        std::string v =
                             removed ? ConfigTableStore::kRemovedMarker : std::string(value);
+                        found.seeded.emplace(std::string(key), v);
+                        found.keys[std::string(key)] = std::move(v);
                         ++found.writes;
                     });
                 if (!whole) ++malformed;
@@ -690,6 +761,21 @@ PersistedConfig ReadPersistedConfig(uint32_t nshards) {
         if (!read || !same_cluster || found.writes == 0) {
             srpc::Log_info("BootstrapConfigTable: earlier log {} has no config for this cluster",
                            log.c_str());
+            continue;
+        }
+        auto id = found.keys.find(kClusterIdKey);
+        if (id == found.keys.end()) {
+            if (!LegacyConfigMatches(found.seeded, nshards)) {
+                srpc::Log_info("BootstrapConfigTable: earlier log {} has no cluster id and other "
+                               "addresses; it is another cluster's", log.c_str());
+                continue;
+            }
+            srpc::Log_info("BootstrapConfigTable: earlier log {} has no cluster id but this "
+                           "cluster's addresses", log.c_str());
+        } else if (id->second != identity) {
+            srpc::Log_info("BootstrapConfigTable: earlier log {} holds another cluster's config "
+                           "({}, this cluster is {})", log.c_str(), id->second.c_str(),
+                           identity.c_str());
             continue;
         }
         if (malformed > 0) {
@@ -767,6 +853,7 @@ void StartShard0Leader(uint32_t nshards, const ConfigEndpoint& ep) {
     const PersistedConfig persisted = ReadPersistedConfig(nshards);
     g_cfg_store->begin_batch();   // the whole seed as one transaction
     SeedTopology(g_cfg_cm.as_ref().unwrap().get(), nshards, std::string());
+    g_cfg_store->put(kClusterIdKey, ClusterIdentity(nshards));
     if (!persisted.keys.empty()) RestorePersistedConfig(g_cfg_cm.as_ref().unwrap().get(), persisted);
     g_cfg_store->end_batch();
 
@@ -861,6 +948,7 @@ void PromoteLocked() {
         cm->set_shard_leader(0, me);
     } else {
         SeedTopology(cm, g_cfg_nshards, me);
+        g_cfg_store->put(kClusterIdKey, ClusterIdentity(g_cfg_nshards));
     }
     g_cfg_store->end_batch();
     if (janus::is_using_raft() &&
