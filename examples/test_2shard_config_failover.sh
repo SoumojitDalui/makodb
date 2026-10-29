@@ -12,6 +12,9 @@
 #   5. the change is still in the config after the failover, and the new
 #      leader applies and confirms a change of its own,
 #   6. no node exited before the event, and no shard-0 replica after it.
+# With right-after, the event follows the change as soon as it is confirmed,
+# before the other nodes load it, so check 1 covers only the confirmation
+# and check 5 shows that a confirmed change survives the failover.
 # Taking over from shard 0's leader also runs Mako's own cross-shard failover
 # handling, which can stop another shard's replicas; such exits are
 # reported as warnings, and at least one node outside shard 0 must stay up
@@ -19,7 +22,7 @@
 # Shard 1's benchmark cannot finish once shard 0's leader is gone, so the test
 # stops the run itself and judges only the config.
 #
-# Usage: test_2shard_config_failover.sh [paxos|raft] [kill|pause]
+# Usage: test_2shard_config_failover.sh [paxos|raft] [kill|pause] [right-after]
 #   A paused leader that resumes after a takeover must step down: Raft tells
 #   it through a newer term, Paxos through an acceptor that refuses it.
 # Env: MAKO_CFG_FAILOVER_PAUSE (seconds paused, default 12),
@@ -30,10 +33,12 @@ source "${SCRIPT_DIR}/simple_transaction_rep_port_utils.sh"
 
 replication="${1:-paxos}"
 event="${2:-kill}"
-case "$replication/$event" in
-    paxos/kill|paxos/pause|raft/kill|raft/pause) ;;
+timing="${3:-}"
+case "$replication/$event/$timing" in
+    paxos/kill/|paxos/pause/|raft/kill/|raft/pause/) ;;
+    paxos/kill/right-after|paxos/pause/right-after|raft/kill/right-after|raft/pause/right-after) ;;
     *)
-        echo "Usage: $0 [paxos|raft] [kill|pause]"
+        echo "Usage: $0 [paxos|raft] [kill|pause] [right-after]"
         exit 2
         ;;
 esac
@@ -52,7 +57,7 @@ converge_timeout="${MAKO_CFG_FAILOVER_TIMEOUT:-60}"
 script_name="$(basename "$0")"
 binary_path="./${BUILD_DIR:-build}/dbtest"
 tool_path="./${BUILD_DIR:-build}/mako_config"
-log_prefix="${script_name}_${replication}"
+log_prefix="${script_name}_${replication}_${event}${timing:+_$timing}"
 export MAKO_CONFIG_TABLE=1
 export LD_LIBRARY_PATH="$(pwd)/${BUILD_DIR:-build}:${LD_LIBRARY_PATH}"
 
@@ -155,6 +160,13 @@ serves_config() {
     [ -n "$line" ] && [[ "$line" != *"no longer leads"* ]]
 }
 
+# Whether two numbers read from the logs are the same. A process's threads
+# share its log, and another thread's output can land right after a
+# number, before the line ends, so one of them may carry extra digits.
+same_number() {
+    [ -n "$1" ] && [ -n "$2" ] && { [[ "$1" == "$2"* ]] || [[ "$2" == "$1"* ]]; }
+}
+
 serving_port() {
     grep -a -o -E "config service listening on [0-9.]+:[0-9]+" "$(log_of "$1")" 2>/dev/null \
         | tail -1 | sed -E 's/.*:([0-9]+)$/\1/'
@@ -196,7 +208,7 @@ converged() {
         if [ "$n" = "$leader" ] || gone "$n"; then
             continue
         fi
-        [ "$(reading_port "$n")" = "$port" ] || return 1
+        same_number "$(reading_port "$n")" "$port" || return 1
         [[ "$n" == shard0-* ]] || readers=$((readers + 1))
     done
     [ "$readers" -gt 0 ] || return 1
@@ -350,9 +362,29 @@ apply_change() {
     done
 }
 
+# The replica that serves the config now, which the event will act on.
+pick_event_node() {
+    local i
+    if ! wait_for_convergence 60 1 stop; then
+        report_no_convergence "before the $event" 60
+        exit 1
+    fi
+    event_node=$CONFIG_LEADER
+    event_pid=$(pid_of "$event_node")
+    if [ -z "$event_pid" ]; then
+        echo "  ✗ Could not find the dbtest process of $event_node"
+        exit 1
+    fi
+    LINES_BEFORE=()
+    for i in "${!NODES[@]}"; do
+        LINES_BEFORE[$i]=$(wc -l < "$(log_of "${NODES[$i]}")")
+    done
+}
+
 # Let the benchmark run past its load phase, then change the config.
 sleep 5
 endpoints=$(config_endpoints)
+[ "$timing" = right-after ] && pick_event_node
 echo "Changing the config through mako_config ($endpoints)..."
 if ! apply_change set_node_status "$change_site" "$change_status" || [ -z "$CHANGE_VERSION" ]; then
     echo "  ✗ mako_config set_node_status exited $TOOL_RC: $TOOL_OUT"
@@ -361,42 +393,32 @@ fi
 change_version=$CHANGE_VERSION
 echo "  ✓ Applied and confirmed replicated at version $change_version"
 
-waited=0
-lagging=("${NODES[@]}")
-while [ "${#lagging[@]}" -gt 0 ] && [ "$waited" -lt 15 ]; do
-    sleep 1
-    waited=$((waited + 1))
-    still=()
-    for n in "${lagging[@]}"; do
-        v=$(loaded_version "$n")
-        if [ -z "$v" ] || [ "$v" -lt "$change_version" ]; then
-            still+=("$n")
-        fi
-    done
-    lagging=("${still[@]}")
-done
-if [ "${#lagging[@]}" -eq 0 ]; then
-    echo "  ✓ Every node loaded version $change_version within ${waited}s"
+if [ "$timing" = right-after ]; then
+    echo "  (the $event follows at once, before every node loads the change)"
 else
-    echo "  ✗ Not loaded version $change_version after 15s: ${lagging[*]}"
-    exit 1
-fi
+    waited=0
+    lagging=("${NODES[@]}")
+    while [ "${#lagging[@]}" -gt 0 ] && [ "$waited" -lt 15 ]; do
+        sleep 1
+        waited=$((waited + 1))
+        still=()
+        for n in "${lagging[@]}"; do
+            v=$(loaded_version "$n")
+            if [ -z "$v" ] || [ "$v" -lt "$change_version" ]; then
+                still+=("$n")
+            fi
+        done
+        lagging=("${still[@]}")
+    done
+    if [ "${#lagging[@]}" -eq 0 ]; then
+        echo "  ✓ Every node loaded version $change_version within ${waited}s"
+    else
+        echo "  ✗ Not loaded version $change_version after 15s: ${lagging[*]}"
+        exit 1
+    fi
 
-# Act on whichever replica serves the config now.
-if ! wait_for_convergence 60 1 stop; then
-    report_no_convergence "before the $event" 60
-    exit 1
+    pick_event_node
 fi
-event_node=$CONFIG_LEADER
-event_pid=$(pid_of "$event_node")
-if [ -z "$event_pid" ]; then
-    echo "  ✗ Could not find the dbtest process of $event_node"
-    exit 1
-fi
-LINES_BEFORE=()
-for i in "${!NODES[@]}"; do
-    LINES_BEFORE[$i]=$(wc -l < "$(log_of "${NODES[$i]}")")
-done
 
 if [ "$event" = "kill" ]; then
     echo "Killing $event_node (pid $event_pid)..."
