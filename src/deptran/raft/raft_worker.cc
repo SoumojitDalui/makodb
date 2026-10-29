@@ -623,6 +623,32 @@ bool RaftWorker::IsLeader(uint32_t par_id) {
   return false;
 }
 
+// @unsafe - uses raw pointers
+uint64_t RaftWorker::CurrentTerm(uint32_t par_id) {
+  verify(rep_frame_ != nullptr);
+  verify(rep_frame_->site_info_ != nullptr);
+
+  if (!handles_all_partitions_) {
+    // @unsafe
+    { // rep_frame_->site_info_-> pointer dereference chain
+      if (!raft_worker_partition_matches(
+              rep_frame_->site_info_->partition_id_, par_id)) {
+        return 0;
+      }
+    }
+  }
+
+  // @unsafe
+  { // GetRaftServer returns a raw pointer, raft_server-> pointer dereference
+    auto raft_server = GetRaftServer();
+    if (raft_server) {
+      return raft_server->CurrentTerm();
+    }
+  }
+
+  return 0;
+}
+
 // @unsafe - uses raw pointers, dynamic_cast
 siteid_t RaftWorker::GetLeaderHint() {
   // @unsafe

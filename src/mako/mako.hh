@@ -654,9 +654,10 @@ static void setup_leader_election_callbacks()
     // happens on the learner for case 0 and case 2, 3
     uint32_t aa = mako::getCurrentTimeMillis();
     Warning("Receive a control command:%d, current ms: %llu", control, aa);
-    if (janus::is_using_raft() && control == 1) {
-      // Raft: became leader. Shard 0's new leader serves the cluster config.
-      janus::PromoteConfigTableLeader();
+    if (janus::is_using_raft()) {
+      // Raft (1 = became leader, 0 = lost leadership, per partition): the
+      // replica that leads partition 0 serves the cluster config.
+      janus::ConfigTableLeadershipChanged();
     }
     switch (control) {
 #if defined(FAIL_NEW_VERSION) && !defined(MAKO_USE_RAFT)
