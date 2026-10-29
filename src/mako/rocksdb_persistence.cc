@@ -46,6 +46,61 @@ std::string copy_db_value(const char* data, size_t len) {
     return std::string(data, len);
 }
 
+// A database opened read-only, closed when it goes out of scope. Opening
+// read-only takes no lock, so it works on a log another process still has
+// open, and it reads the write-ahead log of one that exited without
+// flushing.
+// @unsafe - RocksDB C API handles
+class ReadOnlyDb {
+public:
+    explicit ReadOnlyDb(const std::string& path)
+        : options_(rocksdb_options_create()), read_options_(rocksdb_readoptions_create()) {
+        if (options_ == nullptr || read_options_ == nullptr) return;
+        rocksdb_options_set_create_if_missing(options_, 0);
+        char* err = nullptr;
+        db_ = rocksdb_open_for_read_only(options_, path.c_str(), 0, &err);
+        error_ = take_rocksdb_error(&err);
+        if (!error_.empty()) db_ = nullptr;
+    }
+    ~ReadOnlyDb() {
+        if (db_ != nullptr) rocksdb_close(db_);
+        if (read_options_ != nullptr) rocksdb_readoptions_destroy(read_options_);
+        if (options_ != nullptr) rocksdb_options_destroy(options_);
+    }
+    ReadOnlyDb(const ReadOnlyDb&) = delete;
+    ReadOnlyDb& operator=(const ReadOnlyDb&) = delete;
+
+    bool ok() const { return db_ != nullptr; }
+    const std::string& error() const { return error_; }
+    rocksdb_t* db() const { return db_; }
+    rocksdb_readoptions_t* read_options() const { return read_options_; }
+
+    // The metadata writeMetadata stored, as key -> value.
+    std::map<std::string, std::string> metadata() const {
+        std::map<std::string, std::string> kv;
+        if (db_ == nullptr) return kv;
+        size_t len = 0;
+        char* err = nullptr;
+        char* value = rocksdb_get(db_, read_options_, "meta", std::strlen("meta"), &len, &err);
+        take_rocksdb_error(&err);
+        if (value == nullptr) return kv;
+        std::stringstream ss(copy_db_value(value, len));
+        rocksdb_free(value);
+        std::string pair;
+        while (std::getline(ss, pair, ',')) {
+            size_t colon = pair.find(':');
+            if (colon != std::string::npos) kv[pair.substr(0, colon)] = pair.substr(colon + 1);
+        }
+        return kv;
+    }
+
+private:
+    rocksdb_options_t* options_ = nullptr;
+    rocksdb_readoptions_t* read_options_ = nullptr;
+    rocksdb_t* db_ = nullptr;
+    std::string error_;
+};
+
 }  // namespace
 
 // @safe
@@ -161,6 +216,7 @@ bool RocksDBPersistence::initialize(const std::string& db_path, size_t num_parti
         worker_threads_.emplace_back(&RocksDBPersistence::workerThread, this, i, num_threads);
     }
 
+    db_path_ = db_path;
     initialized_ = true;
     fprintf(stderr, "[RocksDB] Initialized with %zu partitions and %zu worker threads\n",
             num_partitions_, num_threads);
@@ -738,4 +794,78 @@ bool RocksDBPersistence::parseMetadata(const std::string& db_path, uint32_t& epo
     }
 }
 
+// @safe - member read
+const std::string& RocksDBPersistence::dbPath() const {
+    return db_path_;
+}
+
+// @safe - string building
+std::string RocksDBPersistence::leaderLogPrefix(const std::string& user, uint32_t shard_id) {
+    return "/tmp/" + user + "_mako_rocksdb_shard" + std::to_string(shard_id) + "_leader_pid";
+}
+
+// @unsafe - directory listing
+std::vector<std::string> RocksDBPersistence::previousLogs(const std::string& prefix,
+                                                          const std::string& skip_path) {
+    namespace fs = std::filesystem;
+    const fs::path pattern(prefix);
+    const std::string stem = pattern.filename().string();
+    const std::string suffix = "_partition0";
+    std::vector<std::pair<fs::file_time_type, std::string>> found;
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(pattern.parent_path(), ec)) {
+        const std::string name = entry.path().filename().string();
+        if (name.size() <= stem.size() + suffix.size() || name.rfind(stem, 0) != 0 ||
+            name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) {
+            continue;
+        }
+        const std::string full = entry.path().string();
+        const std::string db_path = full.substr(0, full.size() - suffix.size());
+        if (db_path == skip_path) continue;
+        std::error_code tec;
+        const auto changed = fs::last_write_time(entry.path(), tec);
+        if (!tec) found.emplace_back(changed, db_path);
+    }
+    std::sort(found.begin(), found.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::vector<std::string> logs;
+    for (auto& f : found) logs.push_back(std::move(f.second));
+    return logs;
+}
+
+// @unsafe - RocksDB C API iteration
+bool RocksDBPersistence::forEachLogEntry(const std::string& db_path, size_t partition,
+                                         const std::function<bool(const char*, size_t)>& fn,
+                                         std::map<std::string, std::string>* meta) {
+    ReadOnlyDb log(db_path + "_partition" + std::to_string(partition));
+    if (!log.ok()) {
+        fprintf(stderr, "[RocksDB] Cannot read %s_partition%zu: %s\n", db_path.c_str(), partition,
+                log.error().c_str());
+        return false;
+    }
+    if (meta != nullptr) *meta = log.metadata();
+    rocksdb_iterator_t* iter = rocksdb_create_iterator(log.db(), log.read_options());
+    if (iter == nullptr) return false;
+    // Keys are shard:partition:epoch:sequence, zero-padded, so key order is
+    // the order the entries were persisted in.
+    for (rocksdb_iter_seek_to_first(iter); rocksdb_iter_valid(iter); rocksdb_iter_next(iter)) {
+        size_t key_len = 0, value_len = 0;
+        const char* key = rocksdb_iter_key(iter, &key_len);
+        if (key_len == std::strlen("meta") && std::memcmp(key, "meta", key_len) == 0) continue;
+        const char* value = rocksdb_iter_value(iter, &value_len);
+        if (!fn(value, value_len)) break;
+    }
+    char* err = nullptr;
+    rocksdb_iter_get_error(iter, &err);
+    const std::string error = take_rocksdb_error(&err);
+    rocksdb_iter_destroy(iter);
+    if (!error.empty()) {
+        fprintf(stderr, "[RocksDB] Reading %s_partition%zu stopped: %s\n", db_path.c_str(), partition,
+                error.c_str());
+        return false;
+    }
+    return true;
+}
+
 } // namespace mako
+

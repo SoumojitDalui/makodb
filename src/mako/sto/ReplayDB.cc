@@ -77,3 +77,56 @@ size_t treplay_in_same_thread_opt_mbta_v2(size_t par_id, char *buffer, size_t le
     //Warning("%d K-V pairs replayed, par_id:%d, total-len: %d, c_txn:%d, c_kv:%d", thread_put, par_id, len, c_txn, c_kv);
     return thread_put;
 }
+
+// @unsafe: uses memcpy and pointer arithmetic
+bool for_each_log_write(const char *buffer, size_t len, const LogWriteFn &fn) {
+    // The entry ends with the latest commit id and a latency tracker.
+    if (len < sizeof(uint32_t) * 2) return false;
+    len -= sizeof(uint32_t) * 2;
+
+    size_t idx = 0;
+    while (idx < len) {
+        // A transaction: commit id, count of writes, their length in bytes.
+        uint32_t cid = 0;
+        unsigned short int count = 0;
+        unsigned int kv_len = 0;
+        if (len - idx < sizeof(cid) + sizeof(count) + sizeof(kv_len)) return false;
+        memcpy(&cid, buffer + idx, sizeof(cid));
+        idx += sizeof(cid);
+        memcpy(&count, buffer + idx, sizeof(count));
+        idx += sizeof(count);
+        memcpy(&kv_len, buffer + idx, sizeof(kv_len));
+        idx += sizeof(kv_len);
+        if (kv_len > len - idx) return false;
+
+        // Each write: key length and key, value length and value, table id
+        // (the top bit marks a delete).
+        const char *pairs = buffer + idx;
+        size_t off = 0;
+        for (unsigned short int i = 0; i < count; i++) {
+            unsigned short int k_len = 0, v_len = 0, table_id = 0;
+            if (kv_len - off < sizeof(k_len)) return false;
+            memcpy(&k_len, pairs + off, sizeof(k_len));
+            off += sizeof(k_len);
+            if (kv_len - off < k_len) return false;
+            std::string_view key(pairs + off, k_len);
+            off += k_len;
+
+            if (kv_len - off < sizeof(v_len)) return false;
+            memcpy(&v_len, pairs + off, sizeof(v_len));
+            off += sizeof(v_len);
+            if (kv_len - off < v_len) return false;
+            std::string_view value(pairs + off, v_len);
+            off += v_len;
+
+            if (kv_len - off < sizeof(table_id)) return false;
+            memcpy(&table_id, pairs + off, sizeof(table_id));
+            off += sizeof(table_id);
+
+            const bool removed = (table_id & (1 << 15)) != 0;
+            fn(cid, static_cast<unsigned short>(table_id & ~(1 << 15)), removed, key, value);
+        }
+        idx += kv_len;
+    }
+    return true;
+}

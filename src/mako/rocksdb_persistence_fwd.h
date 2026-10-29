@@ -5,7 +5,9 @@
 #include <cstdint>
 #include <functional>
 #include <future>
+#include <map>
 #include <string>
+#include <vector>
 
 namespace mako {
 
@@ -31,6 +33,15 @@ public:
     static bool parseMetadata(const std::string& db_path, uint32_t& epoch, uint32_t& shard_id,
                               uint32_t& num_shards, size_t& num_partitions, size_t& num_workers,
                               int64_t& timestamp);
+
+    // See rocksdb_persistence.h.
+    const std::string& dbPath() const;
+    static std::string leaderLogPrefix(const std::string& user, uint32_t shard_id);
+    static std::vector<std::string> previousLogs(const std::string& prefix,
+                                                 const std::string& skip_path);
+    static bool forEachLogEntry(const std::string& db_path, size_t partition,
+                                const std::function<bool(const char*, size_t)>& fn,
+                                std::map<std::string, std::string>* meta = nullptr);
 };
 
 } // namespace mako
