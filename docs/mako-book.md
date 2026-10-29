@@ -288,8 +288,13 @@ error and leaves the config table off when both are set.
   the old leader's entries) serves the config
   from then on (`PromoteConfigTableLeader`), at a version above the last one
   it saw.
+- **Runtime changes**: `mako_config` (endpoints in
+  `MAKO_CONFIG_TABLE_ENDPOINTS`) sends a change (`kill_shard`,
+  `set_shard_status`, `set_shard_leader`, `set_shard_replicas`,
+  `set_node_addr`, `set_node_status`, `advance_epoch`) to shard 0's leader,
+  which applies it as one transaction and confirms it once it is replicated.
 
-Tests: `test_config_manager`.
+Tests: `test_config_manager`, `test_config_kv_service`.
 
 ### Bootstrap Protocol
 
