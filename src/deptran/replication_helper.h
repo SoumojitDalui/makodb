@@ -60,6 +60,7 @@ void register_for_follower_par_id_return(
 void register_for_leader(std::function<void(const char*, int)>, uint32_t);
 void register_leader_election_callback(std::function<void(int)>);
 void register_step_down_callback(std::function<void()>);
+void register_catch_up_callback(std::function<void(int)>);
 void register_for_leader_par_id(std::function<void(const char*&, int, int)>, uint32_t);
 void register_for_leader_par_id_return(
     std::function<int(const char*&, int, int, int,
@@ -105,6 +106,7 @@ void register_for_follower_par_id_return(
 void register_for_leader(std::function<void(const char*, int)>, uint32_t);
 void register_leader_election_callback(std::function<void(int)>);
 void register_step_down_callback(std::function<void()>);
+void register_catch_up_callback(std::function<void(int)>);
 void register_for_leader_par_id(std::function<void(const char*&, int, int)>, uint32_t);
 void register_for_leader_par_id_return(
     std::function<int(const char*&, int, int, int,
@@ -154,6 +156,10 @@ void register_leader_election_callback(std::function<void(int)>);
 // block. No-op under Raft, which reports that through the election
 // callback.
 void register_step_down_callback(std::function<void()>);
+// Raft: cb(n), n the number of partitions this process just started leading
+// that are still applying entries of earlier terms, each time n changes and
+// once at registration. Called on Raft's threads. No-op under Paxos.
+void register_catch_up_callback(std::function<void(int)>);
 void register_for_leader_par_id(std::function<void(const char*&, int, int)>, uint32_t);
 void register_for_leader_par_id_return(
     std::function<int(const char*&, int, int, int,

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Restart test for the cluster config (MAKO_CONFIG_TABLE=1) on a 2-shard
-# Paxos run. It starts the cluster four times and crashes every process
+# Paxos or Raft run. It starts the cluster four times and crashes every process
 # (SIGKILL) between starts; the first three runs use the same ports, the
 # fourth new ones. In the first run it changes the config through
 # mako_config: a node's status, shard 1's status and a node's address.
@@ -16,7 +16,10 @@
 # start, on other addresses, is a different cluster: shard 0's leader must
 # pass over the earlier logs and start from the shard config.
 #
-# Usage: test_2shard_config_restart.sh
+# Usage: test_2shard_config_restart.sh [paxos|raft]
+#   Under Raft shard 0's preferred leader (localhost) is the replica that
+#   persists its log, so the test expects it to lead partition 0 after each
+#   start, as Raft's preferred-leader timers make it.
 # Exit status: 0 passed, 1 a check failed, 3 the first run never came up
 # (startup or setup), which is the only case worth retrying.
 # Env: MAKO_CFG_RESTART_SETTLE (seconds between the last change and the
@@ -25,8 +28,17 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/simple_transaction_rep_port_utils.sh"
 
+replication="${1:-paxos}"
+case "$replication" in
+    paxos|raft) ;;
+    *)
+        echo "Usage: $0 [paxos|raft]"
+        exit 2
+        ;;
+esac
+
 echo "========================================="
-echo "Testing cluster-config restart (paxos, crash and restart three times)"
+echo "Testing cluster-config restart ($replication, crash and restart three times)"
 echo "========================================="
 
 rm -f nfs_sync_*
@@ -41,7 +53,14 @@ tool_path="./${BUILD_DIR:-build}/mako_config"
 export MAKO_CONFIG_TABLE=1
 export LD_LIBRARY_PATH="$(pwd)/${BUILD_DIR:-build}:${LD_LIBRARY_PATH}"
 
-REPLICAS=(localhost learner p2 p1)
+if [ "$replication" = "raft" ]; then
+    export MAKO_RAFT_PREFERRED_GRACE_US="${MAKO_RAFT_PREFERRED_GRACE_US:-30000000}"
+    export MAKO_RAFT_NONPREFERRED_GRACE_ELECTION_MIN_US="${MAKO_RAFT_NONPREFERRED_GRACE_ELECTION_MIN_US:-5000000}"
+    export MAKO_RAFT_NONPREFERRED_GRACE_ELECTION_MAX_US="${MAKO_RAFT_NONPREFERRED_GRACE_ELECTION_MAX_US:-10000000}"
+    REPLICAS=(localhost p2 p1)
+else
+    REPLICAS=(localhost learner p2 p1)
+fi
 NODES=()
 for s in 0 1; do
     for r in "${REPLICAS[@]}"; do
@@ -67,7 +86,7 @@ done
 # The cluster never got as far as the test.
 SETUP_FAILED=3
 
-if ! ensure_paxos_replication_configs "$trd" 2; then
+if [ "$replication" = "paxos" ] && ! ensure_paxos_replication_configs "$trd" 2; then
     exit $SETUP_FAILED
 fi
 
@@ -130,7 +149,7 @@ trap cleanup EXIT
 trap 'cleanup; exit 130' INT TERM
 
 log_of() {
-    echo "${script_name}_run${run}_$1.log"
+    echo "${script_name}_${replication}_run${run}_$1.log"
 }
 
 # Whether two numbers read from the logs are the same. A process's threads
@@ -156,7 +175,7 @@ start_cluster() {
     else
         drop_configs
         TEMP_CONFIG=$(make_simple_txn_rep_config 2 "$trd") || return 1
-        TEMP_PAXOS_DIR=$(make_paxos_replication_configs 2 "$trd" paxos) || return 1
+        TEMP_PAXOS_DIR=$(make_paxos_replication_configs 2 "$trd" "$replication") || return 1
     fi
     export MAKO_CONFIG="$TEMP_CONFIG"
     export MAKO_PAXOS_CONFIG_DIR="$TEMP_PAXOS_DIR"
@@ -168,7 +187,11 @@ start_cluster() {
                 sleep 1
             fi
             rm -f "$(log_of "shard${shard}-${r}")"
-            nohup bash bash/shard.sh 2 "$shard" "$trd" "$r" 0 1 > "$(log_of "shard${shard}-${r}")" 2>&1 &
+            if [ "$replication" = "raft" ]; then
+                nohup bash bash/shard.sh 2 "$shard" "$trd" "$r" 0 1 raft > "$(log_of "shard${shard}-${r}")" 2>&1 &
+            else
+                nohup bash bash/shard.sh 2 "$shard" "$trd" "$r" 0 1 > "$(log_of "shard${shard}-${r}")" 2>&1 &
+            fi
             WRAPPER_PIDS+=($!)
         done
         if [ "$shard" = 0 ]; then
@@ -346,6 +369,6 @@ if [ "$failed" -eq 0 ]; then
 else
     echo "Some checks failed! (config restart)"
     echo "========================================="
-    echo "Logs: ${script_name}_run*_shard*.log"
+    echo "Logs: ${script_name}_${replication}_run*_shard*.log"
     exit 1
 fi
