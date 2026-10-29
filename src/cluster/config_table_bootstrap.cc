@@ -2,6 +2,7 @@
 
 #include <stdlib.h>  // getenv, strtol, atol
 #include <string.h>  // strcmp
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -20,6 +21,7 @@
 #include "benchmarks/benchmark_config.h"   // BenchmarkConfig, transport::Configuration
 #include "lib/common.h"                    // mako::CONFIG_TABLE_ID
 #include "sto/function_pool.h"             // actual_directs (Masstree thread init), TThread
+#include "deptran/replication_helper.h"    // is_local_partition_leader, partition_term
 #include "cluster/native_sharding.h"       // mako_sharding_enabled
 
 import cluster;        // ConfigManager, KvStore, RemoteKvStore
@@ -471,7 +473,11 @@ private:
     // crashed but is still writing its core keeps its listening socket open
     // and times out every read. So state is logged on read outcomes, once
     // per transition, not on each connect. The next pass starts with the
-    // next replica, where a newly promoted leader would be.
+    // next replica, where a newly promoted leader would be, and waits one
+    // reconnect interval: a load must read every key over one connection,
+    // and reconnecting at once would let a load that missed one key carry
+    // on and still see a matching __version__ at the end. Waiting makes the
+    // rest of the load fail, so ClusterConfig rejects it.
     void drop() {
         if (serving_) {
             srpc::Log_warn("BootstrapConfigTable: lost shard-0 config at {}; trying shard 0's "
@@ -484,6 +490,7 @@ private:
             client_ = rusty::None;
         }
         cur_ = (cur_ + 1) % addrs_.size();
+        next_attempt_ = std::chrono::steady_clock::now() + kConfigReconnectInterval;
     }
 
     std::vector<std::string> addrs_;   // shard 0's replicas, preferred leader first
@@ -559,13 +566,13 @@ void StartShard0Leader(uint32_t nshards, const ConfigEndpoint& ep) {
 // RemoteConfigConnection keeps retrying.
 // @unsafe - RPC client, background thread
 void StartRemoteWatcher(const std::vector<ConfigEndpoint>& eps) {
-    std::vector<std::string> addrs;
     std::string all;
-    for (const auto& ep : eps) {
-        addrs.push_back(ep.addr());
-        all += (all.empty() ? "" : ", ") + ep.addr();
+    for (const auto& ep : eps) all += (all.empty() ? "" : ", ") + ep.addr();
+    if (g_cfg_remote == nullptr) {   // one per process; a replica that steps down reuses it
+        std::vector<std::string> addrs;
+        for (const auto& ep : eps) addrs.push_back(ep.addr());
+        g_cfg_remote = new RemoteConfigConnection(std::move(addrs));
     }
-    g_cfg_remote = new RemoteConfigConnection(std::move(addrs));
     RemoteConfigConnection* conn = g_cfg_remote;
 
     RemoteKvStoreReadFn read_fn =
@@ -579,6 +586,120 @@ void StartRemoteWatcher(const std::vector<ConfigEndpoint>& eps) {
         ConfigWatcher::new_(g_cfg_cm.as_ref().unwrap().get(), &get_cluster_config(), kConfigPollIntervalMs)));
     g_cfg_watcher.as_ref().unwrap()->start();
     srpc::Log_info("BootstrapConfigTable: watching shard-0 config at {}", all.c_str());
+}
+
+// Make this replica shard 0's config leader (g_cfg_mu held): serve its own
+// copy of the config table, which reached it through the replication log.
+// @unsafe - stops the remote watcher, storage index, RPC server bind, background threads
+void PromoteLocked() {
+    if (!g_cfg_active || g_cfg_leading) return;
+
+    const std::string me = MyReplicaName();
+    const ConfigEndpoint* mine = FindEndpoint(me);
+    abstract_ordered_index* idx = ConfigTable();
+    if (mine == nullptr || idx == nullptr) {
+        srpc::Log_error("BootstrapConfigTable: {} now leads shard 0 but {}, so it cannot serve "
+                        "the cluster config", me.c_str(),
+                        mine == nullptr ? "is not in shard 0's replica list" : "has no config table");
+        return;
+    }
+    g_cfg_leading = true;
+    // Under Raft a node can briefly read as partition 0's leader when it is
+    // not: Raft moves to a newer term before clearing its leader flag when it
+    // steps down. So the promotion records the term it starts in and serves
+    // only if, after its writes, this node still leads partition 0 in it.
+    const uint64_t term = ::partition_term(0);
+
+    // Stop following the old leader.
+    if (g_cfg_watcher.is_some()) g_cfg_watcher.as_ref().unwrap()->stop();
+    g_cfg_watcher = rusty::None;
+    const uint64_t last_seen = get_cluster_config().get_version();
+
+    if (g_cfg_store == nullptr) g_cfg_store = new ConfigTableStore(g_cfg_db, idx);
+    g_cfg_cm = rusty::Some(rusty::make_box<ConfigManager>(g_cfg_store));
+    ConfigManager* cm = g_cfg_cm.as_ref().unwrap().get();
+
+    // The old leader's writes reached this replica's table through the log.
+    // shard_count is written last when seeding, so with it present the
+    // table is complete; this replica then only names itself shard 0's
+    // leader. Otherwise (promoted before the seed replicated, or the first
+    // Raft leader) it seeds the config from the shared shard config. Either
+    // way the version continues above every one this replica has seen and
+    // above a floor built from partition 0's replication term (Paxos epoch
+    // or Raft term) in the high half and this replica's position in shard
+    // 0's replica list below it. The term grows with every leadership
+    // change, so leaders of different terms never use the same version,
+    // even when an earlier one's writes never reached this replica; the
+    // position keeps apart two replicas that claim the same term (Mako's
+    // Raft election path can let that happen). Every watcher then sees a
+    // version it has not loaded and reloads.
+    const uint64_t replicated = cm->get_version();
+    const bool complete = replicated > 0 && cm->get_shard_count() > 0;
+    const uint64_t position = static_cast<uint64_t>(mine - g_cfg_endpoints.data());
+    const uint64_t version_floor = (term << 32) | ((position + 1) << 24);
+    const uint64_t base = std::max({last_seen, replicated, version_floor});
+    g_cfg_store->begin_batch();   // one transaction
+    if (base > replicated) g_cfg_store->put("__version__", std::to_string(base));
+    if (complete) {
+        cm->set_shard_leader(0, me);
+    } else {
+        SeedTopology(cm, g_cfg_nshards, me);
+    }
+    g_cfg_store->end_batch();
+    if (janus::is_using_raft() &&
+        (!::is_local_partition_leader(0) || ::partition_term(0) != term)) {
+        g_cfg_leading = false;
+        StartRemoteWatcher(g_cfg_endpoints);
+        srpc::Log_warn("BootstrapConfigTable: {} lost partition 0 while taking over (term {} -> "
+                       "{}); reading the cluster config from shard 0's replicas", me.c_str(),
+                       term, ::partition_term(0));
+        return;
+    }
+    StartLocalWatcher(cm);
+    StartConfigService(g_cfg_store, mine->port);
+    srpc::Log_info("BootstrapConfigTable: {} now leads shard 0 and serves the {} cluster config "
+                   "(version {}; replicated version {}, last seen {})", me.c_str(),
+                   complete ? "replicated" : "seeded", get_cluster_config().get_version(),
+                   replicated, last_seen);
+}
+
+// Raft only (g_cfg_mu held): this replica no longer leads partition 0. Stop
+// serving, so the other nodes move to the new leader, and follow it like
+// any other node. The table thread stays for a later promotion.
+// @unsafe - RPC server teardown, background threads
+void DemoteLocked() {
+    if (!g_cfg_leading) return;
+    if (g_cfg_watcher.is_some()) g_cfg_watcher.as_ref().unwrap()->stop();
+    g_cfg_watcher = rusty::None;
+    delete g_cfg_server;   // closes the listener and its connections
+    g_cfg_server = nullptr;
+    g_cfg_leading = false;
+    StartRemoteWatcher(g_cfg_endpoints);
+    srpc::Log_info("BootstrapConfigTable: {} no longer leads shard 0 and reads the cluster "
+                   "config from shard 0's replicas", MyReplicaName().c_str());
+}
+
+// Raft: bring serving in line with whether this replica leads partition 0
+// now. Raft reports leadership per partition, so the check asks about
+// partition 0 itself. It runs on its own thread, because the callbacks run
+// on Raft's threads and stopping a watcher can take a poll interval plus
+// an RPC timeout. A check requested while one is still queued is folded
+// into it, since each check reads the current state.
+std::atomic<bool> g_cfg_check_queued{false};
+
+// @unsafe - background thread
+void QueueLeadershipCheck() {
+    if (g_cfg_check_queued.exchange(true)) return;
+    std::thread([] {
+        g_cfg_check_queued.store(false);
+        std::lock_guard<std::mutex> lock(g_cfg_mu);
+        if (!g_cfg_active) return;
+        if (::is_local_partition_leader(0)) {
+            PromoteLocked();
+        } else {
+            DemoteLocked();
+        }
+    }).detach();
 }
 
 // The static router's dead-shard redirect: the end of a killed shard's
@@ -616,6 +737,18 @@ void BootstrapConfigTable(abstract_db* db) {
     g_cfg_db = db;
     mako::set_shard_redirect(&RedirectToLiveShard);
 
+    if (janus::is_using_raft()) {
+        // Only partition 0's Raft leader can put writes into the Raft log,
+        // and it need not be the preferred leader. So every node starts as
+        // a reader, and the shard-0 replica that leads partition 0 promotes
+        // itself, now if it already leads or else on its leadership
+        // callback; the first one seeds the table.
+        StartRemoteWatcher(g_cfg_endpoints);
+        g_cfg_active = true;
+        if (bench.getShardIndex() == 0) QueueLeadershipCheck();
+        return;
+    }
+
     const bool is_shard0_leader =
         (bench.getShardIndex() == 0) && (bench.getLeaderConfig() != 0);
 
@@ -635,54 +768,24 @@ void BootstrapConfigTable(abstract_db* db) {
     g_cfg_active = true;
 }
 
-// @unsafe - stops the remote watcher, storage index, RPC server bind, background threads
+// Paxos: called on a failover callback thread (the takeover), which must not
+// wait, so the promotion runs on its own thread. Raft reports through
+// ConfigTableLeadershipChanged instead.
+// @unsafe - background thread
 void PromoteConfigTableLeader() {
-    std::lock_guard<std::mutex> lock(g_cfg_mu);
-    if (!g_cfg_active || g_cfg_leading) return;
+    if (!config_table_enabled() || janus::is_using_raft()) return;
     if (BenchmarkConfig::getInstance().getShardIndex() != 0) return;  // only shard 0 serves
+    std::thread([] {
+        std::lock_guard<std::mutex> lock(g_cfg_mu);
+        PromoteLocked();
+    }).detach();
+}
 
-    const std::string me = MyReplicaName();
-    const ConfigEndpoint* mine = FindEndpoint(me);
-    abstract_ordered_index* idx = ConfigTable();
-    if (mine == nullptr || idx == nullptr) {
-        srpc::Log_error("BootstrapConfigTable: {} now leads shard 0 but {}, so it cannot serve "
-                        "the cluster config", me.c_str(),
-                        mine == nullptr ? "is not in shard 0's replica list" : "has no config table");
-        return;
-    }
-    g_cfg_leading = true;
-
-    // Stop following the old leader.
-    if (g_cfg_watcher.is_some()) g_cfg_watcher.as_ref().unwrap()->stop();
-    g_cfg_watcher = rusty::None;
-    const uint64_t last_seen = get_cluster_config().get_version();
-
-    g_cfg_store = new ConfigTableStore(g_cfg_db, idx);
-    g_cfg_cm = rusty::Some(rusty::make_box<ConfigManager>(g_cfg_store));
-    ConfigManager* cm = g_cfg_cm.as_ref().unwrap().get();
-
-    // The old leader's writes reached this replica's table through the log.
-    // shard_count is written last when seeding, so with it present the
-    // table is complete; this replica then only names itself shard 0's
-    // leader. Otherwise (promoted before the seed replicated) it rebuilds
-    // the config from the shared shard config. Either way the version
-    // continues above every one a watcher has seen, so all of them reload.
-    const uint64_t replicated = cm->get_version();
-    const bool complete = replicated > 0 && cm->get_shard_count() > 0;
-    g_cfg_store->begin_batch();   // one transaction
-    if (last_seen > replicated) g_cfg_store->put("__version__", std::to_string(last_seen));
-    if (complete) {
-        cm->set_shard_leader(0, me);
-    } else {
-        SeedTopology(cm, g_cfg_nshards, me);
-    }
-    g_cfg_store->end_batch();
-    StartLocalWatcher(cm);
-    StartConfigService(g_cfg_store, mine->port);
-    srpc::Log_info("BootstrapConfigTable: {} now leads shard 0 and serves the {} cluster config "
-                   "(version {}; replicated version {}, last seen {})", me.c_str(),
-                   complete ? "replicated" : "re-seeded", get_cluster_config().get_version(),
-                   replicated, last_seen);
+// @unsafe - background thread
+void ConfigTableLeadershipChanged() {
+    if (!config_table_enabled() || !janus::is_using_raft()) return;
+    if (BenchmarkConfig::getInstance().getShardIndex() != 0) return;  // only shard 0 serves
+    QueueLeadershipCheck();
 }
 
 }  // namespace janus
