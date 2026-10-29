@@ -258,6 +258,7 @@ static void handle_new_config_format(const string& site_name)
 
   // Set shard index from site
   benchConfig.setShardIndex(site->shard_id);
+  benchConfig.setSiteName(site_name);
 
   // Set cluster role for compatibility
   if (site->is_leader) {

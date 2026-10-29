@@ -110,6 +110,9 @@ class BenchmarkConfig {
       int is_micro_;
       int is_replicated_;
       string paxos_proc_name_;
+      // With a new-format shard config: the site name this process was
+      // started as (paxos_proc_name_ then holds only its role).
+      string site_name_;
       std::vector<std::string> paxos_config_file_;
       
       // Atomic variables for Paxos termination tracking
@@ -190,6 +193,7 @@ class BenchmarkConfig {
       int getIsReplicated() const { return is_replicated_; }
       // @unsafe: returns std::string by value
       std::string getPaxosProcName() const { return paxos_proc_name_; }
+      const std::string& getSiteName() const { return site_name_; }
       // @safe
       int getLeaderConfig() const { return paxos_proc_name_==mako::LOCALHOST_CENTER; }
       const std::vector<std::string>& getPaxosConfigFile() const { return paxos_config_file_; }
@@ -241,6 +245,7 @@ class BenchmarkConfig {
       void setUseHashtable(int use) { use_hashtable_ = use; }
       void setIsMicro(int micro) { is_micro_ = micro; }
       void setIsReplicated(int replicated) { is_replicated_ = replicated; }
+      void setSiteName(std::string site_name) { site_name_ = std::move(site_name); }
       void setPaxosProcName(std::string paxos_proc_name) { paxos_proc_name_ = paxos_proc_name; setCluster(paxos_proc_name); setClusterRole(mako::convertCluster(paxos_proc_name));}
       void setPaxosConfigFile(const std::vector<std::string>& paxos_config_file) { paxos_config_file_ = paxos_config_file; }
       

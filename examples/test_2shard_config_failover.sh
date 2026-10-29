@@ -25,7 +25,12 @@
 # Usage: test_2shard_config_failover.sh [paxos|raft] [kill|pause] [right-after]
 #   A paused leader that resumes after a takeover must step down: Raft tells
 #   it through a newer term, Paxos through an acceptor that refuses it.
-# Env: MAKO_CFG_FAILOVER_PAUSE (seconds paused, default 12),
+# A paused leader stays stopped until another replica serves and every
+# other live node reads from it (it must, within the convergence timeout),
+# and at least MAKO_CFG_FAILOVER_PAUSE seconds.
+# Exit status: 0 passed, 1 a check failed, 3 the cluster never got as far
+# as the test (startup or setup), which is the only case worth retrying.
+# Env: MAKO_CFG_FAILOVER_PAUSE (seconds paused at least, default 12),
 #      MAKO_CFG_FAILOVER_TIMEOUT (seconds to converge after the event, default 60).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -93,19 +98,22 @@ for bin in "$binary_path" "$tool_path"; do
     fi
 done
 
+# The cluster never got as far as the test.
+SETUP_FAILED=3
+
 if [ "$replication" = "paxos" ] && ! ensure_paxos_replication_configs "$trd" 2; then
-    exit 1
+    exit $SETUP_FAILED
 fi
 
 TEMP_CONFIG=$(make_simple_txn_rep_config 2 $trd)
 if [ -z "$TEMP_CONFIG" ]; then
-    exit 1
+    exit $SETUP_FAILED
 fi
 export MAKO_CONFIG="$TEMP_CONFIG"
 
 TEMP_PAXOS_DIR=$(make_paxos_replication_configs 2 "$trd" "$replication")
 if [ -z "$TEMP_PAXOS_DIR" ]; then
-    exit 1
+    exit $SETUP_FAILED
 fi
 export MAKO_PAXOS_CONFIG_DIR="$TEMP_PAXOS_DIR"
 
@@ -336,7 +344,7 @@ dead_node=""
 echo "Waiting for every node to read the cluster config..."
 if ! wait_for_convergence 120 3 stop; then
     report_no_convergence "before every node read the config" 120
-    exit 1
+    exit $SETUP_FAILED
 fi
 echo "  ✓ All nodes read the config from $CONFIG_LEADER (port $(serving_port "$CONFIG_LEADER"))"
 
@@ -394,6 +402,20 @@ change_version=$CHANGE_VERSION
 echo "  ✓ Applied and confirmed replicated at version $change_version"
 
 if [ "$timing" = right-after ]; then
+    # The event must hit the replica that confirmed the change: if
+    # leadership moved while the change was retried, the case did not run.
+    moved=""
+    for i in "${!NODES[@]}"; do
+        n=${NODES[$i]}
+        [[ "$n" == shard0-* ]] && [ "$n" != "$event_node" ] || continue
+        if tail -n +"$((LINES_BEFORE[$i] + 1))" "$(log_of "$n")" | grep -a -q "now leads shard 0 and serves"; then
+            moved="$moved $n"
+        fi
+    done
+    if ! serves_config "$event_node" || [ "$(pid_of "$event_node")" != "$event_pid" ] || [ -n "$moved" ]; then
+        echo "  ✗ $event_node no longer served the config when the change was confirmed (took over:${moved:- none}); the right-after case did not run"
+        exit 1
+    fi
     echo "  (the $event follows at once, before every node loads the change)"
 else
     waited=0
@@ -427,11 +449,25 @@ if [ "$event" = "kill" ]; then
     event_pid=""
     since="the kill"
 else
-    echo "Pausing $event_node (pid $event_pid) for ${pause_seconds}s..."
+    echo "Pausing $event_node (pid $event_pid)..."
     kill -STOP "$event_pid"
-    sleep "$pause_seconds"
+    paused_at=$SECONDS
+    # Another replica must take over while this one is stopped, so it counts
+    # as gone until it resumes.
+    dead_node=$event_node
+    if wait_for_convergence "$converge_timeout" 2 skip; then
+        echo "  ✓ $CONFIG_LEADER took over while $event_node was paused (converged ${CONVERGED_AFTER}s after the pause)"
+    else
+        report_no_convergence "while $event_node was paused" "$converge_timeout"
+        failed=1
+    fi
+    dead_node=""
+    left=$((pause_seconds - (SECONDS - paused_at)))
+    if [ "$left" -gt 0 ]; then
+        sleep "$left"
+    fi
     kill -CONT "$event_pid"
-    echo "Resumed $event_node"
+    echo "Resumed $event_node after $((SECONDS - paused_at))s"
     since="the resume"
 fi
 

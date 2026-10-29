@@ -198,7 +198,7 @@ TEST_F(ConfigManagerTest, ClusterConfigLoadPublishesRoutingHints) {
 }
 
 // An unreachable remote store reads as empty. Loading it must keep the
-// config already loaded, which the router keeps routing by, not clear it.
+// config already loaded, not clear it.
 TEST_F(ConfigManagerTest, ClusterConfigKeepsConfigWhenStoreReadsEmpty) {
     ASSERT_TRUE(cm_.add_shard(0, {"a"}));
     ASSERT_TRUE(cm_.add_shard(1, {"b"}));
@@ -288,21 +288,35 @@ TEST_F(ConfigManagerTest, ClusterConfigRejectsLoadWithoutShards) {
     EXPECT_EQ(cc.get_shard_count(), 1u);
 }
 
-// A replica that has lost shard 0 but not stepped down yet can still serve
-// an older version. Loading it would undo changes this node has, so the
-// loaded config stays; a newer version still loads.
-TEST_F(ConfigManagerTest, ClusterConfigRejectsOlderVersion) {
+// Versions carry partition 0's replication term in their high 32 bits.
+// A replica that has lost shard 0 but not stepped down yet serves a
+// version of an older term; loading it would undo changes this node has,
+// so the loaded config stays. Another replica that claimed the same term
+// is loaded even with a lower version, since same-term versions are not
+// ordered; a newer version still loads.
+TEST_F(ConfigManagerTest, ClusterConfigRejectsOlderTerm) {
+    const uint64_t term2 = uint64_t{2} << 32;
     ASSERT_TRUE(cm_.add_shard(0, {"a"}));
     ASSERT_TRUE(cm_.add_shard(1, {"b"}));
+    kv_.put("__version__", std::to_string(term2 | (uint64_t{4} << 24) | 7));
     ClusterConfig cc = ClusterConfig::new_();
     ASSERT_TRUE(cc.load_from_config_manager(&cm_));
 
     InMemoryKvStore stale_kv;
     ConfigManager stale{&stale_kv};
     ASSERT_TRUE(stale.add_shard(0, {"a"}));
-    ASSERT_LT(stale.get_version(), cc.get_version());
+    stale_kv.put("__version__", std::to_string((uint64_t{1} << 32) | (uint64_t{1} << 24) | 900));
     EXPECT_FALSE(cc.load_from_config_manager(&stale));
     EXPECT_EQ(cc.get_shard_count(), 2u);
+
+    InMemoryKvStore peer_kv;
+    ConfigManager peer{&peer_kv};
+    ASSERT_TRUE(peer.add_shard(0, {"a"}));
+    ASSERT_TRUE(peer.add_shard(1, {"b"}));
+    ASSERT_TRUE(peer.add_shard(2, {"c"}));
+    peer_kv.put("__version__", std::to_string(term2 | (uint64_t{1} << 24) | 3));
+    EXPECT_TRUE(cc.load_from_config_manager(&peer));
+    EXPECT_EQ(cc.get_shard_count(), 3u);
 
     ASSERT_TRUE(cm_.kill_shard(1, 0));
     EXPECT_TRUE(cc.load_from_config_manager(&cm_));

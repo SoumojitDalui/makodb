@@ -413,6 +413,9 @@ static void register_paxos_leader_callback(vector<pair<uint32_t, uint32_t>>& adv
         //Warning("In register_for_leader_par_id_return, par_id:%d, slot_id:%d, len:%d, st: %llu, et: %llu, latency: %llu",
         //       par_id, slot_id, len, commit_info.latency_tracker, end_time, end_time-commit_info.latency_tracker);
         sync_util::sync_logger::local_timestamp_[par_id].store(commit_info.timestamp, memory_order_release) ;
+        if (par_id == 0) {
+          sync_util::sync_logger::record_commit(commit_info.timestamp);
+        }
 
 #if defined(TRACKING_LATENCY)
         if (par_id==4){
