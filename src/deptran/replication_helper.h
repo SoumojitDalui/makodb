@@ -59,6 +59,7 @@ void register_for_follower_par_id_return(
     uint32_t);
 void register_for_leader(std::function<void(const char*, int)>, uint32_t);
 void register_leader_election_callback(std::function<void(int)>);
+void register_step_down_callback(std::function<void()>);
 void register_for_leader_par_id(std::function<void(const char*&, int, int)>, uint32_t);
 void register_for_leader_par_id_return(
     std::function<int(const char*&, int, int, int,
@@ -103,6 +104,7 @@ void register_for_follower_par_id_return(
     uint32_t);
 void register_for_leader(std::function<void(const char*, int)>, uint32_t);
 void register_leader_election_callback(std::function<void(int)>);
+void register_step_down_callback(std::function<void()>);
 void register_for_leader_par_id(std::function<void(const char*&, int, int)>, uint32_t);
 void register_for_leader_par_id_return(
     std::function<int(const char*&, int, int, int,
@@ -147,6 +149,11 @@ void register_for_follower_par_id_return(
     uint32_t);
 void register_for_leader(std::function<void(const char*, int)>, uint32_t);
 void register_leader_election_callback(std::function<void(int)>);
+// Paxos: cb runs once each time an acceptor's promise to a later epoch
+// deposes this process as leader, on an RPC callback thread, so it must not
+// block. No-op under Raft, which reports that through the election
+// callback.
+void register_step_down_callback(std::function<void()>);
 void register_for_leader_par_id(std::function<void(const char*&, int, int)>, uint32_t);
 void register_for_leader_par_id_return(
     std::function<int(const char*&, int, int, int,

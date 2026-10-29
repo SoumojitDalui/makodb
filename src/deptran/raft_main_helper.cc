@@ -1031,6 +1031,10 @@ void register_leader_election_callback(std::function<void(int)> cb) {
   janus::leader_callback_ = std::move(cb);
 }
 
+// register_step_down_callback is a no-op: Raft reports a lost leadership
+// through the election callback (0).
+void register_step_down_callback(std::function<void()>) {}
+
 // register_for_leader_par_id registers leader callbacks that want the partition id.
 void register_for_leader_par_id(
     std::function<void(const char*&, int, int)> cb, uint32_t par_id) {
