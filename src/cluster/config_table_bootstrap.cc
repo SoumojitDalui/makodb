@@ -351,6 +351,13 @@ void StartRemoteWatcher(const ConfigEndpoint& ep) {
     srpc::Log_info("BootstrapConfigTable: watching shard-0 config at {}", addr.c_str());
 }
 
+// The static router's dead-shard redirect: the end of a killed shard's
+// replacement chain. One atomic load while no shard is dead.
+int RedirectToLiveShard(int shard) {
+    if ((get_cluster_config().routing_hints() & CC_HINT_REDIRECTS) == 0) return shard;
+    return static_cast<int>(get_cluster_config().resolve_live_shard(static_cast<uint32_t>(shard)));
+}
+
 }  // namespace
 
 // @unsafe - see per-branch helpers
@@ -375,6 +382,7 @@ void BootstrapConfigTable(abstract_db* db) {
 
     ConfigEndpoint ep;
     if (!ResolveConfigEndpoint(&ep)) return;
+    mako::set_shard_redirect(&RedirectToLiveShard);
 
     const bool is_shard0_leader =
         (bench.getShardIndex() == 0) && (bench.getLeaderConfig() != 0);
