@@ -273,7 +273,9 @@ admission only accepts the tables in its catalog, so the bootstrap logs an
 error and leaves the config table off when both are set.
 
 - **Shard 0's leader** seeds the table from the shared shard config and serves
-  it with a `ConfigKvService`.
+  it with a `ConfigKvService`. The table is replicated through partition 0's
+  log like any other table, each change as one transaction, so a replica that
+  takes over shard 0 serves the config it replayed.
 - **Every other node** reads it through a `RemoteKvStore`; a `ConfigWatcher`
   on each node polls `__version__` and reloads its `ClusterConfig` when it
   changes.
