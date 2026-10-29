@@ -697,15 +697,15 @@ run_1shard_replication_raft_restart() {
 # ============================================================================
 
 # One config failover case, retried once like the replication tests.
-# Usage: run_config_failover_case <ci target> <paxos|raft> <kill|pause>
+# Usage: run_config_failover_case <ci target> <paxos|raft> <kill|pause> [right-after]
 run_config_failover_case() {
-    local target=$1 replication=$2 event=$3
+    local target=$1 replication=$2 event=$3 timing=${4:-}
     local attempt=1
     local max_attempts=2
     while [ $attempt -le $max_attempts ]; do
         cleanup_processes
         set +e
-        bash ./examples/test_2shard_config_failover.sh "$replication" "$event"
+        bash ./examples/test_2shard_config_failover.sh "$replication" "$event" $timing
         local test_result=$?
         set -e
         check_for_hanging_processes "$target"
@@ -714,7 +714,7 @@ run_config_failover_case() {
             return 0
         fi
         if [ $attempt -lt $max_attempts ]; then
-            echo "Retrying $target ($replication $event, attempt $((attempt + 1))/$max_attempts)..."
+            echo "Retrying $target ($replication $event${timing:+ $timing}, attempt $((attempt + 1))/$max_attempts)..."
         fi
         attempt=$((attempt + 1))
     done
@@ -726,7 +726,8 @@ run_2shard_config_failover() {
     echo "Running: ./ci/ci.sh shard2ConfigFailover"
     echo "========================================="
     run_config_failover_case shard2ConfigFailover paxos kill &&
-        run_config_failover_case shard2ConfigFailover paxos pause
+        run_config_failover_case shard2ConfigFailover paxos pause &&
+        run_config_failover_case shard2ConfigFailover paxos kill right-after
 }
 
 run_2shard_config_failover_raft() {
