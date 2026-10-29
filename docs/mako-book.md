@@ -292,7 +292,8 @@ error and leaves the config table off when both are set.
   `set_node_addr`, `set_node_status`, `advance_epoch`) to shard 0's leader,
   which applies it as one transaction and confirms it once it is replicated.
 
-Tests: `test_config_manager`, `test_config_kv_service`.
+Tests: `examples/test_2shard_config_failover.sh` (ci target
+`shard2ConfigFailover`), `test_config_manager`, `test_config_kv_service`.
 
 ### Bootstrap Protocol
 
