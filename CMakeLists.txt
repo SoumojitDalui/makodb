@@ -987,6 +987,7 @@ set(MAKO_SRCFILES
   "${CMAKE_CURRENT_SOURCE_DIR}/src/mako/lib/server.cc"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/mako/storage/abstract_db.cc"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/mako/cluster_bootstrap.cc"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/cluster/config_table_bootstrap.cc"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/mako/native_sharding_storage.cc"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/mako/native_sharding_rpc.cc"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/rocks_interface/gateway_receiver.cc"
@@ -1175,6 +1176,23 @@ target_compile_options(cluster PUBLIC ${BENCH_CXXFLAGS})
 # std_port supersedes the deleted hashbrown_port target; it PUBLIC-links
 # std_port_hashbrown, so naming std_port pulls in both archives/BMIs.
 target_link_libraries(cluster PUBLIC srpc pthread btree_port vec_port rc_port std_port mako_sharding_native)
+
+# `config_table` (MAKO_CONFIG_TABLE=1): this node's copy of the cluster config
+# kept in table __mako_config__ on shard 0 (shard leaders, status, dead-shard
+# replacements, epoch) and the watcher that refreshes it. Its own module next
+# to `cluster`, which it imports for ConfigManager; placement stays native.
+set(CONFIG_TABLE_MODULE_INTERFACES
+    ${CMAKE_SOURCE_DIR}/src/cluster/cluster_config.h
+    ${CMAKE_SOURCE_DIR}/src/cluster/config_watcher.h
+    ${CMAKE_SOURCE_DIR}/src/cluster/config_table.ccm
+)
+set_source_files_properties(${CONFIG_TABLE_MODULE_INTERFACES} PROPERTIES LANGUAGE CXX)
+add_library(config_table STATIC ${CMAKE_SOURCE_DIR}/src/cluster/cluster_config.cc)
+target_sources(config_table PUBLIC
+    FILE_SET config_table_modules TYPE CXX_MODULES FILES ${CONFIG_TABLE_MODULE_INTERFACES}
+)
+set_target_properties(config_table PROPERTIES POSITION_INDEPENDENT_CODE ON CXX_MODULE_STD OFF)
+target_link_libraries(config_table PUBLIC cluster)
 
 # The Raft server is Rust. src/deptran/raft is a
 # cargo staticlib: its C ABI (src/deptran/raft/server_exports.h) is what the C++
@@ -1616,7 +1634,7 @@ target_compile_definitions(mako PUBLIC CONFIG_H=\"${CONFIG_H}\")
 # A static library gets no objects from txlog_core_obj, only usage requirements;
 # executables that link mako alone (the gtest binaries) therefore need the
 # kernels' archive next to libraft_rt.a, in the same rescan group.
-target_link_libraries(mako PUBLIC txlog_core_obj masstree mako_sharding_native
+target_link_libraries(mako PUBLIC txlog_core_obj config_table masstree mako_sharding_native
     "$<LINK_GROUP:RESCAN,txlog_core,${RAFT_CORE_TARGET}>")
 add_dependencies(mako rcc_rpc_gen)
 target_include_directories(mako PUBLIC ${LIBEVENT_INCLUDE_DIRS})
@@ -1942,7 +1960,7 @@ if(BUILD_TESTS)
     add_executable(test_config_kv_service tests/config_kv_service_test.cc)
     target_include_directories(test_config_kv_service PRIVATE ${TEST_INCLUDE_DIRS} ${GTEST_INCLUDE_DIRS} src/deptran)
     target_compile_options(test_config_kv_service PRIVATE ${TEST_COMPILE_OPTIONS})
-    target_link_libraries(test_config_kv_service ${TXLOG_LINK_LIBS} ${TEST_LINK_LIBS} ${GTEST_LIBRARIES} ${GTEST_MAIN_LIBRARIES} rocksdb pthread)
+    target_link_libraries(test_config_kv_service config_table ${TXLOG_LINK_LIBS} ${TEST_LINK_LIBS} ${GTEST_LIBRARIES} ${GTEST_MAIN_LIBRARIES} rocksdb pthread)
     add_test(NAME test_config_kv_service COMMAND test_config_kv_service)
 
     # ConfigManager standalone unit tests
@@ -1971,7 +1989,7 @@ if(BUILD_TESTS)
         "-Wl,-rpath,${_CXX_COMPILER_ROOT}/lib"
     )
     target_link_libraries(test_config_manager
-        cluster srpc ${GTEST_LIBRARIES} ${GTEST_MAIN_LIBRARIES} c++ pthread
+        cluster config_table srpc ${GTEST_LIBRARIES} ${GTEST_MAIN_LIBRARIES} c++ pthread
     )
     add_test(NAME test_config_manager COMMAND test_config_manager)
 

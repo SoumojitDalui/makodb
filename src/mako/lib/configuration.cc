@@ -195,6 +195,27 @@ namespace transport
         }
     }
 
+    bool Configuration::HasShard(int idx, int clusterRole) const
+    {
+        if (is_new_format) {
+            if (idx < 0 || idx >= (int)shard_map.size()) return false;
+            int replica_idx = 0;
+            if (clusterRole == mako::P1_CENTER_INT) replica_idx = 1;
+            else if (clusterRole == mako::P2_CENTER_INT) replica_idx = 2;
+            else if (clusterRole == mako::LEARNER_CENTER_INT) replica_idx = 3;
+            if (replica_idx >= (int)shard_map[idx].size()) return false;
+            return sites_map.find(shard_map[idx][replica_idx]) != sites_map.end();
+        }
+        int i = 0;
+        for (const auto& s : shards) {
+            if (s.clusterRole == clusterRole) {
+                if (i == idx) return true;
+                i++;
+            }
+        }
+        return false;
+    }
+
     SiteInfo* Configuration::GetSiteByName(const string& name)
     {
         if (!is_new_format) return nullptr;

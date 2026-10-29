@@ -1,0 +1,7 @@
+// The config table (MAKO_CONFIG_TABLE=1): this node's copy of the cluster
+// config kept in table __mako_config__ on shard 0, and the watcher that
+// refreshes it. Separate from module cluster (native sharding owns placement).
+export module config_table;
+
+export import :cluster_config;
+export import :config_watcher;

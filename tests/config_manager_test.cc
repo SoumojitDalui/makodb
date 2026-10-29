@@ -9,7 +9,8 @@
 #include <vector>
 #include <rusty/option.hpp>   // tests inspect rusty::Option<std::string> results
 
-import cluster;   // ConfigManager / InMemoryKvStore / RemoteKvStore
+import cluster;        // ConfigManager / InMemoryKvStore / RemoteKvStore
+import config_table;   // ClusterConfig / ConfigWatcher
 
 namespace janus {
 
@@ -156,6 +157,84 @@ TEST_F(ConfigManagerTest, NodeAddrRoundTrip) {
 TEST_F(ConfigManagerTest, NodeStatusRoundTrip) {
     ASSERT_TRUE(cm_.set_node_status("site-a", "alive"));
     EXPECT_EQ(cm_.get_node_status("site-a"), "alive");
+}
+
+// ===========================================================================
+// ClusterConfig
+// ===========================================================================
+
+TEST_F(ConfigManagerTest, ClusterConfigLoadMirrorsManager) {
+    ASSERT_TRUE(cm_.add_shard(0, {"a", "b", "c"}));
+    ASSERT_TRUE(cm_.add_shard(1, {"d", "e", "f"}));
+    ASSERT_TRUE(cm_.set_shard_leader(0, "a"));
+    ASSERT_TRUE(cm_.set_shard_leader(1, "d"));
+    ASSERT_TRUE(cm_.advance_epoch());
+
+    ClusterConfig cc = ClusterConfig::new_();
+    ASSERT_TRUE(cc.load_from_config_manager(&cm_));
+
+    EXPECT_EQ(cc.get_shard_count(), 2u);
+    EXPECT_EQ(cc.get_shard_leader(0), "a");
+    EXPECT_EQ(cc.get_shard_leader(1), "d");
+    EXPECT_EQ(cc.get_shard_replicas(0).size(), 3u);
+    EXPECT_EQ(cc.get_epoch(), 1u);
+    EXPECT_EQ(cc.get_version(), cm_.get_version());
+}
+
+TEST_F(ConfigManagerTest, ClusterConfigLoadFromNullManagerFails) {
+    ClusterConfig cc = ClusterConfig::new_();
+    EXPECT_FALSE(cc.load_from_config_manager(nullptr));
+}
+
+// ===========================================================================
+// ConfigWatcher
+// ===========================================================================
+
+TEST_F(ConfigManagerTest, WatcherPollDetectsVersionBump) {
+    ASSERT_TRUE(cm_.add_shard(0, {"a"}));
+    ClusterConfig local = ClusterConfig::new_();
+    auto watcher = ConfigWatcher::new_(&cm_, &local, /*poll_interval_ms=*/1000);
+
+    // First poll picks up the current config (version went 0 -> 1).
+    EXPECT_TRUE(watcher.poll());
+    EXPECT_EQ(local.get_shard_count(), 1u);
+
+    // Idempotent: no new writes -> no change.
+    EXPECT_FALSE(watcher.poll());
+
+    // Mutate; next poll must observe.
+    ASSERT_TRUE(cm_.add_shard(1, {"b"}));
+    EXPECT_TRUE(watcher.poll());
+    EXPECT_EQ(local.get_shard_count(), 2u);
+}
+
+TEST_F(ConfigManagerTest, WatcherCallbackFiresOnlyOnChange) {
+    int callback_count = 0;
+    ClusterConfig local = ClusterConfig::new_();
+    auto watcher = ConfigWatcher::new_(&cm_, &local, /*poll_interval_ms=*/1000);
+    watcher.set_update_callback(
+        [&](const ClusterConfig&) { ++callback_count; });
+
+    ASSERT_TRUE(cm_.add_shard(0, {"a"}));
+    EXPECT_TRUE(watcher.poll());
+    EXPECT_EQ(callback_count, 1);
+
+    EXPECT_FALSE(watcher.poll());
+    EXPECT_EQ(callback_count, 1);
+
+    ASSERT_TRUE(cm_.advance_epoch());
+    EXPECT_TRUE(watcher.poll());
+    EXPECT_EQ(callback_count, 2);
+}
+
+TEST_F(ConfigManagerTest, WatcherTracksPollCount) {
+    ClusterConfig local = ClusterConfig::new_();
+    auto watcher = ConfigWatcher::new_(&cm_, &local, /*poll_interval_ms=*/1000);
+    EXPECT_EQ(watcher.get_poll_count(), 0u);
+    watcher.poll();
+    watcher.poll();
+    watcher.poll();
+    EXPECT_EQ(watcher.get_poll_count(), 3u);
 }
 
 // ===========================================================================
