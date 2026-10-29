@@ -287,7 +287,8 @@ error and leaves the config table off when both are set.
   over shard 0 (the Paxos learner, or a new Raft leader once it has applied
   the old leader's entries) serves the config
   from then on (`PromoteConfigTableLeader`), at a version above the last one
-  it saw.
+  it saw. A Paxos leader that an acceptor turns down, or a Raft leader that
+  loses its term, stops serving (`ConfigTableLeadershipChanged`).
 - **Runtime changes**: `mako_config` (endpoints in
   `MAKO_CONFIG_TABLE_ENDPOINTS`) sends a change (`kill_shard`,
   `set_shard_status`, `set_shard_leader`, `set_shard_replicas`,

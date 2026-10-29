@@ -650,6 +650,10 @@ static void setup_transport_callbacks()
 
 static void setup_leader_election_callbacks()
 {
+  // Paxos: a leader that resumes after a new one took over learns it when
+  // an acceptor refuses it; on shard 0 it then stops serving the cluster
+  // config. Raft reports this through the election callback below.
+  register_step_down_callback([] { janus::ConfigTableLeadershipChanged(); });
   register_leader_election_callback([&](int control) { // communicate with third party: Paxos
     // happens on the learner for case 0 and case 2, 3
     uint32_t aa = mako::getCurrentTimeMillis();
