@@ -276,11 +276,14 @@ error and leaves the config table off when both are set.
   takes over shard 0 serves the config it replayed.
 - **Every other node** reads it through a `RemoteKvStore`; a `ConfigWatcher`
   on each node polls `__version__` and reloads its `ClusterConfig` when it
-  changes.
+  changes. Versions only grow (a replica that takes over continues above
+  every version it has seen), so a lower version, from a replica that lost
+  shard 0 but has not stepped down, is never loaded.
 - **Failover**: every shard-0 replica has a config-service endpoint (its base
   port + 90, or `MAKO_CONFIG_TABLE_PORT` plus its position in shard 0's
   replica list), and other nodes try them in turn. The replica that takes
-  over shard 0 (the Paxos learner, or a new Raft leader) serves the config
+  over shard 0 (the Paxos learner, or a new Raft leader once it has applied
+  the old leader's entries) serves the config
   from then on (`PromoteConfigTableLeader`), at a version above the last one
   it saw.
 
