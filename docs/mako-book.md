@@ -243,10 +243,41 @@ for native Rust routing; writing them does not publish a native ownership change
 **ConfigManager**: Typed configuration over a `KvStore` port (`get`/`put`/`remove`), not a bespoke store. Provides methods like `get_shard_replicas()`, `add_shard()`, `set_shard_leader()`, `advance_epoch()`. Every write increments `__version__` (written last). On shard 0's leader the port binds to the unified `FullOrderedIndex` — the `__mako_config__` system table — via the `OrderedIndexKvStore` adapter; other nodes bind a `RemoteKvStore` that reads shard 0 over RPC; unit tests bind an in-memory fake. The port keeps `cluster/` standalone-testable with no storage-engine dependency (see [The Storage Interface](storage-interface.md#cluster-metadata-port-srcclusterkv_storeh)).
 
 **Native sharding runtime**: Owns governed routing and migration decisions in
-Rust. The former C++ `ClusterConfig`, `ConfigWatcher`, policy builder/cache,
-and stub shard manager have been retired; there is no C++ routing fallback.
+Rust. The former C++ policy builder/cache and stub shard manager have been
+retired; there is no C++ routing fallback. `ClusterConfig` and `ConfigWatcher`
+now belong to the config table (below) and hold no placement.
 `RemoteKvStore` and `ConfigKvService` remain metadata read boundaries, not
 alternate ownership authorities.
+
+### The config table (`MAKO_CONFIG_TABLE`)
+
+`MAKO_CONFIG_TABLE=1` turns on the config table: the cluster's configuration
+kept in `__mako_config__` (table id 200) on shard 0 and served from there to
+every node. It is separate from native sharding (`MAKO_CLUSTER_CONFIG=1`),
+which owns placement; the config table holds what placement does not:
+
+- per shard its replicas, leader, status and, for a dead shard, the shard
+  recorded as its replacement (`kill_shard`; metadata only, it redirects
+  nothing);
+- per node its address and status;
+- the epoch and `__version__`.
+
+The code is module `config_table` (`src/cluster/cluster_config.h`,
+`config_watcher.h`, `config_table.ccm`) and
+`src/cluster/config_table_bootstrap.cc`, whose `BootstrapConfigTable(db)` runs
+from `init_env()` and is a no-op unless the switch is set and there is more
+than one shard. It does not run together with native sharding yet: native
+admission only accepts the tables in its catalog, so the bootstrap logs an
+error and leaves the config table off when both are set.
+
+- **Shard 0's leader** seeds the table from the shared shard config and serves
+  it with a `ConfigKvService` at `MAKO_CONFIG_TABLE_PORT` (default: 90 above
+  shard 0's preferred-leader base port).
+- **Every other node** reads it through a `RemoteKvStore`; a `ConfigWatcher`
+  on each node polls `__version__` and reloads its `ClusterConfig` when it
+  changes.
+
+Tests: `test_config_manager`.
 
 ### Bootstrap Protocol
 
